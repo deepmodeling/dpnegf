@@ -390,6 +390,9 @@ class NEGF(object):
                                                         dtype=self.poisson_options['poisson_dtype'])
                 log.info(msg="-------------------------------------------\n")
 
+            else:
+                log.info(msg="Using the given Poisson condition for NEGF-Poisson SCF")
+
             assert isinstance(pcond, Interface3D)
             self.poisson_negf_scf(interface_poisson=pcond,
                                   atom_gridpoint_index=list(pcond.grid.atom_index_dict.values()),
