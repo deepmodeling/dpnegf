@@ -246,6 +246,7 @@ class Interface3D(object):
     Interface3D(grid, Dirichlet_group, dielectric_group)
     A class to handle the initialization and solution of the 3D Poisson equation
     on a structured grid with support for Dirichlet and dielectric regions.
+
     Parameters
     ----------
     grid : Grid
@@ -254,6 +255,7 @@ class Interface3D(object):
         List of Dirichlet region objects specifying boundary conditions.
     dielectric_group : list of Dielectric
         List of Dielectric region objects specifying spatially varying permittivity.
+        
     Attributes
     ----------
     Dirichlet_group : list

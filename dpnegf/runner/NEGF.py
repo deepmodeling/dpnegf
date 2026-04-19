@@ -182,7 +182,7 @@ class NEGF(object):
                                                                 meshgrid=self.stru_options[lead_tag]["kmesh_lead_Ef"],
                                                                 AtomicData_options=AtomicData_options,
                                                                 smearing_method=self.stru_options.get("e_fermi_smearing", "FD"),
-                                                                temp=100.0,
+                                                                temp=self.ele_T,
                                                                 eig_solver=self.stru_options.get("eig_solver", "torch"),)
         else:
             e_fermi["lead_L"] = self.e_fermi
@@ -342,64 +342,81 @@ class NEGF(object):
             xu = torch.tensor(max(v_list)+8*self.kBT)
             self.int_grid, self.int_weight = gauss_xw(xl=xl, xu=xu, n=int(self.density_options["n_gauss"]))
 
-    def compute(self):
+    def compute(self, 
+                pcond: Optional[Interface3D]=None) -> Optional[Interface3D]:
+        '''
+        compute the NEGF calculation, can also from the given Poisson
+        '''
 
         if self.scf:
+            if pcond is None:
+                # create real-space grid
+                grid = self.get_grid(self.poisson_options["grid"],self.deviceprop.structure)
 
-            # create real-space grid
-            grid = self.get_grid(self.poisson_options["grid"],self.deviceprop.structure)
+                # create Dirichlet boundary condition region
+                Dirichlet_group = []
+                for idx in range(len(self.Dirichlet_region)):
+                    Dirichlet_init = Dirichlet(self.Dirichlet_region[idx].get("x_range",None).split(':'),\
+                                    self.Dirichlet_region[idx].get("y_range",None).split(':'),\
+                                    self.Dirichlet_region[idx].get("z_range",None).split(':'))
+                    #TODO: when heterogenous Dirichlet conditions are set, the voltage should be set as electrochemical potential(Fermi level + voltage)
+                    Dirichlet_init.Ef = -1*float(self.Dirichlet_region[idx].get("voltage",None)) # in unit of eV
+                    Dirichlet_group.append(Dirichlet_init)
+                
+                # create dielectric region          
+                dielectric_group = []
+                for dd in range(len(self.dielectric_region)):
+                    dielectric_init = Dielectric(self.dielectric_region[dd].get("x_range",None).split(':'),\
+                                                 self.dielectric_region[dd].get("y_range",None).split(':'),\
+                                                 self.dielectric_region[dd].get("z_range",None).split(':'))
+                    dielectric_init.eps = float(self.dielectric_region[dd].get("relative permittivity",None))
+                    dielectric_group.append(dielectric_init) 
 
-            # create Dirichlet boundary condition region
-            Dirichlet_group = []
-            for idx in range(len(self.Dirichlet_region)):
-                Dirichlet_init = Dirichlet(self.Dirichlet_region[idx].get("x_range",None).split(':'),\
-                                self.Dirichlet_region[idx].get("y_range",None).split(':'),\
-                                self.Dirichlet_region[idx].get("z_range",None).split(':'))
-                #TODO: when heterogenous Dirichlet conditions are set, the voltage should be set as electrochemical potential(Fermi level + voltage)
-                Dirichlet_init.Ef = -1*float(self.Dirichlet_region[idx].get("voltage",None)) # in unit of eV
-                Dirichlet_group.append(Dirichlet_init)
+                # create interface
+                pcond = Interface3D(grid,Dirichlet_group,dielectric_group)
+                pcond.get_potential_eps(Dirichlet_group+dielectric_group)
+                atom_gridpoint_index =  list(pcond.grid.atom_index_dict.values()) # atomic site index in the grid
+                for dp in range(len(self.doped_region)):
+                    pcond.get_fixed_charge(self.doped_region[dp].get("x_range",None).split(':'),\
+                                           self.doped_region[dp].get("y_range",None).split(':'),\
+                                           self.doped_region[dp].get("z_range",None).split(':'),\
+                                           self.doped_region[dp].get("charge",None),\
+                                           atom_gridpoint_index)
+
+                #initial guess for electrostatic potential
+                log.info(msg="-----Initial guess for electrostatic potential----")
+                pcond.solve_poisson_NRcycle(method=self.poisson_options['solver'],\
+                                                        tolerance=self.poisson_options['tolerance'],\
+                                                        dtype=self.poisson_options['poisson_dtype'])
+                log.info(msg="-------------------------------------------\n")
+
+            else:
+                log.info(msg="Using the given Poisson condition for NEGF-Poisson SCF")
+
+            assert isinstance(pcond, Interface3D)
+            self.poisson_negf_scf(interface_poisson=pcond,
+                                  atom_gridpoint_index=list(pcond.grid.atom_index_dict.values()),
+                                  err=self.poisson_options['err'],
+                                  max_iter=self.poisson_options['max_iter'],
+                                  mix_rate=self.poisson_options['mix_rate'],
+                                  tolerance=self.poisson_options['tolerance'])
             
-            # create dielectric region          
-            dielectric_group = []
-            for dd in range(len(self.dielectric_region)):
-                dielectric_init = Dielectric(   self.dielectric_region[dd].get("x_range",None).split(':'),\
-                                                self.dielectric_region[dd].get("y_range",None).split(':'),\
-                                                self.dielectric_region[dd].get("z_range",None).split(':'))
-                dielectric_init.eps = float(self.dielectric_region[dd].get("relative permittivity",None))
-                dielectric_group.append(dielectric_init) 
-
-            # create interface
-            interface_poisson = Interface3D(grid,Dirichlet_group,dielectric_group)
-            interface_poisson.get_potential_eps(Dirichlet_group+dielectric_group)
-            atom_gridpoint_index =  list(interface_poisson.grid.atom_index_dict.values()) # atomic site index in the grid
-            for dp in range(len(self.doped_region)):
-                interface_poisson.get_fixed_charge( self.doped_region[dp].get("x_range",None).split(':'),\
-                                                    self.doped_region[dp].get("y_range",None).split(':'),\
-                                                    self.doped_region[dp].get("z_range",None).split(':'),\
-                                                    self.doped_region[dp].get("charge",None),\
-                                                    atom_gridpoint_index)
-
-            #initial guess for electrostatic potential
-            log.info(msg="-----Initial guess for electrostatic potential----")
-            interface_poisson.solve_poisson_NRcycle(method=self.poisson_options['solver'],\
-                                                    tolerance=self.poisson_options['tolerance'],\
-                                                    dtype=self.poisson_options['poisson_dtype'])
-            log.info(msg="-------------------------------------------\n")
-
-            self.poisson_negf_scf(  interface_poisson=interface_poisson,atom_gridpoint_index=atom_gridpoint_index,\
-                                    err=self.poisson_options['err'],max_iter=self.poisson_options['max_iter'],\
-                                    mix_rate=self.poisson_options['mix_rate'],tolerance=self.poisson_options['tolerance'])
             # calculate transport properties with converged potential
             self.negf_compute(scf_require=False,Vbias=self.potential_at_orb)
         
-        else:
-            profiler = Profiler()
-            profiler.start() 
-            self.negf_compute(scf_require=False,Vbias=None)
-            profiler.stop()
-            output_path = os.path.join(self.results_path, "profile_report.html")
-            with open(output_path, 'w') as report_file:
-                report_file.write(profiler.output_html())
+            return pcond
+
+        # otherwise, the non-self-consistent calculation is performed
+        assert not self.scf
+        profiler = Profiler()
+        profiler.start() 
+        self.negf_compute(scf_require=False,Vbias=None)
+        profiler.stop()
+        output_path = os.path.join(self.results_path, "profile_report.html")
+        with open(output_path, 'w') as report_file:
+            report_file.write(profiler.output_html())
+        
+        return None
 
     def poisson_negf_scf(self,interface_poisson,atom_gridpoint_index,err=1e-6,max_iter=1000,
                          mix_method:str='linear', mix_rate:float=0.3, tolerance:float=1e-7,Gaussian_sigma:float=3.0):
