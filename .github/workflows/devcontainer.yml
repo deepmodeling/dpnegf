@@ -42,7 +42,7 @@ jobs:
       # ✅ 新增步骤：此 action 会创建有效、小写的 Docker 标签
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           # 提供基础镜像名，此 action 会自动处理大小写
           images: ghcr.io/${{ github.repository_owner }}/dpnegf-${{ matrix.dockerfile }}
