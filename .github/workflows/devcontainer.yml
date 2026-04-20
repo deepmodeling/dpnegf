@@ -52,7 +52,7 @@ jobs:
       # ✏️ 修改步骤：现在使用上面 'meta' 步骤的输出来代替手动拼接
       - name: Build and push Docker image
         id: build-and-push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           # 指定 Dockerfile 的路径
           file: Dockerfile
