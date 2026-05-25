@@ -22,7 +22,7 @@ Installing **DPNEGF** is straightforward. We recommend using a virtual environme
 - **From Source**
     1. Clone the repository:
         ```bash
-        git clone https://github.com/DeePTB-Lab/dpnegf.git
+        git clone https://github.com/deepmodeling/dpnegf.git
         ```
     2. Navigate to the root directory and install DPNEGF:
         ```bash

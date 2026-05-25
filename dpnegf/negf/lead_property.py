@@ -705,8 +705,8 @@ def write_to_hdf5(h5_path, k, e, se):
         group_name = f"E_{e:.8f}"
         dset_name = f"k_{k[0]}_{k[1]}_{k[2]}"
         grp = f.require_group(group_name)
-        if dset_name in grp:
-            log.warning(f"Dataset {dset_name} already exists in group {group_name}. Skipping it.")
+        # if dset_name in grp:
+        #     log.warning(f"Dataset {dset_name} already exists in group {group_name}. Skipping it.")
         grp.create_dataset(dset_name, data=se.cpu().numpy(), compression="gzip")
         f.flush()
 
@@ -740,7 +740,7 @@ def merge_hdf5_files(tmp_dir, output_path, pattern, remove=True):
 
                     for dset_name in fin_group:
                         if dset_name in fout_group:
-                            log.warning(f"Dataset '{dset_name}' already exists in group '{group_name}'. Skipping.")
+                            # log.warning(f"Dataset '{dset_name}' already exists in group '{group_name}'. Skipping.")
                             continue
                         fin_group.copy(dset_name, fout_group)
 

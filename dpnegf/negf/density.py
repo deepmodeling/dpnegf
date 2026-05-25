@@ -267,7 +267,7 @@ class Fiori(Density):
 
     def density_integrate_Fiori(self,e_grid,kpoint,Vbias,block_tridiagonal,subblocks,integrate_way,deviceprop,
                                 device_atom_norbs,potential_at_atom,with_Dirichlet_leads,free_charge,E_ref,
-                                eta_lead=1e-5, eta_device=1e-5):
+                                eta_lead=1e-5, eta_device=1e-5, self_energy_save_path=None):
 
         for eidx, e in enumerate(self.integrate_range):
             if not with_Dirichlet_leads:
@@ -276,14 +276,13 @@ class Fiori(Density):
                 #   to ensure the Neuamnn boundary condition in the leads.
                 deviceprop.lead_L.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead, save=False)
                 deviceprop.lead_R.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead, save=False)
+            else:
+                # For the Dirichlet leads, the self-energy of the leads is only calculated once and saved.
+                # In each iteration, load the pre-computed self-energy from disk.
+                deviceprop.lead_L.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead, save_path=self_energy_save_path)
+                deviceprop.lead_R.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead, save_path=self_energy_save_path)
 
-            # else:
-            #     # For the Dirichlet leads, the self-energy of the leads is only calculated once and saved.
-            #     # In each iteration, the self-energy of the leads is not updated.
-            #     deviceprop.lead_L.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead, save=True)
-            #     deviceprop.lead_R.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead, save=True)
-            
-             
+
             deviceprop.cal_green_function(energy=e, kpoint=kpoint, block_tridiagonal=block_tridiagonal,\
                                           eta_device=eta_device,Vbias = Vbias)
 
