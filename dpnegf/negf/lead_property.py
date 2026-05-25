@@ -533,6 +533,9 @@ def _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1, max_memory_fraction=0.
         Minimum number of workers to use. Default 1.
     kpoint : array-like, optional
         A sample k-point for fetching Hamiltonian matrices to estimate memory.
+    n_cpus : int or None, optional
+        Optional upper bound on CPU cores to consider. If provided, caps the
+        available CPU count before memory-based limiting.
 
     Returns
     -------
@@ -543,6 +546,11 @@ def _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1, max_memory_fraction=0.
     if cpu_count is None or cpu_count < 1:
         cpu_count = 1
         log.warning("os.cpu_count() returned None or invalid value. Defaulting to 1 CPU core.")
+    if n_cpus is not None:
+        if isinstance(n_cpus, int) and n_cpus > 0:
+            cpu_count = min(cpu_count, n_cpus)
+        else:
+            log.warning(f"Requested n_cpus={n_cpus} is not a positive integer. Ignoring.")
 
     available_memory = psutil.virtual_memory().available
     memory_per_worker = _estimate_worker_memory(lead_L, lead_R, kpoint=kpoint)
@@ -615,9 +623,15 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
     self_energy_save_path : str or None, optional
         Directory to save self-energy files. If None, uses lead_L's results_path.
     n_jobs : int, optional
-        Number of parallel jobs to use. Default is -1 (use all available CPUs).
+        Requested number of parallel jobs. Default is -1 (auto-detect). The
+        final worker count may be capped by ``n_cpus`` and reduced further by
+        memory-based limiting.
     batch_size : int, optional
         Number of (k, e) tasks per parallel batch. Default is 200.
+    n_cpus : int or None, optional
+        Optional upper bound on CPU cores to consider when auto-detecting or
+        capping ``n_jobs``. If None, uses all available CPUs. Memory-based
+        limiting may still reduce the final worker count.
 
     Returns
     -------
