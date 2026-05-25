@@ -2,6 +2,7 @@
     "task_options": {
         "task": "negf",
         "scf": false,
+        "n_cpus": 2,
         "block_tridiagonal": false,
         "ele_T": 300,
         "unit": "eV",
