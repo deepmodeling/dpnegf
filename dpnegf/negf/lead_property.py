@@ -639,17 +639,23 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
     elif safe_n_jobs < n_jobs:
         log.info(f"Adjusted n_jobs from {n_jobs} to {safe_n_jobs} due to memory constraints")
 
+    # Precompute all k-dependent matrices in the parent so workers receive
+    # only plain tensors (the hamiltonian holds a torch.jit.ScriptFunction-
+    # bearing model that loky/cloudpickle cannot serialize).
+    leadL_pack = _precompute_lead_kdata(lead_L, kpoints_grid)
+    leadR_pack = _precompute_lead_kdata(lead_R, kpoints_grid)
+
     total_tasks = [(k, e) for k in kpoints_grid for e in energy_grid]
     if len(total_tasks) <= batch_size:
         Parallel(n_jobs=safe_n_jobs, backend="loky")(
-            delayed(self_energy_worker)(k, e, eta, lead_L, lead_R, self_energy_save_path)
+            delayed(_self_energy_worker_pure)(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path)
             for k, e in total_tasks
         )
     else:
         for i in range(0, len(total_tasks), batch_size):
             batch = total_tasks[i:i+batch_size]
             Parallel(n_jobs=safe_n_jobs, backend="loky")(
-                delayed(self_energy_worker)(k, e, eta, lead_L, lead_R, self_energy_save_path)
+                delayed(_self_energy_worker_pure)(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path)
                 for k, e in batch
             )
 
@@ -661,7 +667,170 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
     merge_hdf5_files(self_energy_save_path, save_path_R, pattern="tmp_leadR_*.h5")
 
 
+def _k_key(k):
+    """Canonical tuple key for caching by k-point."""
+    arr = np.asarray(k, dtype=float).reshape(3)
+    return (float(arr[0]), float(arr[1]), float(arr[2]))
 
+
+def _precompute_lead_kdata(lead, kpoints_grid):
+    """Fetch every k-dependent quantity a lead needs during self-energy
+    calculation, so workers can run without holding a reference to the
+    hamiltonian (whose model contains torch.jit.ScriptFunction objects
+    that cannot be pickled across loky processes).
+
+    Parameters
+    ----------
+    lead : LeadProperty
+    kpoints_grid : iterable of length-3 array-likes
+
+    Returns
+    -------
+    dict
+        Plain (pickleable) data: per-k Hamiltonian/overlap matrices and
+        device subblocks, plus the small scalars used by `selfEnergy`
+        and the Bloch unfolding.
+    """
+    pack = {
+        "tab": lead.tab,
+        "voltage": lead.voltage,
+        "E_ref": lead.E_ref,
+        "useBloch": lead.useBloch,
+        "bloch_factor": lead.bloch_factor,
+        "bloch_R_list": lead.bloch_R_list,
+        "bloch_sorted_indice": lead.bloch_sorted_indice,
+        "kdata": {},
+    }
+
+    bloch_unfolder = Bloch(lead.bloch_factor) if lead.useBloch else None
+    seen = set()
+    for k in kpoints_grid:
+        key = _k_key(k)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        subblocks = lead.hamiltonian.get_hs_device(k, only_subblocks=True)
+
+        if not lead.useBloch:
+            HLk, HLLk, HDLk, SLk, SLLk, SDLk = lead.hamiltonian.get_hs_lead(
+                k, tab=lead.tab, v=lead.voltage
+            )
+            pack["kdata"][key] = {
+                "subblocks": subblocks,
+                "HLk": HLk, "HLLk": HLLk, "HDLk": HDLk,
+                "SLk": SLk, "SLLk": SLLk, "SDLk": SDLk,
+            }
+        else:
+            kpoints_bloch = bloch_unfolder.unfold_points(list(np.asarray(k, dtype=float).reshape(3)))
+            bloch_entries = []
+            for k_bloch in kpoints_bloch:
+                kb_tensor = torch.tensor(k_bloch)
+                HLk, HLLk, HDLk, SLk, SLLk, SDLk = lead.hamiltonian.get_hs_lead(
+                    kb_tensor, tab=lead.tab, v=lead.voltage
+                )
+                bloch_entries.append({
+                    "k_bloch": kb_tensor,
+                    "HLk": HLk, "HLLk": HLLk, "HDLk": HDLk,
+                    "SLk": SLk, "SLLk": SLLk, "SDLk": SDLk,
+                })
+            pack["kdata"][key] = {
+                "subblocks": subblocks,
+                "bloch_entries": bloch_entries,
+            }
+
+    return pack
+
+
+def _compute_self_energy_from_pack(pack, k, e, eta_lead, method="Lopez-Sancho"):
+    """Pure-function port of LeadProperty.self_energy_cal that operates on
+    the dict produced by _precompute_lead_kdata. Mirrors the math in
+    lead_property.py self_energy_cal (non-Bloch and Bloch branches)."""
+    if not isinstance(e, torch.Tensor):
+        energy = torch.tensor(e)
+    else:
+        energy = e
+
+    entry = pack["kdata"][_k_key(k)]
+    subblocks = entry["subblocks"]
+    E_ref = pack["E_ref"]
+
+    if not pack["useBloch"]:
+        HDL_reduced, SDL_reduced = LeadProperty.HDL_reduced(
+            entry["HDLk"], entry["SDLk"], subblocks
+        )
+        se, _ = selfEnergy(
+            ee=energy,
+            hL=entry["HLk"],
+            hLL=entry["HLLk"],
+            sL=entry["SLk"],
+            sLL=entry["SLLk"],
+            hDL=HDL_reduced,
+            sDL=SDL_reduced,
+            E_ref=E_ref,
+            etaLead=eta_lead,
+            method=method,
+        )
+        return se
+
+    sgf_k = []
+    bloch_factor = pack["bloch_factor"]
+    m_size = bloch_factor[1] * bloch_factor[0]
+    last_HDLk = None
+    last_SDLk = None
+    for be in entry["bloch_entries"]:
+        k_bloch = be["k_bloch"]
+        last_HDLk, last_SDLk = be["HDLk"], be["SDLk"]
+        _, sgf = selfEnergy(
+            ee=energy,
+            hL=be["HLk"],
+            hLL=be["HLLk"],
+            sL=be["SLk"],
+            sLL=be["SLLk"],
+            E_ref=E_ref,
+            etaLead=eta_lead,
+            method=method,
+        )
+        phase_factor_m = torch.zeros([m_size, m_size], dtype=torch.complex128)
+        bloch_R_list = pack["bloch_R_list"]
+        for i in range(m_size):
+            for j in range(m_size):
+                if i == j:
+                    phase_factor_m[i, j] = 1
+                else:
+                    phase_factor_m[i, j] = torch.exp(
+                        torch.tensor(1j) * 2 * torch.pi
+                        * torch.dot(bloch_R_list[j] - bloch_R_list[i], k_bloch)
+                    )
+        phase_factor_m = phase_factor_m.contiguous()
+        sgf = sgf.contiguous()
+        sgf_k.append(torch.kron(phase_factor_m, sgf))
+
+    sgf_k = torch.sum(torch.stack(sgf_k), dim=0) / len(sgf_k)
+    sorted_idx = pack["bloch_sorted_indice"]
+    sgf_k = sgf_k[sorted_idx, :][:, sorted_idx]
+    b = last_HDLk.shape[1]
+
+    HDL_reduced, SDL_reduced = LeadProperty.HDL_reduced(last_HDLk, last_SDLk, subblocks)
+    if not isinstance(energy, torch.Tensor):
+        eeshifted = torch.scalar_tensor(energy, dtype=torch.complex128) + E_ref
+    else:
+        eeshifted = energy + E_ref
+    se = (eeshifted * SDL_reduced - HDL_reduced) @ sgf_k[:b, :b] \
+         @ (eeshifted * SDL_reduced.conj().T - HDL_reduced.conj().T)
+    return se
+
+
+def _self_energy_worker_pure(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path):
+    """joblib worker replacement that takes only pickleable packs."""
+    save_tmp_L = os.path.join(self_energy_save_path, f"tmp_leadL_k{k[0]}_{k[1]}_{k[2]}_E{e:.8f}.h5")
+    save_tmp_R = os.path.join(self_energy_save_path, f"tmp_leadR_k{k[0]}_{k[1]}_{k[2]}_E{e:.8f}.h5")
+
+    seL = _compute_self_energy_from_pack(leadL_pack, k, e, eta)
+    seR = _compute_self_energy_from_pack(leadR_pack, k, e, eta)
+
+    write_to_hdf5(save_tmp_L, k, e, seL)
+    write_to_hdf5(save_tmp_R, k, e, seR)
 
 
 def self_energy_worker(k, e, eta, lead_L, lead_R, self_energy_save_path):
