@@ -358,6 +358,20 @@ class TestGetSafeNJobs:
         # Should be capped at CPU count
         assert result <= 4
 
+    @patch('dpnegf.negf.lead_property.psutil')
+    @patch('dpnegf.negf.lead_property.os')
+    def test_respects_n_cpus_cap(self, mock_os, mock_psutil):
+        """Test that n_cpus caps available CPU count."""
+        mock_os.cpu_count.return_value = 8
+        mock_psutil.virtual_memory.return_value = Mock(available=128 * 1024**3)
+
+        lead_L = MockLead("lead_L", matrix_size=10)
+        lead_R = MockLead("lead_R", matrix_size=10)
+
+        result = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1, n_cpus=2)
+
+        assert result == 2
+
 
 # =============================================================================
 # Integration tests
