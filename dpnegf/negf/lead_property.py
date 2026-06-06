@@ -8,6 +8,7 @@ import numpy as np
 from dpnegf.negf.bloch import Bloch
 import ase
 from joblib import Parallel, delayed
+from threadpoolctl import threadpool_limits
 import h5py
 import glob
 import psutil
@@ -651,14 +652,14 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
     parent_log_level = logging.getLogger().getEffectiveLevel()
     if len(total_tasks) <= batch_size:
         Parallel(n_jobs=safe_n_jobs, backend="loky")(
-            delayed(_self_energy_worker_pure)(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path, parent_log_level)
+            delayed(_self_energy_worker_blas1)(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path, parent_log_level)
             for k, e in total_tasks
         )
     else:
         for i in range(0, len(total_tasks), batch_size):
             batch = total_tasks[i:i+batch_size]
             Parallel(n_jobs=safe_n_jobs, backend="loky")(
-                delayed(_self_energy_worker_pure)(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path, parent_log_level)
+                delayed(_self_energy_worker_blas1)(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path, parent_log_level)
                 for k, e in batch
             )
 
@@ -858,6 +859,24 @@ def _self_energy_worker_pure(k, e, eta, leadL_pack, leadR_pack, self_energy_save
 
     write_to_hdf5(save_tmp_L, k, e, seL)
     write_to_hdf5(save_tmp_R, k, e, seR)
+
+
+def _self_energy_worker_blas1(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path, log_level):
+    """Loky entry point that pins this worker's BLAS/LAPACK runtime to a
+    single thread, then delegates to `_self_energy_worker_pure`.
+
+    Each loky worker is a separate process whose BLAS library would otherwise
+    autodetect every physical core, leading to N_workers * N_cores threads
+    contending for N_cores cores. The Lopez-Sancho iteration in
+    `surface_green._surface_green_{numba,scipy}_core` issues many small
+    `solve` / `inv` / matmul calls where single-threaded BLAS already wins
+    per-call; outer joblib-level parallelism handles scaling.
+    """
+    with threadpool_limits(limits=1, user_api='blas'):
+        return _self_energy_worker_pure(
+            k, e, eta, leadL_pack, leadR_pack,
+            self_energy_save_path, log_level,
+        )
 
 
 def self_energy_worker(k, e, eta, lead_L, lead_R, self_energy_save_path):
