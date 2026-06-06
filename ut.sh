@@ -19,7 +19,7 @@ echo "--- Installing/updating package from PR in editable mode ---"
 #    Docker image.
 # 2. `pytest ./tests/`: After the package is installed, we run the tests.
 
-conda run -n dpnegf bash -c "pip install --no-deps -e . && pytest dpnegf/tests/"
+conda run -n dpnegf bash -c "pip install -e . 'torch==2.1.1' --extra-index-url https://download.pytorch.org/whl/cpu -f https://data.pyg.org/whl/torch-2.1.1+cpu.html --only-binary=torch-scatter && pytest dpnegf/tests/"
 
 echo "--- Unit Tests Passed Successfully ---"
 
