@@ -36,11 +36,11 @@ RUN \
     sed -i 's/build-backend = "poetry_dynamic_versioning.backend"/build-backend = "poetry.core.masonry.api"/' pyproject.toml && \
     conda create -n dpnegf python=3.10 -c conda-forge -y && \
     git clone https://github.com/deepmodeling/DeePTB.git && \
+    cd DeePTB && \
+    bash install.sh cpu && \
     conda run -n dpnegf pip install --upgrade pip setuptools wheel && \
-    conda run -n dpnegf pip install torch==2.1.1 --index-url https://download.pytorch.org/whl/cpu && \
-    conda run -n dpnegf pip install torch-scatter -f https://data.pyg.org/whl/torch-2.1.1+cpu.html && \
-    conda run -n dpnegf pip install ./DeePTB && \
-     conda run -n dpnegf pip install ./ && \
+    cd .. && \
+    conda run -n dpnegf pip install ./ && \
     conda clean --all -y && \
     rm -rf /root/.cache/pip
 
