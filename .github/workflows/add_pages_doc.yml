@@ -9,7 +9,7 @@ on:
       - 'examples/**'
 jobs:
   build:
-    if: github.repository == 'DeePTB-Lab/dpnegf'
+    if: github.repository == 'deepmodeling/dpnegf'
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4

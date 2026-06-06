@@ -37,7 +37,7 @@ RUN \
     conda create -n dpnegf python=3.10 -c conda-forge -y && \
     git clone https://github.com/deepmodeling/DeePTB.git && \
     conda run -n dpnegf pip install --upgrade pip setuptools wheel && \
-    conda run -n dpnegf pip install torch==2.1.1 && \
+    conda run -n dpnegf pip install torch==2.1.1 --index-url https://download.pytorch.org/whl/cpu && \
     conda run -n dpnegf pip install torch-scatter -f https://data.pyg.org/whl/torch-2.1.1+cpu.html && \
     conda run -n dpnegf pip install ./DeePTB && \
      conda run -n dpnegf pip install ./ && \
