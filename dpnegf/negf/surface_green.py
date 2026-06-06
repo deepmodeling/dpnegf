@@ -247,7 +247,7 @@ def surface_green(H, h01, S, s01, ee,
                 assert np.iscomplexobj(s01), "s01 must be a complex array."
                 # normalize ee to numpy complex128 to match the @njit signature
                 ee = np.complex128(ee)
-                log.info("surface_green: using numba core")
+                log.debug("surface_green: using numba core")
                 gs, conv_flag, conv_test, e_real = _surface_green_numba_core(H, h01, S, s01, ee)
                 if conv_flag == 1:
                     log.warning(f"Lopez-Sancho scheme not-so-well converged at E = {e_real:.4f} eV: {conv_test}")
@@ -256,7 +256,7 @@ def surface_green(H, h01, S, s01, ee,
                 log.error(f"Numba JIT function failed at runtime. Falling back to NumPy. Error: {e}")
                 return _surface_green_scipy_core(H, h01, S, s01, ee)
         else:
-            log.info("surface_green: using scipy core")
+            log.debug("surface_green: using scipy core")
             return _surface_green_scipy_core(H, h01, S, s01, ee)
                 
 
