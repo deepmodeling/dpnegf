@@ -43,8 +43,8 @@ RUN \
     # 这样如果找不到精确匹配的 Wheel，它会立刻报错，而不是花 10 分钟编译出一个会引发崩溃的包。
     conda run -n dpnegf pip install torch-scatter -f https://data.pyg.org/whl/torch-2.1.1+cpu.html --only-binary=torch-scatter && \
     # [3] 给本地仓库的安装加上 CPU 源保护，防止安装过程触发隐藏依赖，把刚才装好的 CPU 版 Torch 顶替成带 CUDA 的版本
-    conda run -n dpnegf pip install ./DeePTB --extra-index-url https://download.pytorch.org/whl/cpu && \
-    conda run -n dpnegf pip install ./ && \
+    conda run -n dpnegf pip install ./DeePTB torch==2.1.1 --extra-index-url https://download.pytorch.org/whl/cpu && \
+    conda run -n dpnegf pip install ./ torch==2.1.1 --extra-index-url https://download.pytorch.org/whl/cpu && \
     conda clean --all -y && \
     rm -rf /root/.cache/pip
 
