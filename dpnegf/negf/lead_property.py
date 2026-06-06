@@ -646,16 +646,19 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
     leadR_pack = _precompute_lead_kdata(lead_R, kpoints_grid)
 
     total_tasks = [(k, e) for k in kpoints_grid for e in energy_grid]
+    # Capture the parent's log level so loky workers (which start with a clean
+    # logging state and the WARNING default) can match it when they reinit.
+    parent_log_level = logging.getLogger().getEffectiveLevel()
     if len(total_tasks) <= batch_size:
         Parallel(n_jobs=safe_n_jobs, backend="loky")(
-            delayed(_self_energy_worker_pure)(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path)
+            delayed(_self_energy_worker_pure)(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path, parent_log_level)
             for k, e in total_tasks
         )
     else:
         for i in range(0, len(total_tasks), batch_size):
             batch = total_tasks[i:i+batch_size]
             Parallel(n_jobs=safe_n_jobs, backend="loky")(
-                delayed(_self_energy_worker_pure)(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path)
+                delayed(_self_energy_worker_pure)(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path, parent_log_level)
                 for k, e in batch
             )
 
@@ -821,8 +824,32 @@ def _compute_self_energy_from_pack(pack, k, e, eta_lead, method="Lopez-Sancho"):
     return se
 
 
-def _self_energy_worker_pure(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path):
+def _init_worker_logging(level):
+    """Attach a console handler to the root logger inside a loky worker.
+
+    Loky workers start with no logging configuration, so log records emitted
+    from `selfEnergy` / `surface_green` are silently dropped. Reuse the
+    parent's formatter (CFORMATTER + _AppFilter from dpnegf.utils.loggers)
+    so worker output matches parent output, but skip the version banner.
+
+    Idempotent: returns immediately if a handler is already attached, so
+    persistent loky workers pay the cost only once.
+    """
+    root_log = logging.getLogger()
+    if root_log.handlers:
+        return
+    from dpnegf.utils.loggers import CFORMATTER, _AppFilter
+    root_log.setLevel(level)
+    ch = logging.StreamHandler()
+    ch.setFormatter(CFORMATTER)
+    ch.setLevel(level)
+    ch.addFilter(_AppFilter())
+    root_log.addHandler(ch)
+
+
+def _self_energy_worker_pure(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path, log_level):
     """joblib worker replacement that takes only pickleable packs."""
+    _init_worker_logging(log_level)
     save_tmp_L = os.path.join(self_energy_save_path, f"tmp_leadL_k{k[0]}_{k[1]}_{k[2]}_E{e:.8f}.h5")
     save_tmp_R = os.path.join(self_energy_save_path, f"tmp_leadR_k{k[0]}_{k[1]}_{k[2]}_E{e:.8f}.h5")
 
