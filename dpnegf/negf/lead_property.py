@@ -487,7 +487,7 @@ def _estimate_worker_memory(lead_L, lead_R, kpoint=None, temp_allocation_factor=
         Estimated memory in bytes per worker.
     """
     # Base overhead for Python process + libraries (interpreter, numpy, scipy, torch, etc.)
-    base_overhead = 300 * 1024 * 1024  # 300 MB
+    base_overhead = 100 * 1024 * 1024  # 100 MB
 
     matrix_bytes = 0
 
@@ -522,7 +522,7 @@ def _estimate_worker_memory(lead_L, lead_R, kpoint=None, temp_allocation_factor=
     return total_estimate
 
 
-def _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1, max_memory_fraction=0.7, min_workers=1, kpoint=None, n_cpus=None):
+def _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1, max_memory_fraction=0.9, min_workers=1, kpoint=None, n_cpus=None):
     """
     Calculate safe number of parallel workers based on available system memory.
 
@@ -533,7 +533,7 @@ def _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1, max_memory_fraction=0.
     requested_n_jobs : int
         User-requested n_jobs. -1 means auto-detect.
     max_memory_fraction : float
-        Maximum fraction of available memory to use. Default 0.7.
+        Maximum fraction of available memory to use. Default 0.9.
     min_workers : int
         Minimum number of workers to use. Default 1.
     kpoint : array-like, optional

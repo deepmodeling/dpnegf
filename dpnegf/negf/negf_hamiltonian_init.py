@@ -141,7 +141,8 @@ class NEGFHamiltonianInit(object):
             atom_norbs.append(int(self.model.idp.atom_norb[model.idp.chemical_symbol_to_type[atom.symbol]]))
         self.atom_norbs = atom_norbs
 
-    def initialize(self, kpoints, block_tridiagnal=False,useBloch=False,bloch_factor=None,\
+    def initialize(self, kpoints, block_tridiagnal=False, plot_blocks=False, \
+                   useBloch=False,bloch_factor=None,\
                    use_saved_HS=False, saved_HS_path=None):
         '''This function initializes the structure and Hamiltonian for a system with optional block tridiagonal
         and Bloch factor parameters.
@@ -152,6 +153,8 @@ class NEGFHamiltonianInit(object):
             Kpoints in the Brillouin zone
         block_tridiagnal, optional
              a boolean flag that determines whether the Hamiltonian matrix should be stored in a block-tridiagonal form. 
+        plot_blocks, optional
+            a boolean flag that determines whether to visualize the block structure using `show_blocks`.
         useBloch, optional
             a boolean flag that determines whether Bloch boundary conditions should be used in the lead self energy calculations. 
         bloch_factor
@@ -199,7 +202,7 @@ class NEGFHamiltonianInit(object):
             log.info(msg="=="*40)
         else:
             self.saved_HS_path = self.results_path
-            self.Hamiltonian_initialized(kpoints,useBloch,bloch_factor,block_tridiagnal,\
+            self.Hamiltonian_initialized(kpoints,useBloch,bloch_factor,block_tridiagnal,plot_blocks,\
                                                  lead_atom_range,structure_leads,structure_leads_fold)
             log.info(msg="--"*40)
             log.info(msg=f"The Hamiltonian has been initialized by model.")
@@ -211,7 +214,8 @@ class NEGFHamiltonianInit(object):
 
 
     def Hamiltonian_initialized(self,kpoints:List[List[float]],useBloch:bool,bloch_factor:List[int],\
-                                block_tridiagnal:bool,lead_atom_range:dict,structure_leads:Atoms,structure_leads_fold:Atoms):
+                                block_tridiagnal:bool, plot_blocks:bool,\
+                                lead_atom_range:dict,structure_leads:Atoms,structure_leads_fold:Atoms):
         '''This function initializes the Hamiltonian for a device with leads, handling various calculations
         and checks along the way.
 
@@ -236,6 +240,8 @@ class NEGFHamiltonianInit(object):
         should be stored in a block-tridiagonal form. If `block_tridiagnal` is set to `True`, the Hamiltonian
         matrix will be stored in a block-tridiagonal form. Otherwise, the Hamiltonian matrix will be stored in
         a full matrix format.
+        plot_blocks : bool
+            The `plot_blocks` parameter is a boolean flag that determines whether to visualize the block structure
         lead_atom_range : dict
             The `lead_atom_range` parameter indicates the range of leads. The key of the dictionary is the
         lead name, and the value is a list containing the start and end indices of the lead atoms.
@@ -432,7 +438,8 @@ class NEGFHamiltonianInit(object):
             leftmost_size = coupling_width['lead_L']
             rightmost_size = coupling_width['lead_R']
             hd, hu, hl, sd, su, sl, subblocks = self.get_block_tridiagonal(HD*self.h_factor,SD.cdouble(),self.structase,\
-                                                                leftmost_size,rightmost_size)
+                                                                leftmost_size,rightmost_size,
+                                                                plot_blocks=plot_blocks)
             HS_device.update({"hd":hd, "hu":hu, "hl":hl, "sd":sd, "su":su, "sl":sl, \
                               "subblocks":subblocks, "block_tridiagonal":True})
 
@@ -637,7 +644,7 @@ class NEGFHamiltonianInit(object):
         
         return stru_lead, stru_lead_fold, bloch_sorted_indice, bloch_R_list
 
-    def get_block_tridiagonal(self,HK,SK,structase:ase.Atoms,leftmost_size:int,rightmost_size:int):
+    def get_block_tridiagonal(self,HK,SK,structase:ase.Atoms,leftmost_size:int,rightmost_size:int,plot_blocks=False):
         """
         Block-tridiagonalizes the Hamiltonian (HK) and overlap (SK) matrices for a given atomic structure.
         This method splits the input matrices into block tridiagonal form based on the atomic structure along the z-axis.
@@ -671,6 +678,8 @@ class NEGFHamiltonianInit(object):
             List of lower-diagonal blocks of SK for each k-point.
         subblocks : list
             List of subblock sizes (number of orbitals in each block).
+        plot_blocks : bool
+            Whether to visualize the block structure using `show_blocks`.
         Notes
         -----
         - Uses optimized or fallback block splitting depending on the structure.
@@ -726,7 +735,9 @@ class NEGFHamiltonianInit(object):
         log.info(msg="               occupation of subblocks: {} %".format(num_total/(HK[0].shape[0]**2)*100))     
 
         subblocks = subblocks[1:]
-        show_blocks(subblocks,HK[0],self.results_path)
+
+        if plot_blocks:
+            show_blocks(subblocks,HK[0],self.results_path)
         
         return hd, hu, hl, sd, su, sl, subblocks
 

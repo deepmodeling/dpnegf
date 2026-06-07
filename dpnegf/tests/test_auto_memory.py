@@ -65,12 +65,12 @@ class TestEstimateWorkerMemory:
     """Tests for _estimate_worker_memory function."""
 
     def test_base_overhead_included(self):
-        """Test that base overhead (300MB) is always included."""
+        """Test that base overhead (100MB) is always included."""
         lead_L = MockLead("lead_L", matrix_size=1)  # tiny matrices
         lead_R = MockLead("lead_R", matrix_size=1)
 
         result = _estimate_worker_memory(lead_L, lead_R)
-        base_overhead = 300 * 1024 * 1024  # 300 MB
+        base_overhead = 100 * 1024 * 1024  # 100 MB
 
         # Result should be at least base_overhead
         assert result >= base_overhead
@@ -149,7 +149,7 @@ class TestEstimateWorkerMemory:
 
         result = _estimate_worker_memory(lead_L, lead_R, temp_allocation_factor=1.0)
 
-        base_overhead = 300 * 1024 * 1024  # 300 MB
+        base_overhead = 100 * 1024 * 1024  # 100 MB
         fallback_per_lead = 100 * 1024 * 1024  # 100 MB per lead
         expected = base_overhead + 2 * fallback_per_lead  # 2 leads
 
@@ -166,7 +166,7 @@ class TestEstimateWorkerMemory:
         # Total matrix bytes = 2 * 960,000 = 1,920,000 bytes
         expected_matrix_bytes = 2 * 6 * matrix_size * matrix_size * 16
 
-        base_overhead = 300 * 1024 * 1024
+        base_overhead = 100 * 1024 * 1024
         temp_factor = 3.0
         expected_total = base_overhead + int(expected_matrix_bytes * temp_factor)
 
@@ -181,7 +181,7 @@ class TestEstimateWorkerMemory:
 
         result = _estimate_worker_memory(lead_L, lead_R, temp_allocation_factor=1.0)
 
-        base_overhead = 300 * 1024 * 1024
+        base_overhead = 100 * 1024 * 1024
         # lead_L: 6 * 50 * 50 * 16 = 240,000 bytes
         # lead_R: fallback 100 MB
         lead_L_bytes = 6 * 50 * 50 * 16
@@ -397,12 +397,12 @@ class TestMemoryEstimationIntegration:
         n_jobs = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1)
 
         # Memory per worker should be significant (> 500 MB)
-        # 1000x1000 matrices: 2 leads * 6 matrices * 1000^2 * 16 bytes * 3.0 factor + 300MB overhead
-        # = 576 MB computation + 300 MB overhead = ~876 MB
+        # 1000x1000 matrices: 2 leads * 6 matrices * 1000^2 * 16 bytes * 3.0 factor + 100MB overhead
+        # = 576 MB computation + 100 MB overhead = ~676 MB
         assert memory_estimate > 500 * 1024**2  # > 500 MB
 
-        # Should limit workers due to memory (4 GB available, ~900 MB per worker)
-        assert n_jobs <= 4
+        # Should limit workers due to memory (4 GB * 0.9 / ~676 MB per worker ~= 5, below CPU count of 16)
+        assert n_jobs <= 8
 
     def test_consistent_estimates(self):
         """Test that estimates are consistent across calls."""
