@@ -44,7 +44,7 @@ class NEGF(object):
                 unit: str,
                 scf: bool, poisson_options: dict,
                 stru_options: dict,eta_lead: float,eta_device: float,
-                block_tridiagonal: bool,
+                block_tridiagonal: bool, plot_blocks: bool,
                 sgf_solver: str,
                 e_fermi: float=None,
                 use_saved_HS: bool=False, saved_HS_path: str=None,
@@ -125,6 +125,7 @@ class NEGF(object):
         self.unit = unit
         self.scf = scf
         self.block_tridiagonal = block_tridiagonal
+        self.plot_blocks = plot_blocks
         for lead_tag in ["lead_L", "lead_R"]:
             assert "voltage" in self.stru_options[lead_tag], f"{lead_tag} voltage should be set in stru_options"
             if self.scf:
@@ -154,8 +155,9 @@ class NEGF(object):
         with torch.no_grad():
             # if useBloch is None, structure_leads_fold,bloch_sorted_indices,bloch_R_lists = None,None,None
             struct_device, struct_leads,structure_leads_fold,bloch_sorted_indices,bloch_R_lists = \
-                self.negf_hamiltonian.initialize(kpoints=self.kpoints,block_tridiagnal=self.block_tridiagonal,\
-                                                 useBloch=self.useBloch,bloch_factor=self.bloch_factor,\
+                self.negf_hamiltonian.initialize(kpoints=self.kpoints,
+                                                 block_tridiagnal=self.block_tridiagonal, plot_blocks=self.plot_blocks,\
+                                                 useBloch=self.useBloch,bloch_factor=self.bloch_factor,
                                                  use_saved_HS=self.use_saved_HS, saved_HS_path=self.saved_HS_path)
         profiler.stop()
         output_path = os.path.join(self.results_path, "profile_report_ham_init.html")

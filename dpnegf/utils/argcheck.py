@@ -1039,6 +1039,7 @@ def negf():
     return [
         Argument("scf", bool, optional=True, default=False, doc=doc_scf),
         Argument("block_tridiagonal", bool, optional=True, default=False, doc=doc_block_tridiagonal),
+        Argument("plot_blocks", bool, optional=True, default=False, doc="Whether to plot the block tridiagonalization process"),
         Argument("ele_T", [float, int], optional=False, doc=doc_ele_T),
         Argument("unit", str, optional=True, default="Hartree", doc=doc_unit),
         Argument("use_saved_HS", bool, optional=True, default=False, doc="Whether to use saved Hamiltonian and overlap matrix"),
