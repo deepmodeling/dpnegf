@@ -11,13 +11,13 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list, sd, su, sl, s_i
 
     Parameters
     ----------
-    energy : numpy.ndarray (dtype=numpy.float)
+    energy : torch.Tensor (dtype=torch.float)
         Energy array
-    mat_d_list : list of numpy.ndarray (dtype=numpy.float)
+    mat_d_list : list of torch.Tensor (dtype=torch.float)
         List of diagonal blocks
-    mat_u_list : list of numpy.ndarray (dtype=numpy.float)
+    mat_u_list : list of torch.Tensor (dtype=torch.float)
         List of upper-diagonal blocks
-    mat_l_list : list of numpy.ndarray (dtype=numpy.float)
+    mat_l_list : list of torch.Tensor (dtype=torch.float)
         List of lower-diagonal blocks
     s_in :
          (Default value = 0)
@@ -28,31 +28,31 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list, sd, su, sl, s_i
 
     Returns
     -------
-    g_trans : numpy.ndarray (dtype=numpy.complex)
+    g_trans : torch.Tensor (dtype=torch.complex)
         Blocks of the retarded Green's function responsible for transmission
-    grd : numpy.ndarray (dtype=numpy.complex)
+    grd : torch.Tensor (dtype=torch.complex)
         Diagonal blocks of the retarded Green's function
-    grl : numpy.ndarray (dtype=numpy.complex)
+    grl : torch.Tensor (dtype=torch.complex)
         Lower diagonal blocks of the retarded Green's function
-    gru : numpy.ndarray (dtype=numpy.complex)
+    gru : torch.Tensor (dtype=torch.complex)
         Upper diagonal blocks of the retarded Green's function
-    gr_left : numpy.ndarray (dtype=numpy.complex)
+    gr_left : torch.Tensor (dtype=torch.complex)
         Left-conencted blocks of the retarded Green's function
-    gnd : numpy.ndarray (dtype=numpy.complex)
+    gnd : torch.Tensor (dtype=torch.complex)
         Diagonal blocks of the retarded Green's function
-    gnl : numpy.ndarray (dtype=numpy.complex)
+    gnl : torch.Tensor (dtype=torch.complex)
         Lower diagonal blocks of the retarded Green's function
-    gnu : numpy.ndarray (dtype=numpy.complex)
+    gnu : torch.Tensor (dtype=torch.complex)
         Upper diagonal blocks of the retarded Green's function
-    gin_left : numpy.ndarray (dtype=numpy.complex)
+    gin_left : torch.Tensor (dtype=torch.complex)
         Left-conencted blocks of the retarded Green's function
-    gpd : numpy.ndarray (dtype=numpy.complex)
+    gpd : torch.Tensor (dtype=torch.complex)
         Diagonal blocks of the retarded Green's function
-    gpl : numpy.ndarray (dtype=numpy.complex)
+    gpl : torch.Tensor (dtype=torch.complex)
         Lower diagonal blocks of the retarded Green's function
-    gpu : numpy.ndarray (dtype=numpy.complex)
+    gpu : torch.Tensor (dtype=torch.complex)
         Upper diagonal blocks of the retarded Green's function
-    gip_left : numpy.ndarray (dtype=numpy.complex)
+    gip_left : torch.Tensor (dtype=torch.complex)
         Left-conencted blocks of the retarded Green's function
     """
     # -------------------------------------------------------------------
@@ -208,13 +208,13 @@ def recursive_gf(energy, hl, hd, hu, sd, su, sl, left_se, right_se, seP=None, E_
 
     Parameters
     ----------
-    energy : numpy.ndarray (dtype=numpy.float)
+    energy : torch.Tensor (dtype=torch.float)
         Energy array
-    mat_d_list : list of numpy.ndarray (dtype=numpy.float)
+    mat_d_list : list of torch.Tensor (dtype=torch.float)
         List of diagonal blocks
-    mat_u_list : list of numpy.ndarray (dtype=numpy.float)
+    mat_u_list : list of torch.Tensor (dtype=torch.float)
         List of upper-diagonal blocks
-    mat_l_list : list of numpy.ndarray (dtype=numpy.float)
+    mat_l_list : list of torch.Tensor (dtype=torch.float)
         List of lower-diagonal blocks
     s_in : Coupling Matrix Gamma from leads to the device
          (Default value = 0)
@@ -225,31 +225,31 @@ def recursive_gf(energy, hl, hd, hu, sd, su, sl, left_se, right_se, seP=None, E_
 
     Returns
     -------
-    g_trans : numpy.ndarray (dtype=numpy.complex)
+    g_trans : torch.Tensor (dtype=torch.complex)
         Blocks of the retarded Green's function responsible for transmission
-    grd : numpy.ndarray (dtype=numpy.complex)
+    grd : torch.Tensor (dtype=torch.complex)
         Diagonal blocks of the retarded Green's function
-    grl : numpy.ndarray (dtype=numpy.complex)
+    grl : torch.Tensor (dtype=torch.complex)
         Lower diagonal blocks of the retarded Green's function
-    gru : numpy.ndarray (dtype=numpy.complex)
+    gru : torch.Tensor (dtype=torch.complex)
         Upper diagonal blocks of the retarded Green's function
-    gr_left : numpy.ndarray (dtype=numpy.complex)
+    gr_left : torch.Tensor (dtype=torch.complex)
         Left-conencted blocks of the retarded Green's function
-    gnd : numpy.ndarray (dtype=numpy.complex)
+    gnd : torch.Tensor (dtype=torch.complex)
         Diagonal blocks of the retarded Green's function
-    gnl : numpy.ndarray (dtype=numpy.complex)
+    gnl : torch.Tensor (dtype=torch.complex)
         Lower diagonal blocks of the retarded Green's function
-    gnu : numpy.ndarray (dtype=numpy.complex)
+    gnu : torch.Tensor (dtype=torch.complex)
         Upper diagonal blocks of the retarded Green's function
-    gin_left : numpy.ndarray (dtype=numpy.complex)
+    gin_left : torch.Tensor (dtype=torch.complex)
         Left-conencted blocks of the retarded Green's function
-    gpd : numpy.ndarray (dtype=numpy.complex)
+    gpd : torch.Tensor (dtype=torch.complex)
         Diagonal blocks of the retarded Green's function
-    gpl : numpy.ndarray (dtype=numpy.complex)
+    gpl : torch.Tensor (dtype=torch.complex)
         Lower diagonal blocks of the retarded Green's function
-    gpu : numpy.ndarray (dtype=numpy.complex)
+    gpu : torch.Tensor (dtype=torch.complex)
         Upper diagonal blocks of the retarded Green's function
-    gip_left : numpy.ndarray (dtype=numpy.complex)
+    gip_left : torch.Tensor (dtype=torch.complex)
         Left-conencted blocks of the retarded Green's function
     """
 
