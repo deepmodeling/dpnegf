@@ -117,12 +117,12 @@ class DeviceProperty(object):
 
 
     def cal_green_function(self, energy, kpoint, eta_device=0., block_tridiagonal=True, Vbias=None,
-                           HS_inmem:bool=True):
+                           HS_inmem:bool=True, need_lesser:bool=False, need_greater:bool=False, need_gr_lc:bool=True):
         ''' computes the Green's function for a given energy and k-point in device.
 
         the tags used here to identify different Green's functions follows the NEGF theory 
         developed by Supriyo Datta in his book "Quantum Transport: Atom to Transistor". 
-        The detials are listed in DeePTB/dptb/negf/RGF.py docstring.
+        The detials are listed in dpnegf/negf/recursive_green_cal.py docstring.
         
         Parameters
         ----------
@@ -140,6 +140,14 @@ class DeviceProperty(object):
         HS_inmem
             A boolean parameter that shows whether the Hamiltonian/overlap is stored in memory after finishing 
             cal_green_function or not, which is important for large-scale calculations.
+        need_lesser
+            A boolean parameter that indicates whether the lesser Green's function is needed in the calculation.
+            The lesser Green's function is used to calculate the electron density and current density.
+        need_greater
+            A boolean parameter that indicates whether the greater Green's function is needed in the calculation.
+            The greater Green's function is used to calculate the hole density and phase-breaking scattering.
+        need_gr_lc
+            A boolean parameter that indicates whether the last column blocks of the retarded Green's function are needed.
         '''
         assert len(np.array(kpoint).reshape(-1)) == 3
         if not isinstance(energy, torch.Tensor):
@@ -185,26 +193,21 @@ class DeviceProperty(object):
             self.hd, self.sd, self.hl, self.su, self.sl, self.hu = self.hamiltonian.get_hs_device(self.kpoint, self.V, block_tridiagonal)
 
 
-        s_in = [torch.zeros(i.shape).cdouble() for i in self.hd]
-               
         tags = ["g_trans","gr_lc", \
                "grd", "grl", "gru", "gr_left", \
                "gnd", "gnl", "gnu", "gin_left", \
                "gpd", "gpl", "gpu", "gip_left"]
-        
+
         seL = self.lead_L.se
         seR = self.lead_R.se
-        # Fluctuation-Dissipation theorem
-        seinL = 1j*(seL-seL.conj().T) * self.lead_L.fermi_dirac(energy+self.E_ref).reshape(-1)
-        seinR = 1j*(seR-seR.conj().T) * self.lead_R.fermi_dirac(energy+self.E_ref).reshape(-1)
-        s01, s02 = s_in[0].shape # The shape of the first H block
-        se01, se02 = seL.shape # The shape of the left self-energy
-        s11, s12 = s_in[-1].shape
+        s01, s02 = self.hd[0].shape  # The shape of the first H block
+        se01, se02 = seL.shape       # The shape of the left self-energy
+        s11, s12 = self.hd[-1].shape
         se11, se12 = seR.shape
-        idx0, idy0 = min(s01, se01), min(s02, se02) # The minimum of the two shapes
+        idx0, idy0 = min(s01, se01), min(s02, se02)
         idx1, idy1 = min(s11, se11), min(s12, se12)
         if block_tridiagonal:
-            # Based on the block tridiagonal algorithm, the shape of the self-energy should be 
+            # Based on the block tridiagonal algorithm, the shape of the self-energy should be
             # equal to or larger than the corresponding Hamiltonian block
             if se01 > s01 or se02 > s02:
                 log.warning(f"The shape of left self-energy ({se01},{se02}) is larger than\
@@ -214,18 +217,24 @@ class DeviceProperty(object):
                 log.warning(f"The shape of right self-energy ({se11},{se12}) is different from\
                              the last Hamiltonian block ({s11},{s12}).")
                 raise ValueError("Right Lead Self Energy size is larger than the last Hamiltonian Block.")
-            
-        
+
         green_funcs = {}
 
-        s_in[0][:idx0,:idy0] = s_in[0][:idx0,:idy0] + seinL[:idx0,:idy0]
-        s_in[-1][-idx1:,-idy1:] = s_in[-1][-idx1:,-idy1:] + seinR[-idx1:,-idy1:]
+        if need_lesser:
+            # Fluctuation-Dissipation theorem; only build s_in when the lesser GF is consumed
+            seinL = 1j*(seL-seL.conj().T) * self.lead_L.fermi_dirac(energy+self.E_ref).reshape(-1)
+            seinR = 1j*(seR-seR.conj().T) * self.lead_R.fermi_dirac(energy+self.E_ref).reshape(-1)
+            s_in = [torch.zeros(i.shape).cdouble() for i in self.hd]
+            s_in[0][:idx0,:idy0] = s_in[0][:idx0,:idy0] + seinL[:idx0,:idy0]
+            s_in[-1][-idx1:,-idy1:] = s_in[-1][-idx1:,-idy1:] + seinR[-idx1:,-idy1:]
+        else:
+            s_in = 0
+
         ans = recursive_gf(energy, hl=self.hl, hd=self.hd, hu=self.hu,
-                            sd=self.sd, su=self.su, sl=self.sl, 
+                            sd=self.sd, su=self.su, sl=self.sl,
                             left_se=seL, right_se=seR, seP=None, s_in=s_in,
-                            s_out=None, eta=eta_device, E_ref = self.E_ref)
-        s_in[0][:idx0,:idy0] = s_in[0][:idx0,:idy0] - seinL[:idx0,:idy0]
-        s_in[-1][-idx1:,-idy1:] = s_in[-1][-idx1:,-idy1:] - seinR[-idx1:,-idy1:]
+                            s_out=None, eta=eta_device, E_ref=self.E_ref,
+                            need_lesser=need_lesser, need_greater=need_greater, need_gr_lc=need_gr_lc)
             # green shape [[g_trans, grd, grl,...],[g_trans, ...]]
         
         for t in range(len(tags)):
@@ -310,12 +319,6 @@ class DeviceProperty(object):
             cc.append(I)
 
         return vv, cc
-    
-    # def fermi_dirac(self, x) -> torch.Tensor:
-    #     '''
-    #     calculates the Fermi-Dirac distribution function for a given energy.
-    #     '''
-    #     return 1 / (1 + torch.exp((x - self.chemiPot) / self.kBT))
 
 
     def _cal_tc_(self):
