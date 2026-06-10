@@ -693,7 +693,10 @@ class NEGF(object):
                             energy=e, kpoint=k, 
                             eta_device=self.eta_device,
                             block_tridiagonal=self.block_tridiagonal,
-                            Vbias=Vbias
+                            Vbias=Vbias,
+                            need_lesser=False,
+                            need_greater=False,
+                            need_gr_lc=False, # set to False for memory saving, can be set to True for lead spectral function G^r * \Gamma * G^a
                             )
                         # self.out["gtrans"][str(e.numpy())] = gtrans
 
@@ -785,11 +788,14 @@ class NEGF(object):
                                     
                             self.deviceprop.cal_green_function(
                                 energy=e,
-                                kpoint=k, 
-                                eta_device=self.eta_device, 
-                                block_tridiagonal=self.block_tridiagonal
+                                kpoint=k,
+                                eta_device=self.eta_device,
+                                block_tridiagonal=self.block_tridiagonal,
+                                need_lesser=True, # set to True for gn
+                                need_greater=False,
+                                need_gr_lc=False,
                                 )
-                            
+
                             lcurrent += self.int_weight[i] * self.compute_lcurrent(k)
 
                         prop_local_current = self.out.setdefault('LOCAL_CURRENT', {})
@@ -925,7 +931,13 @@ class NEGF(object):
      
 
     def compute_current(self, kpoint):
-        self.deviceprop.cal_green_function(e=self.int_grid, kpoint=kpoint, block_tridiagonal=self.block_tridiagonal)
+        self.deviceprop.cal_green_function(e=self.int_grid, 
+                                           kpoint=kpoint, 
+                                           eta_device=self.eta_device,
+                                           block_tridiagonal=self.block_tridiagonal,
+                                           need_lesser=False, # set to True for gn
+                                           need_greater=False,
+                                           need_gr_lc=False,)
         return self.deviceprop.current
     
     def compute_lcurrent(self, kpoint):
