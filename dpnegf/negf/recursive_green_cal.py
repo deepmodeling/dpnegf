@@ -9,6 +9,8 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list, sd, su, sl, s_i
     In order to get the electron correlation function output, the parameters s_in has to be set.
     For the hole correlation function, the parameter s_out has to be set.
 
+    By default, the function would return the retarded Green's function blocks.
+
     Parameters
     ----------
     energy : torch.Tensor (dtype=torch.float)
@@ -23,13 +25,25 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list, sd, su, sl, s_i
          (Default value = 0)
     s_out :
          (Default value = 0)
-    damp :
+    eta :
          (Default value = 0.000001j)
-
+    need_lesser : bool, optional
+        Whether to calculate the lesser Green's function, by default False. 
+        Lesser Green's function is used for electron density and current density calculation.
+    need_greater : bool, optional
+        Whether to calculate the greater Green's function, by default False.
+        Greater Green's function is used for hole density and phase-breaking scattering case.
+    need_gr_lc : bool, optional
+        Whether to calculate the last column blocks of the retarded Green's function responsible for transmission, by default True
+        gr_lc is used for lead spectral function A_L/ A_R = G^r * Gamma_L/R * G^a calculation.
+        Although set need_gr_lc to True would not increase the computational cost of the recursive Green's function algorithm, it would increase the memory cost.
+        If the memory cost is a concern, it is recommended to set need_gr_lc to False.
     Returns
     -------
     g_trans : torch.Tensor (dtype=torch.complex)
-        Blocks of the retarded Green's function responsible for transmission
+        [0, N-1] block of the retarded Green's function responsible for transmission
+    gr_lc: torch.Tensor (dtype=torch.complex)
+        Last column [:, N-1] blocks of the retarded Green's function responsible for transmission
     grd : torch.Tensor (dtype=torch.complex)
         Diagonal blocks of the retarded Green's function
     grl : torch.Tensor (dtype=torch.complex)
@@ -37,23 +51,23 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list, sd, su, sl, s_i
     gru : torch.Tensor (dtype=torch.complex)
         Upper diagonal blocks of the retarded Green's function
     gr_left : torch.Tensor (dtype=torch.complex)
-        Left-conencted blocks of the retarded Green's function
+        Diagonal blocks of the Left-conencted retarded Green's function
     gnd : torch.Tensor (dtype=torch.complex)
-        Diagonal blocks of the retarded Green's function
+        Diagonal blocks of the lesser Green's function
     gnl : torch.Tensor (dtype=torch.complex)
-        Lower diagonal blocks of the retarded Green's function
+        Lower diagonal blocks of the lesser Green's function
     gnu : torch.Tensor (dtype=torch.complex)
-        Upper diagonal blocks of the retarded Green's function
+        Upper diagonal blocks of the lesser Green's function
     gin_left : torch.Tensor (dtype=torch.complex)
-        Left-conencted blocks of the retarded Green's function
+        Diagonal blocks of the Left-conencted lesser Green's function
     gpd : torch.Tensor (dtype=torch.complex)
-        Diagonal blocks of the retarded Green's function
+        Diagonal blocks of the greater Green's function
     gpl : torch.Tensor (dtype=torch.complex)
-        Lower diagonal blocks of the retarded Green's function
+        Lower diagonal blocks of the greater Green's function
     gpu : torch.Tensor (dtype=torch.complex)
-        Upper diagonal blocks of the retarded Green's function
+        Upper diagonal blocks of the greater Green's function
     gip_left : torch.Tensor (dtype=torch.complex)
-        Left-conencted blocks of the retarded Green's function
+        Diagonal blocks of the Left-conencted greater Green's function
     """
     # -------------------------------------------------------------------
     # ---------- convert input arrays to the matrix data type -----------
@@ -220,37 +234,22 @@ def recursive_gf(energy, hl, hd, hu, sd, su, sl, left_se, right_se, seP=None, E_
          (Default value = 0)
     s_out :
          (Default value = 0)
-    damp :
+    eta :
          (Default value = 0.000001j)
+    need_lesser : bool, optional
+        Whether to calculate the lesser Green's function, by default False. 
+        Lesser Green's function is used for electron density and current density calculation.
+    need_greater : bool, optional
+        Whether to calculate the greater Green's function, by default False.
+        Greater Green's function is used for hole density and phase-breaking scattering case.
+    need_gr_lc : bool, optional
+        Whether to calculate the left-connected blocks of the retarded Green's function responsible for transmission,
+        by default False for memory saving. 
 
     Returns
     -------
-    g_trans : torch.Tensor (dtype=torch.complex)
-        Blocks of the retarded Green's function responsible for transmission
-    grd : torch.Tensor (dtype=torch.complex)
-        Diagonal blocks of the retarded Green's function
-    grl : torch.Tensor (dtype=torch.complex)
-        Lower diagonal blocks of the retarded Green's function
-    gru : torch.Tensor (dtype=torch.complex)
-        Upper diagonal blocks of the retarded Green's function
-    gr_left : torch.Tensor (dtype=torch.complex)
-        Left-conencted blocks of the retarded Green's function
-    gnd : torch.Tensor (dtype=torch.complex)
-        Diagonal blocks of the retarded Green's function
-    gnl : torch.Tensor (dtype=torch.complex)
-        Lower diagonal blocks of the retarded Green's function
-    gnu : torch.Tensor (dtype=torch.complex)
-        Upper diagonal blocks of the retarded Green's function
-    gin_left : torch.Tensor (dtype=torch.complex)
-        Left-conencted blocks of the retarded Green's function
-    gpd : torch.Tensor (dtype=torch.complex)
-        Diagonal blocks of the retarded Green's function
-    gpl : torch.Tensor (dtype=torch.complex)
-        Lower diagonal blocks of the retarded Green's function
-    gpu : torch.Tensor (dtype=torch.complex)
-        Upper diagonal blocks of the retarded Green's function
-    gip_left : torch.Tensor (dtype=torch.complex)
-        Left-conencted blocks of the retarded Green's function
+     ans: tuple of torch.Tensor
+         The output of the recursive Green's function calculation
     """
 
     shift_energy = energy + E_ref
