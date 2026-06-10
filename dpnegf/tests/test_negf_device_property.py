@@ -122,9 +122,10 @@ def test_negf_Device(root_directory):
     assert  abs(device.lead_R.se-lead_R_se_standard).max()<1e-5
 
     device.cal_green_function(  energy=torch.tensor([0]),   #calculate device green function at E=0
-                            kpoint=kpoints[0], 
-                            eta_device=task_options["eta_device"], 
-                            block_tridiagonal=task_options["block_tridiagonal"]
+                            kpoint=kpoints[0],
+                            eta_device=task_options["eta_device"],
+                            block_tridiagonal=task_options["block_tridiagonal"],
+                            need_lesser=True
                             )
 
     #check  green functions' results
