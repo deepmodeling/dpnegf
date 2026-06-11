@@ -1055,7 +1055,7 @@ def negf():
         Argument("espacing", [int, float], optional=False, doc=doc_espacing),
         Argument("emin", [int, float], optional=False, doc=doc_emin),
         Argument("emax", [int, float], optional=False, doc=doc_emax),
-        Argument("e_batch_size", [int, float], optional=False, doc="the batch size for energy points in NEGF calculation"),
+        Argument("e_batch_size", [int, float], optional=True, default=None, doc="the batch size for energy points in NEGF calculation"),
         Argument("e_fermi", [int, float], optional=True, default=None ,doc=doc_e_fermi),
         Argument("density_options", dict, optional=True, default={}, sub_fields=[], sub_variants=[density_options()], doc=doc_density_options),
         Argument("eta_lead", [int, float], optional=True, default=1e-5, doc=doc_eta_lead),
