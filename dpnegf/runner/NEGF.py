@@ -64,7 +64,7 @@ class NEGF(object):
         self.cdtype = torch.complex128
         self.torch_device = torch_device
         self.n_cpus = n_cpus
-               
+
         # get the parameters
         self.ele_T = ele_T
         self.kBT = Boltzmann * self.ele_T / eV2J # change to eV
@@ -113,6 +113,14 @@ class NEGF(object):
             self.kpoints,self.wk = kmesh_sampling_negf(self.stru_options["kmesh"], 
                                                        self.stru_options["gamma_center"],
                                                      self.stru_options["time_reversal_symmetry"])
+
+        if 'override_overlap' in kwargs:
+            assert isinstance(kwargs['override_overlap'], str)
+            self.override_overlap = kwargs['override_overlap']
+            log.info(msg="Using external calculated overlap overriding!")
+        else:
+            self.override_overlap = None
+
         log.info(msg="------ k-point for NEGF -----")
         log.info(msg="Gamma Center: {0}".format(self.stru_options["gamma_center"]))
         log.info(msg="Time Reversal: {0}".format(self.stru_options["time_reversal_symmetry"]))
@@ -180,7 +188,7 @@ class NEGF(object):
         e_fermi = {}; chemiPot = {}
         # calculate Fermi level
         if  self.e_fermi is None:        
-            elec_cal = ElecStruCal(model=model,device=self.torch_device)
+            elec_cal = ElecStruCal(model=model, device=self.torch_device, override_overlap=self.override_overlap)
             nel_atom_lead = self.get_nel_atom_lead(
                                 struct_leads, 
                                 charge={lead_tag: self.stru_options[lead_tag].get("charge", 0) for lead_tag in ["lead_L", "lead_R"]}
@@ -551,7 +559,8 @@ class NEGF(object):
         # self energy calculation
         log.info(msg="------Self-energy calculation------")
         if  self.self_energy_save_path is None:
-            self.self_energy_save_path = os.path.join(self.results_path, "self_energy") 
+            self.self_energy_save_path = os.path.join(self.results_path, "self_energy")
+        self.self_energy_save_path = os.path.abspath(self.self_energy_save_path)
         os.makedirs(self.self_energy_save_path, exist_ok=True)
 
         if self.use_saved_se:

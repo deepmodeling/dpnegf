@@ -1035,6 +1035,7 @@ def negf():
     doc_out_lcurrent = ""
     doc_density_options = ""
     doc_out_potential = ""
+    doc_override_overlap = ""
 
     return [
         Argument("scf", bool, optional=True, default=False, doc=doc_scf),
@@ -1067,7 +1068,8 @@ def negf():
         Argument("out_current_nscf", bool, optional=True, default=False, doc=doc_out_current_nscf),
         Argument("out_ldos", bool, optional=True, default=False, doc=doc_out_ldos),
         Argument("out_lcurrent", bool, optional=True, default=False, doc=doc_out_lcurrent),
-        Argument("n_cpus", [int, None], optional=True, default=None, doc="Number of CPU cores for parallel self-energy calculation. Default None uses os.cpu_count().")
+        Argument("n_cpus", [int, None], optional=True, default=None, doc="Number of CPU cores for parallel self-energy calculation. Default None uses os.cpu_count()."),
+        Argument("override_overlap", str, optional=True, doc=doc_override_overlap),
     ]
 
 def stru_options():
