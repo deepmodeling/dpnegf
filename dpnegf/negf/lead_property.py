@@ -450,7 +450,7 @@ class LeadProperty(object):
             The Gamma function, Gamma = 1j(se-se^dagger).
         
         '''
-        return 1j * (se - se.conj().T)
+        return 1j * (se - se.mH)
     
     def fermi_dirac(self, x) -> torch.Tensor:
         return 1 / (1 + torch.exp((x - self.chemiPot_lead)/ self.kBT))
