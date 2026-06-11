@@ -250,8 +250,7 @@ def recursive_gf(energy, hl, hd, hu, sd, su, sl, left_se, right_se, seP=None, E_
     shift_energy = energy + E_ref
     if not torch.is_tensor(shift_energy):
         shift_energy = torch.as_tensor(shift_energy, dtype=torch.complex128)
-    # Legacy scalar callers pass either a 0-d tensor or a length-1 1-D tensor
-    # together with 2-D Hamiltonian / self-energy inputs. 
+    # Legacy scalar callers pass either a 0-d tensor or a length-1 1-D tensor together with 2-D Hamiltonian / self-energy inputs. 
     # Batched callers pass a 1-D ``[B]`` energy together with 3-D ``[B, n, n]`` tensors. 
     # Use the rank of ``left_se`` (or ``right_se``) as the disambiguator so the
     # wrapper can squeeze the batch dim back out for scalar callers.
