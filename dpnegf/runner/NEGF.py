@@ -35,7 +35,8 @@ except ImportError:
 # TODO : add common class to set all the dtype and precision.
 
 class NEGF(object):
-    def __init__(self, 
+    @torch.no_grad()
+    def __init__(self,
                 model: torch.nn.Module,
                 structure: Union[AtomicData, ase.Atoms, str],
                 ele_T: float,
@@ -154,13 +155,12 @@ class NEGF(object):
                                                     unit = self.unit, 
                                                     results_path=self.results_path,
                                                     torch_device = self.torch_device)
-        with torch.no_grad():
-            # if useBloch is None, structure_leads_fold,bloch_sorted_indices,bloch_R_lists = None,None,None
-            struct_device, struct_leads,structure_leads_fold,bloch_sorted_indices,bloch_R_lists = \
-                self.negf_hamiltonian.initialize(kpoints=self.kpoints,
-                                                 block_tridiagnal=self.block_tridiagonal, plot_blocks=self.plot_blocks,\
-                                                 useBloch=self.useBloch,bloch_factor=self.bloch_factor,
-                                                 use_saved_HS=self.use_saved_HS, saved_HS_path=self.saved_HS_path)
+        # if useBloch is None, structure_leads_fold,bloch_sorted_indices,bloch_R_lists = None,None,None
+        struct_device, struct_leads,structure_leads_fold,bloch_sorted_indices,bloch_R_lists = \
+            self.negf_hamiltonian.initialize(kpoints=self.kpoints,
+                                             block_tridiagnal=self.block_tridiagonal, plot_blocks=self.plot_blocks,\
+                                             useBloch=self.useBloch,bloch_factor=self.bloch_factor,
+                                             use_saved_HS=self.use_saved_HS, saved_HS_path=self.saved_HS_path)
         profiler.stop()
         output_path = os.path.join(self.results_path, "profile_report_ham_init.html")
         with open(output_path, 'w') as report_file:
@@ -356,7 +356,8 @@ class NEGF(object):
             xu = torch.tensor(max(v_list)+8*self.kBT)
             self.int_grid, self.int_weight = gauss_xw(xl=xl, xu=xu, n=int(self.density_options["n_gauss"]))
 
-    def compute(self, 
+    @torch.no_grad()
+    def compute(self,
                 pcond: Optional[Interface3D]=None) -> Optional[Interface3D]:
         '''
         compute the NEGF calculation, can also from the given Poisson
