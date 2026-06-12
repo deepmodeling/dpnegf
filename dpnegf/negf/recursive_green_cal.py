@@ -1,12 +1,17 @@
 import torch.linalg as tLA
 import torch
 
-def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list, 
+def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
                      sd, su, sl, s_in=0, s_out=0, eta=1e-5,
                      need_lesser=False, need_greater=False, need_gr_lc=False):
     """The recursive Green's function algorithm is taken from
     M. P. Anantram, M. S. Lundstrom and D. E. Nikonov, Proceedings of the IEEE, 96, 1511 - 1550 (2008)
     DOI: 10.1109/JPROC.2008.927355
+
+    Batched form: every tensor carries a leading energy-batch dim B. Diagonal
+    blocks have shape ``[B, n_q, n_q]`` and the energy argument is ``[B]``.
+    Scalar callers go through :func:`recursive_gf`, which broadcasts to B=1
+    and squeezes the leading dim back out.
 
     In order to get the electron correlation function output, the parameters s_in has to be set.
     For the hole correlation function, the parameter s_out has to be set.
@@ -15,22 +20,24 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
 
     Parameters
     ----------
-    energy : torch.Tensor (dtype=torch.float)
-        Energy array
-    mat_d_list : list of torch.Tensor (dtype=torch.float)
-        List of diagonal blocks
-    mat_u_list : list of torch.Tensor (dtype=torch.float)
-        List of upper-diagonal blocks
-    mat_l_list : list of torch.Tensor (dtype=torch.float)
-        List of lower-diagonal blocks
+    energy : torch.Tensor (dtype=torch.complex)
+        Energy array of shape ``[B]``.
+    mat_d_list : list of torch.Tensor (dtype=torch.complex)
+        List of diagonal blocks, each of shape ``[B, n_q, n_q]``.
+    mat_u_list : list of torch.Tensor (dtype=torch.complex)
+        List of upper-diagonal blocks, each of shape ``[B, n_q, n_{q+1}]``.
+    mat_l_list : list of torch.Tensor (dtype=torch.complex)
+        List of lower-diagonal blocks, each of shape ``[B, n_{q+1}, n_q]``.
     s_in :
-         (Default value = 0)
+         (Default value = 0). When ``need_lesser`` is True, a list of
+         ``[B, n_q, n_q]`` tensors.
     s_out :
-         (Default value = 0)
+         (Default value = 0). When ``need_greater`` is True, a list of
+         ``[B, n_q, n_q]`` tensors.
     eta :
          (Default value = 0.000001j)
     need_lesser : bool, optional
-        Whether to calculate the lesser Green's function, by default False. 
+        Whether to calculate the lesser Green's function, by default False.
         Lesser Green's function is used for electron density and current density calculation.
     need_greater : bool, optional
         Whether to calculate the greater Green's function, by default False.
@@ -40,88 +47,65 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
         gr_lc is used for lead spectral function A_L/ A_R = G^r * Gamma_L/R * G^a calculation.
         Although set need_gr_lc to True would not increase the computational cost of the recursive Green's function algorithm, it would increase the memory cost.
         If the memory cost is a concern, it is recommended to set need_gr_lc to False.
+
     Returns
     -------
-    g_trans : torch.Tensor (dtype=torch.complex)
-        [0, N-1] block of the retarded Green's function responsible for transmission
-    gr_lc: torch.Tensor (dtype=torch.complex)
-        Last column [:, N-1] blocks of the retarded Green's function responsible for transmission
-    grd : torch.Tensor (dtype=torch.complex)
-        Diagonal blocks of the retarded Green's function
-    grl : torch.Tensor (dtype=torch.complex)
-        Lower diagonal blocks of the retarded Green's function
-    gru : torch.Tensor (dtype=torch.complex)
-        Upper diagonal blocks of the retarded Green's function
-    gr_left : torch.Tensor (dtype=torch.complex)
-        Diagonal blocks of the Left-conencted retarded Green's function
-    gnd : torch.Tensor (dtype=torch.complex)
-        Diagonal blocks of the lesser Green's function
-    gnl : torch.Tensor (dtype=torch.complex)
-        Lower diagonal blocks of the lesser Green's function
-    gnu : torch.Tensor (dtype=torch.complex)
-        Upper diagonal blocks of the lesser Green's function
-    gin_left : torch.Tensor (dtype=torch.complex)
-        Diagonal blocks of the Left-conencted lesser Green's function
-    gpd : torch.Tensor (dtype=torch.complex)
-        Diagonal blocks of the greater Green's function
-    gpl : torch.Tensor (dtype=torch.complex)
-        Lower diagonal blocks of the greater Green's function
-    gpu : torch.Tensor (dtype=torch.complex)
-        Upper diagonal blocks of the greater Green's function
-    gip_left : torch.Tensor (dtype=torch.complex)
-        Diagonal blocks of the Left-conencted greater Green's function
+    All returned blocks carry a leading batch dim ``B``.
     """
-    # -------------------------------------------------------------------
-    # ---------- convert input arrays to the matrix data type -----------
-    # ----------------- in case they are not matrices -------------------
-    # -------------------------------------------------------------------
     if need_lesser:
         assert isinstance(s_in, list), "Lesser Green's function calculation requires s_in to be a list of coupling matrices"
     if need_greater:
         assert isinstance(s_out, list), "Greater Green's function calculation requires s_out to be a list of coupling matrices"
-    for jj, item in enumerate(mat_d_list):
-        mat_d_list[jj] = mat_d_list[jj] - (energy+1j*eta) * sd[jj]
 
-    for jj, item in enumerate(mat_l_list):
-        mat_l_list[jj] = mat_l_list[jj] - (energy+1j*eta) * sl[jj]
-    for jj, item in enumerate(mat_u_list):
-        mat_u_list[jj] = mat_u_list[jj] - (energy+1j*eta) * su[jj]
-    # computes matrix sizes
-    num_of_matrices = len(mat_d_list)  # Number of diagonal blocks.
-    mat_shapes = [item.shape for item in mat_d_list]  # This gives the sizes of the diagonal matrices.
+    # energy enters as a [B]-shaped (or broadcastable) complex tensor; reshape
+    # so it multiplies into [B, n, n] block tensors along the batch dim.
+    e_bcast = (energy + 1j * eta).view(-1, 1, 1)
 
+    for jj in range(len(mat_d_list)):
+        mat_d_list[jj] = mat_d_list[jj] - e_bcast * sd[jj]
+    for jj in range(len(mat_l_list)):
+        mat_l_list[jj] = mat_l_list[jj] - e_bcast * sl[jj]
+    for jj in range(len(mat_u_list)):
+        mat_u_list[jj] = mat_u_list[jj] - e_bcast * su[jj]
+
+    num_of_matrices = len(mat_d_list)
+    mat_shapes = [item.shape for item in mat_d_list]  # [B, n_q, n_q]
+    ref = mat_d_list[0]
+    B = ref.shape[0]
+
+    def _batched_eye(n):
+        return torch.eye(n, dtype=ref.dtype, device=ref.device).expand(B, n, n)
 
     # -------------------------------------------------------------------
     # -------------- compute retarded Green's function ------------------
     # -------------------------------------------------------------------
     # Firstly calculate the left-connected retarded Green's function
     gr_left = [None for _ in range(num_of_matrices)]
-    gr_left[0] = tLA.solve(-mat_d_list[0], torch.eye(mat_shapes[0][0], dtype=mat_d_list[0].dtype))  # Initialising the retarded left connected.
+    gr_left[0] = tLA.solve(-mat_d_list[0], _batched_eye(mat_shapes[0][-1]))
 
     for q in range(num_of_matrices - 1):  # Recursive algorithm (B2)
-        gr_left[q + 1] = tLA.solve(-mat_d_list[q + 1] - mat_l_list[q] @ gr_left[q] @ mat_u_list[q],
-                                      torch.eye(mat_shapes[q + 1][0], dtype=mat_d_list[0].dtype))  # The left connected recursion.
-    # -------------------------------------------------------------------
+        gr_left[q + 1] = tLA.solve(
+            -mat_d_list[q + 1] - mat_l_list[q] @ gr_left[q] @ mat_u_list[q],
+            _batched_eye(mat_shapes[q + 1][-1]),
+        )
 
-    grl = [None for _ in range(num_of_matrices-1)]
-    gru = [None for _ in range(num_of_matrices-1)]
-    grd = [i.clone() for i in gr_left]  # Our glorious benefactor.
+    grl = [None for _ in range(num_of_matrices - 1)]
+    gru = [None for _ in range(num_of_matrices - 1)]
+    grd = [i.clone() for i in gr_left]
     g_trans = gr_left[len(gr_left) - 1].clone()
     if need_gr_lc:
         gr_lc = [gr_left[len(gr_left) - 1].clone()]
     else:
         gr_lc = None
     for q in range(num_of_matrices - 2, -1, -1):  # Recursive algorithm
-        grl[q] = grd[q + 1] @ mat_l_list[q] @ gr_left[q]  # (B5) We get the off-diagonal blocks for free.
-        gru[q] = gr_left[q] @ mat_u_list[q] @ grd[q + 1]  # (B6) because we need .Tthem.T for the next calc:
-        grd[q] = gr_left[q] + gr_left[q] @ mat_u_list[q] @ grl[q]  # (B4) I suppose I could also use the lower.
-        g_trans = gr_left[q] @ mat_u_list[q] @ g_trans # iteratively calculate the (0, N-1) block of the retarded Green's function responsible for transmission
+        grl[q] = grd[q + 1] @ mat_l_list[q] @ gr_left[q]  # (B5)
+        gru[q] = gr_left[q] @ mat_u_list[q] @ grd[q + 1]  # (B6)
+        grd[q] = gr_left[q] + gr_left[q] @ mat_u_list[q] @ grl[q]  # (B4)
+        g_trans = gr_left[q] @ mat_u_list[q] @ g_trans
         if need_gr_lc:
-            gr_lc.append(g_trans) # The last coloumn of the retarded Green's function: (:, N-1) block of the retarded Green's function
+            gr_lc.append(g_trans)
     if need_gr_lc:
         gr_lc.reverse()
-
-
 
     # -------------------------------------------------------------------
     # ------ compute the electron correlation function ( Lesser Green Function ) if needed --------
@@ -131,31 +115,25 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
         assert isinstance(s_in, list), "need_lesser=True requires s_in to be a list of coupling matrices"
         gin_left = [None for _ in range(num_of_matrices)]
         # Keldysh formula: G^< = G^r * Sigma^< * G^a  ====> (-i * G^<) = G^r * (-i * Sigma^<) * G^a
-        gin_left[0] = gr_left[0] @ s_in[0] @ gr_left[0].conj().T
+        gin_left[0] = gr_left[0] @ s_in[0] @ gr_left[0].mH
 
         for q in range(num_of_matrices - 1):
-            # sla2: coupling with the left layer 
-            # s_in[q + 1]: coupling directly with the q+1 layer from lead
             sla2 = mat_l_list[q] @ gin_left[q] @ mat_u_list[q]
             prom = s_in[q + 1] + sla2
-            gin_left[q + 1] = gr_left[q + 1] @ prom @ gr_left[q + 1].conj().T 
+            gin_left[q + 1] = gr_left[q + 1] @ prom @ gr_left[q + 1].mH
 
-        # ---------------------------------------------------------------
-
-        gnl = [None for _ in range(num_of_matrices-1)]
-        gnu = [None for _ in range(num_of_matrices-1)]
+        gnl = [None for _ in range(num_of_matrices - 1)]
+        gnu = [None for _ in range(num_of_matrices - 1)]
         gnd = [i.clone() for i in gin_left]
 
-        for q in range(num_of_matrices - 2, -1, -1):  # Recursive algorithm
+        for q in range(num_of_matrices - 2, -1, -1):
             gnl[q] = grd[q + 1] @ mat_l_list[q] @ gin_left[q] + \
-                     gnd[q + 1] @ mat_l_list[q] @ gr_left[q].conj().T # (B10) 
+                     gnd[q + 1] @ mat_l_list[q] @ gr_left[q].mH  # (B10)
             gnd[q] = gin_left[q] + \
-                             gr_left[q] @ mat_u_list[q] @ gnd[q + 1] @ mat_l_list[q] @ \
-                                 gr_left[q].conj().T + \
-                             ((gin_left[q] @ mat_u_list[q] @ gru[q].conj().T) + (gru[q] @
-                                 mat_l_list[q] @ gin_left[q])) # (B11)
-
-            gnu[q] = gnl[q].conj().T
+                     gr_left[q] @ mat_u_list[q] @ gnd[q + 1] @ mat_l_list[q] @ gr_left[q].mH + \
+                     ((gin_left[q] @ mat_u_list[q] @ gru[q].mH) +
+                      (gru[q] @ mat_l_list[q] @ gin_left[q]))  # (B11)
+            gnu[q] = gnl[q].mH
 
     # -------------------------------------------------------------------
     # -------- compute the hole correlation function if needed ----------
@@ -171,58 +149,54 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
             prom = s_out[q + 1] + sla2
             gip_left[q + 1] = gr_left[q + 1] @ prom @ gr_left[q + 1].conj()
 
-        # ---------------------------------------------------------------
-
-        gpl = [None for _ in range(num_of_matrices-1)]
-        gpu = [None for _ in range(num_of_matrices-1)]
+        gpl = [None for _ in range(num_of_matrices - 1)]
+        gpu = [None for _ in range(num_of_matrices - 1)]
         gpd = [i.clone() for i in gip_left]
 
-        for q in range(num_of_matrices - 2, -1, -1):  # Recursive algorithm
+        for q in range(num_of_matrices - 2, -1, -1):
             gpl[q] = grd[q + 1] @ mat_l_list[q] @ gip_left[q] + \
                      gpd[q + 1] @ mat_l_list[q].conj() @ gr_left[q].conj()
             gpd[q] = gip_left[q] + \
-                             gr_left[q] @ mat_u_list[q] @ gpd[q + 1] @ mat_l_list[q].conj() @ \
-                                 gr_left[q].conj()+ \
-                             ((gip_left[q]@ mat_u_list[q].conj() @ grl[q].conj()) + (gru[q] @
-                                mat_l_list[q] @ gip_left[q]))
-
-            gpu[q] = gpl[q].conj().T
+                     gr_left[q] @ mat_u_list[q] @ gpd[q + 1] @ mat_l_list[q].conj() @ gr_left[q].conj() + \
+                     ((gip_left[q] @ mat_u_list[q].conj() @ grl[q].conj()) +
+                      (gru[q] @ mat_l_list[q] @ gip_left[q]))
+            gpu[q] = gpl[q].mH
 
     # -------------------------------------------------------------------
     # -- remove energy from the main diagonal of th Hamiltonian matrix --
     # -------------------------------------------------------------------
 
-    for jj, item in enumerate(mat_d_list):
-        mat_d_list[jj] = mat_d_list[jj] + (energy + 1j * eta) * sd[jj]
-    for jj, item in enumerate(mat_l_list):
-        mat_l_list[jj] = mat_l_list[jj] + (energy + 1j * eta) * sl[jj]
-    for jj, item in enumerate(mat_u_list):
-        mat_u_list[jj] = mat_u_list[jj] + (energy + 1j * eta) * su[jj]
+    for jj in range(len(mat_d_list)):
+        mat_d_list[jj] = mat_d_list[jj] + e_bcast * sd[jj]
+    for jj in range(len(mat_l_list)):
+        mat_l_list[jj] = mat_l_list[jj] + e_bcast * sl[jj]
+    for jj in range(len(mat_u_list)):
+        mat_u_list[jj] = mat_u_list[jj] + e_bcast * su[jj]
 
     # -------------------------------------------------------------------
     # ---- choose a proper output depending on the list of arguments ----
     # -------------------------------------------------------------------
 
     if not need_lesser and not need_greater:
-        return g_trans,gr_lc, \
+        return g_trans, gr_lc, \
                grd, grl, gru, gr_left, \
                None, None, None, None, \
                None, None, None, None
 
     elif need_lesser and not need_greater:
-        return g_trans,gr_lc, \
+        return g_trans, gr_lc, \
                grd, grl, gru, gr_left, \
                gnd, gnl, gnu, gin_left, \
                None, None, None, None
 
     elif not need_lesser and need_greater:
-        return g_trans,gr_lc, \
+        return g_trans, gr_lc, \
                grd, grl, gru, gr_left, \
                None, None, None, None, \
                gpd, gpl, gpu, gip_left
 
     else:
-        return g_trans,gr_lc, \
+        return g_trans, gr_lc, \
                grd, grl, gru, gr_left, \
                gnd, gnl, gnu, gin_left, \
                gpd, gpl, gpu, gip_left
@@ -230,23 +204,26 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
 
 def recursive_gf(energy, hl, hd, hu, sd, su, sl, left_se, right_se, seP=None, E_ref=0.0, s_in=0, s_out=0,
                  eta=1e-5, need_lesser=False, need_greater=False, need_gr_lc=False):
-    
+
     """The recursive Green's function algorithm is taken from
     M. P. Anantram, M. S. Lundstrom and D. E. Nikonov, Proceedings of the IEEE, 96, 1511 - 1550 (2008)
     DOI: 10.1109/JPROC.2008.927355
 
-    Obitan various green function for later calculations.
+    Obtain various Green's functions for later calculations.
+
+    Accepts either a scalar/0-d ``energy`` (legacy callers) or a 1-D ``[B]``
+    energy tensor. In the scalar case, all inputs are broadcast to B=1, the
+    batched kernel runs, and the leading batch dim is squeezed back out so
+    return shapes match the legacy contract. In the batched case, every
+    energy-dependent input (``left_se``, ``right_se``, ``s_in``, ``s_out``,
+    ``seP``) must already carry the leading ``[B, ...]`` dim, and the
+    k-dependent blocks (``hd``, ``sd``, ``hl``, ``hu``, ``sl``, ``su``) may
+    arrive 2-D and will be expanded to ``[B, ...]`` zero-copy.
 
     Parameters
     ----------
-    energy : torch.Tensor (dtype=torch.float)
-        Energy array
-    mat_d_list : list of torch.Tensor (dtype=torch.float)
-        List of diagonal blocks
-    mat_u_list : list of torch.Tensor (dtype=torch.float)
-        List of upper-diagonal blocks
-    mat_l_list : list of torch.Tensor (dtype=torch.float)
-        List of lower-diagonal blocks
+    energy : torch.Tensor
+        Scalar (0-d) or 1-D ``[B]`` complex tensor.
     s_in : Coupling Matrix Gamma from leads to the device
          (Default value = 0)
     s_out :
@@ -254,63 +231,118 @@ def recursive_gf(energy, hl, hd, hu, sd, su, sl, left_se, right_se, seP=None, E_
     eta :
          (Default value = 0.000001j)
     need_lesser : bool, optional
-        Whether to calculate the lesser Green's function, by default False. 
+        Whether to calculate the lesser Green's function, by default False.
         Lesser Green's function is used for electron density and current density calculation.
     need_greater : bool, optional
         Whether to calculate the greater Green's function, by default False.
         Greater Green's function is used for hole density and phase-breaking scattering case.
     need_gr_lc : bool, optional
         Whether to calculate the left-connected blocks of the retarded Green's function responsible for transmission,
-        by default False for memory saving. 
+        by default False for memory saving.
 
     Returns
     -------
      ans: tuple of torch.Tensor
-         The output of the recursive Green's function calculation
+         The output of the recursive Green's function calculation. Leading
+         batch dim is squeezed when the caller passed a scalar energy.
     """
 
     shift_energy = energy + E_ref
-    # shift_energy = torch.scalar_tensor(shift_energy, dtype=torch.complex128)
+    if not torch.is_tensor(shift_energy):
+        shift_energy = torch.as_tensor(shift_energy, dtype=torch.complex128)
+    # Legacy scalar callers pass either a 0-d tensor or a length-1 1-D tensor together with 2-D Hamiltonian / self-energy inputs. 
+    # Batched callers pass a 1-D ``[B]`` energy together with 3-D ``[B, n, n]`` tensors. 
+    # Use the rank of ``left_se`` (or ``right_se``) as the disambiguator so the
+    # wrapper can squeeze the batch dim back out for scalar callers.
+    # se_probe is used to determine whether the self-energy inputs are 2-D (scalar energy case) or 3-D (batched energy case).
+    se_probe = left_se if isinstance(left_se, torch.Tensor) else right_se
+    squeezed = isinstance(se_probe, torch.Tensor) and se_probe.ndim == 2
+    # if squeezed = True, the wrapper will squeeze the leading batch dim from every output tensor; 
+    # if False, the wrapper leaves the leading batch dim in place.
+    if shift_energy.ndim == 0:
+        shift_energy = shift_energy.reshape(1)
+    elif squeezed and shift_energy.ndim == 1 and shift_energy.shape[0] == 1:
+        pass  # already shape [1]; kernel runs B=1, wrapper will squeeze
+    B = shift_energy.shape[0]
 
-    # if isinstance(hd,torch.Tensor): # hd, hl, hu are torch.nested.nested_tensor
-    #     temp_mat_d_list = [hd[i] * 1. for i in range(hd.size(0))]
-    #     temp_mat_l_list = [hl[i] * 1. for i in range(hl.size(0))]
-    #     temp_mat_u_list = [hu[i] * 1. for i in range(hu.size(0))]
-    # else:
-    temp_mat_d_list = [hd[i] * 1. for i in range(len(hd))]
-    temp_mat_l_list = [hl[i] * 1. for i in range(len(hl))]
-    temp_mat_u_list = [hu[i] * 1. for i in range(len(hu))]
+    def _to_batch(t):
+        if t.ndim == 2:
+            return t.unsqueeze(0).expand(B, -1, -1)
+        return t
+
+    temp_mat_d_list = [_to_batch(hd[i]) * 1. for i in range(len(hd))]
+    temp_mat_l_list = [_to_batch(hl[i]) * 1. for i in range(len(hl))]
+    temp_mat_u_list = [_to_batch(hu[i]) * 1. for i in range(len(hu))]
+    sd_b = [_to_batch(sd[i]) for i in range(len(sd))]
+    sl_b = [_to_batch(sl[i]) for i in range(len(sl))]
+    su_b = [_to_batch(su[i]) for i in range(len(su))]
+
     if seP is not None:
+        seP_b = [_to_batch(seP[i]) if torch.is_tensor(seP[i]) else seP[i] for i in range(len(seP))]
         for i in range(len(temp_mat_d_list)):
-            temp_mat_d_list[i] = temp_mat_d_list[i] + seP[i]
+            temp_mat_d_list[i] = temp_mat_d_list[i] + seP_b[i]
+    else:
+        seP_b = None
 
     if isinstance(left_se, torch.Tensor):
-        s01, s02 = temp_mat_d_list[0].shape
-        se01, se02 = left_se.shape
+        left_se_b = _to_batch(left_se)
+        s01, s02 = temp_mat_d_list[0].shape[-2], temp_mat_d_list[0].shape[-1]
+        se01, se02 = left_se_b.shape[-2], left_se_b.shape[-1]
         idx0, idy0 = min(s01, se01), min(s02, se02)
-        temp_mat_d_list[0][:idx0,:idy0] = temp_mat_d_list[0][:idx0,:idy0] + left_se[:idx0,:idy0]
+        temp_mat_d_list[0][:, :idx0, :idy0] = temp_mat_d_list[0][:, :idx0, :idy0] + left_se_b[:, :idx0, :idy0]
+    else:
+        left_se_b = left_se
 
     if isinstance(right_se, torch.Tensor):
-        s11, s12 = temp_mat_d_list[-1].shape
-        se11, se12 = right_se.shape
+        right_se_b = _to_batch(right_se)
+        s11, s12 = temp_mat_d_list[-1].shape[-2], temp_mat_d_list[-1].shape[-1]
+        se11, se12 = right_se_b.shape[-2], right_se_b.shape[-1]
         idx1, idy1 = min(s11, se11), min(s12, se12)
-        # right_se = right_se[-idx1:, -idy1:]
-        temp_mat_d_list[-1][-idx1:, -idy1:] = temp_mat_d_list[-1][-idx1:, -idy1:] + right_se[-idx1:, -idy1:]
+        temp_mat_d_list[-1][:, -idx1:, -idy1:] = temp_mat_d_list[-1][:, -idx1:, -idy1:] + right_se_b[:, -idx1:, -idy1:]
+    else:
+        right_se_b = right_se
 
-    ans = recursive_gf_cal(shift_energy, temp_mat_l_list, temp_mat_d_list, temp_mat_u_list, sd, su, sl,
-                           s_in=s_in, s_out=s_out, eta=eta,
-                           need_lesser=need_lesser, 
-                           need_greater=need_greater, 
+    # s_in / s_out arrive as lists when the lesser/greater paths are active.
+    if isinstance(s_in, list):
+        s_in_b = [_to_batch(t) if torch.is_tensor(t) else t for t in s_in]
+    else:
+        s_in_b = s_in
+    if isinstance(s_out, list):
+        s_out_b = [_to_batch(t) if torch.is_tensor(t) else t for t in s_out]
+    else:
+        s_out_b = s_out
+
+    ans = recursive_gf_cal(shift_energy, temp_mat_l_list, temp_mat_d_list, temp_mat_u_list, sd_b, su_b, sl_b,
+                           s_in=s_in_b, s_out=s_out_b, eta=eta,
+                           need_lesser=need_lesser,
+                           need_greater=need_greater,
                            need_gr_lc=need_gr_lc)
 
     if isinstance(left_se, torch.Tensor):
-        temp_mat_d_list[0][:idx0, :idy0] = temp_mat_d_list[0][:idx0, :idy0] - left_se[:idx0, :idy0]
+        temp_mat_d_list[0][:, :idx0, :idy0] = temp_mat_d_list[0][:, :idx0, :idy0] - left_se_b[:, :idx0, :idy0]
 
     if isinstance(right_se, torch.Tensor):
-        temp_mat_d_list[-1][-idx1:, -idy1:] = temp_mat_d_list[-1][-idx1:, -idy1:] - right_se[-idx1:, -idy1:]
+        temp_mat_d_list[-1][:, -idx1:, -idy1:] = temp_mat_d_list[-1][:, -idx1:, -idy1:] - right_se_b[:, -idx1:, -idy1:]
 
     if seP is not None:
         for i in range(len(temp_mat_d_list)):
-            temp_mat_d_list[i] = temp_mat_d_list[i] - seP[i]
+            temp_mat_d_list[i] = temp_mat_d_list[i] - seP_b[i]
+
+    if squeezed:
+        ans = _squeeze_ans(ans)
 
     return ans
+
+
+def _squeeze_ans(ans):
+    """Squeeze the leading batch dim from every tensor / list-of-tensors in the
+    RGF return tuple so scalar-energy callers see the original 2-D shapes."""
+    def _sq(x):
+        if x is None:
+            return None
+        if torch.is_tensor(x):
+            return x.squeeze(0)
+        if isinstance(x, list):
+            return [t.squeeze(0) if torch.is_tensor(t) else t for t in x]
+        return x
+    return tuple(_sq(x) for x in ans)

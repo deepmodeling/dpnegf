@@ -44,7 +44,7 @@ class NEGF(object):
                 unit: str,
                 scf: bool, poisson_options: dict,
                 stru_options: dict,eta_lead: float,eta_device: float,
-                block_tridiagonal: bool, plot_blocks: bool,
+                block_tridiagonal: bool,
                 sgf_solver: str,
                 e_fermi: float=None,
                 use_saved_HS: bool=False, saved_HS_path: str=None,
@@ -52,18 +52,20 @@ class NEGF(object):
                 se_info_display: bool=False, se_numba_jit: Optional[bool]=None,
                 out_tc: bool=False,out_dos: bool=False,out_density: bool=False,out_potential: bool=False,
                 out_current: bool=False,out_current_nscf: bool=False,out_ldos: bool=False,out_lcurrent: bool=False,
-                results_path: Optional[str]=None,
+                results_path: Optional[str]=None, plot_blocks: Optional[bool]=False,
                 torch_device: Union[str, torch.device]=torch.device('cpu'),
                 AtomicData_options: Optional[dict]=None,
                 n_cpus: Optional[int]=None,
+                e_batch_size: Optional[int]=None,
                 **kwargs):
-        
-        
+
+
         # self.model = model # No need to set model as property for memory saving
         self.results_path = results_path
         self.cdtype = torch.complex128
         self.torch_device = torch_device
         self.n_cpus = n_cpus
+        self.e_batch_size = e_batch_size
                
         # get the parameters
         self.ele_T = ele_T
@@ -642,13 +644,15 @@ class NEGF(object):
 
             # in non-scf case, computing properties in uni_gird
             else:
-                if hasattr(self, "uni_grid"):                     
-                    output_freq = int(len(self.uni_grid)/10)
-                    if output_freq == 0: output_freq = 1
-                    for ie, e in enumerate(self.uni_grid):
-                        if ie % output_freq == 0:
-                            log.info(f" computing green's function at e = {float(e):>6.3f}")
-                        if self.scf:
+                if hasattr(self, "uni_grid"):
+                    if self.scf:
+                        # SCF branch keeps per-E iteration: lead.voltage is mutated per energy,
+                        # which makes per-E self_energy unavoidable.
+                        output_freq = int(len(self.uni_grid)/10)
+                        if output_freq == 0: output_freq = 1
+                        for ie, e in enumerate(self.uni_grid):
+                            if ie % output_freq == 0:
+                                log.info(f" computing green's function at e = {float(e):>6.3f}")
                             if not self.poisson_options["with_Dirichlet_leads"]:
                                 for ll in self.stru_options.keys():
                                     if ll.startswith("lead") and\
@@ -663,63 +667,87 @@ class NEGF(object):
                                 # TODO: consider the case with heterogeneous Dirichlet leads
                                 # In this case, the Dirichlet conditions in leads and gate are set as electrochemical potential(Fermi level + voltage)
                                 assert getattr(self.deviceprop, "lead_L").voltage == self.stru_options["lead_L"]["voltage"]
-                                assert getattr(self.deviceprop, "lead_R").voltage == self.stru_options["lead_R"]["voltage"]    
-                            
+                                assert getattr(self.deviceprop, "lead_R").voltage == self.stru_options["lead_R"]["voltage"]
+
                             for ll in self.stru_options.keys():
                                 if ll.startswith("lead"):
                                     getattr(self.deviceprop, ll).self_energy(
-                                        energy=e, 
-                                        kpoint=k, 
+                                        energy=e,
+                                        kpoint=k,
                                         eta_lead=self.eta_lead,
                                         method=self.sgf_solver,
                                         save_path=self.self_energy_save_path,
                                         se_info_display=self.se_info_display
                                         )
-                                    # self.out[str(ll)+"_se"][str(e.numpy())] = getattr(self.deviceprop, ll).se
-                                    
-                        else:
-                            for ll in self.stru_options.keys():
-                                if ll.startswith("lead"):
-                                    getattr(self.deviceprop, ll).self_energy(
-                                        energy=e, 
-                                        kpoint=k, 
-                                        eta_lead=self.eta_lead,
-                                        method=self.sgf_solver,
-                                        save_path=self.self_energy_save_path,
-                                        se_info_display=self.se_info_display
-                                        )                                
 
-                        self.deviceprop.cal_green_function(
-                            energy=e, kpoint=k, 
-                            eta_device=self.eta_device,
-                            block_tridiagonal=self.block_tridiagonal,
-                            Vbias=Vbias,
-                            need_lesser=False,
-                            need_greater=False,
-                            need_gr_lc=False, # set to False for memory saving, can be set to True for lead spectral function G^r * \Gamma * G^a
+                            self.deviceprop.cal_green_function(
+                                energy=e, kpoint=k,
+                                eta_device=self.eta_device,
+                                block_tridiagonal=self.block_tridiagonal,
+                                Vbias=Vbias,
+                                need_lesser=False,
+                                need_greater=False,
+                                need_gr_lc=False,
+                                )
+
+                            if self.out_dos:
+                                self.out.setdefault('DOS', {}).setdefault(str(k), []).append(self.compute_DOS(k))
+                            if self.out_tc or self.out_current_nscf:
+                                self.out.setdefault('T_k', {}).setdefault(str(k), []).append(self.compute_TC(k))
+                            if self.out_ldos:
+                                self.out.setdefault('LDOS', {}).setdefault(str(k), []).append(self.compute_LDOS(k))
+                    else:
+                        # Non-SCF: solve a whole chunk of energies in one batched recursive_gf call.
+                        chunk = self.e_batch_size if self.e_batch_size is not None else len(self.uni_grid)
+                        for e_chunk in torch.split(self.uni_grid, chunk):
+                            b = len(e_chunk)
+                            log.info(
+                                f"computing green's functions for chunk e=[{float(e_chunk[0]):>6.3f}..{float(e_chunk[-1]):>6.3f}], B={b}"
                             )
-                        # self.out["gtrans"][str(e.numpy())] = gtrans
+                            seL_list, seR_list = [], []
+                            for e in e_chunk:
+                                for ll in self.stru_options.keys():
+                                    if ll.startswith("lead"):
+                                        getattr(self.deviceprop, ll).self_energy(
+                                            energy=e,
+                                            kpoint=k,
+                                            eta_lead=self.eta_lead,
+                                            method=self.sgf_solver,
+                                            save_path=self.self_energy_save_path,
+                                            se_info_display=self.se_info_display
+                                            )
+                                seL_list.append(self.deviceprop.lead_L.se)
+                                seR_list.append(self.deviceprop.lead_R.se)
 
-                        
-                        if self.out_dos:
-                            # prop = self.out.setdefault("DOS", [])
-                            # prop.append(self.compute_DOS(k))
-                            prop = self.out.setdefault('DOS', {})
-                            propk = prop.setdefault(str(k), [])
-                            propk.append(self.compute_DOS(k))
-                        if self.out_tc or self.out_current_nscf:
-                            # prop = self.out.setdefault("TC", [])
-                            # prop.append(self.compute_TC(k))
-                            prop = self.out.setdefault('T_k', {})
-                            propk = prop.setdefault(str(k), [])
-                            propk.append(self.compute_TC(k))                            
-                        if self.out_ldos:
-                            # prop = self.out['LDOS'].setdefault(str(k), [])
-                            # prop.append(self.compute_LDOS(k))
-                            prop = self.out.setdefault('LDOS', {})
-                            propk = prop.setdefault(str(k), [])
-                            propk.append(self.compute_LDOS(k))
-                        
+                            if b > 1:
+                                self.deviceprop.lead_L.se = torch.stack(seL_list, dim=0)
+                                self.deviceprop.lead_R.se = torch.stack(seR_list, dim=0)
+                            # else: leave the per-E [n,n] in place — preserves scalar contract exactly.
+
+                            self.deviceprop.cal_green_function(
+                                energy=e_chunk, kpoint=k,
+                                eta_device=self.eta_device,
+                                block_tridiagonal=self.block_tridiagonal,
+                                Vbias=Vbias,
+                                need_lesser=False,
+                                need_greater=False,
+                                need_gr_lc=False, # set to False for memory saving, can be set to True for lead spectral function G^r * \Gamma * G^a
+                                )
+
+                            if self.out_dos:
+                                self.out.setdefault('DOS', {}).setdefault(str(k), []).append(self.compute_DOS(k).reshape(-1))
+                            if self.out_tc or self.out_current_nscf:
+                                self.out.setdefault('T_k', {}).setdefault(str(k), []).append(self.compute_TC(k).reshape(-1))
+                            if self.out_ldos:
+                                ldos_chunk = self.compute_LDOS(k)
+                                if ldos_chunk.ndim == 1:  # scalar-E chunk → [na]
+                                    ldos_chunk = ldos_chunk.unsqueeze(0)
+                                self.out.setdefault('LDOS', {}).setdefault(str(k), []).append(ldos_chunk)
+
+                        # Restore lead.se to scalar [n,n] so downstream scalar callers
+                        # (density modules, lcurrent loop, future SCF re-entry) see the expected shape.
+                        self.deviceprop.lead_L.se = seL_list[-1]
+                        self.deviceprop.lead_R.se = seR_list[-1]
                             
                     # over energy loop in uni_gird
                     # The following code is for output properties before NEGF ends
@@ -759,10 +787,15 @@ class NEGF(object):
                             raise ValueError("Unknown method for density calculation.")
                     if self.out_potential:
                         pass
+                    # SCF branch appended per-E scalars (stack→[E]); non-SCF branch appended per-chunk [b] tensors (cat→[E]).
+                    reduce_fn = torch.stack if self.scf else torch.cat
                     if self.out_dos:
-                        self.out["DOS"][str(k)] = torch.stack(self.out["DOS"][str(k)])
+                        self.out["DOS"][str(k)] = reduce_fn(self.out["DOS"][str(k)])
                     if self.out_tc or self.out_current_nscf:
-                        self.out["T_k"][str(k)] = torch.stack(self.out["T_k"][str(k)])
+                        self.out["T_k"][str(k)] = reduce_fn(self.out["T_k"][str(k)])
+                    if self.out_ldos:
+                        # Non-SCF: list of [b, na] → [E, na]. SCF: list of [na] → [E, na].
+                        self.out["LDOS"][str(k)] = reduce_fn(self.out["LDOS"][str(k)])
                     # if self.out_current_nscf:
                     #     self.out["BIAS_POTENTIAL_NSCF"], self.out["CURRENT_NSCF"] = self.compute_current_nscf(k, self.uni_grid, self.out["TC"]) 
                     # computing properties that are not functions of E (improvement can be made here in properties related to integration of energy window of fermi functions)
