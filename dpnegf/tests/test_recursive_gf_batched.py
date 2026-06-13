@@ -149,6 +149,54 @@ def test_batched_matches_scalar_lesser():
     _assert_ans_close(stacked, batched, atol=1e-10)
 
 
+def test_batched_matches_scalar_retarded_uniform():
+    # Uniform block sizes exercise the [K, B, n, n] stacked fast path.
+    B = 16
+    block_sizes = [8, 8, 8, 8, 8]
+    hd, sd, hl, hu, sl, su, left_se, right_se, energies = _make_btd_inputs(
+        B, block_sizes, seed=3)
+
+    stacked = _stack_scalar(hd, sd, hl, hu, sl, su, left_se, right_se, energies,
+                            need_lesser=False)
+
+    batched = recursive_gf(
+        energy=energies,
+        hl=hl, hd=hd, hu=hu, sd=sd, su=su, sl=sl,
+        left_se=left_se, right_se=right_se,
+        s_in=0, eta=1e-5,
+        need_lesser=False, need_gr_lc=True,
+    )
+
+    _assert_ans_close(stacked, batched, atol=1e-10)
+
+
+def test_batched_matches_scalar_lesser_uniform():
+    B = 8
+    block_sizes = [6, 6, 6, 6]
+    hd, sd, hl, hu, sl, su, left_se, right_se, energies = _make_btd_inputs(
+        B, block_sizes, seed=4)
+
+    rng = torch.Generator(device="cpu").manual_seed(5)
+    s_in_batched = []
+    for n in block_sizes:
+        x = (torch.randn(B, n, n, generator=rng, dtype=torch.float64) +
+             1j * torch.randn(B, n, n, generator=rng, dtype=torch.float64)).to(torch.complex128)
+        s_in_batched.append(0.5 * (x + x.mH))
+
+    stacked = _stack_scalar(hd, sd, hl, hu, sl, su, left_se, right_se, energies,
+                            need_lesser=True, s_in_batched=s_in_batched)
+
+    batched = recursive_gf(
+        energy=energies,
+        hl=hl, hd=hd, hu=hu, sd=sd, su=su, sl=sl,
+        left_se=left_se, right_se=right_se,
+        s_in=s_in_batched, eta=1e-5,
+        need_lesser=True, need_gr_lc=True,
+    )
+
+    _assert_ans_close(stacked, batched, atol=1e-10)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_batched_cuda_smoke():
     B = 16
