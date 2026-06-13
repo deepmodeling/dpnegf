@@ -70,8 +70,9 @@ class NEGFHamiltonianInit(object):
 
         if isinstance(torch_device, str):
             torch_device = torch.device(torch_device)
-        self.torch_device = torch_device   
+        self.torch_device = torch_device
         self.model = model
+        self.model.to(self.torch_device)
         self.AtomicData_options = AtomicData_options
         self.model.eval()
         
@@ -417,8 +418,8 @@ class NEGFHamiltonianInit(object):
                                 f.create_dataset(f"{key}", data=np.array("None", dtype=h5py.string_dtype()))
                         elif key in ["HL", "SL", "HDL", "SDL", "HLL", "SLL"]:
                             # TODO: HDL,SDL can be saved in reduced form by eliminating zero rows
-                            f.create_dataset(f"{key}_real", data=items.real.numpy().astype(numpy_dtype))
-                            f.create_dataset(f"{key}_imag", data=items.imag.numpy().astype(numpy_dtype))
+                            f.create_dataset(f"{key}_real", data=items.real.cpu().numpy().astype(numpy_dtype))
+                            f.create_dataset(f"{key}_imag", data=items.imag.cpu().numpy().astype(numpy_dtype))
                         else:
                             raise ValueError(f"Unsupported key {key} in HS_leads")
                     
@@ -462,11 +463,11 @@ class NEGFHamiltonianInit(object):
                             sub_block_len = len(item)
                             for idx_block in range(sub_block_len):  
                                 # group.create_dataset(f"{key}_k{idx_k}_b{idx_block}", data=item[idx_block].numpy())
-                                group.create_dataset(f"{key}_k{idx_k}_b{idx_block}_real", data=item[idx_block].real.numpy())
-                                group.create_dataset(f"{key}_k{idx_k}_b{idx_block}_imag", data=item[idx_block].imag.numpy())
+                                group.create_dataset(f"{key}_k{idx_k}_b{idx_block}_real", data=item[idx_block].real.cpu().numpy())
+                                group.create_dataset(f"{key}_k{idx_k}_b{idx_block}_imag", data=item[idx_block].imag.cpu().numpy())
                     else:
                         assert key in ["HD", "SD", "Hall", "Sall"], f"Unsupported key {key} for not block_tridiagnal case"
-                        f.create_dataset(f"{key}", data=items.numpy())
+                        f.create_dataset(f"{key}", data=items.cpu().numpy())
                 else:
                     raise ValueError(f"Unsupported key {key} in HS_device")
 
