@@ -214,7 +214,8 @@ class DeviceProperty(object):
 
         if (not (hasattr(self, "hd") and hasattr(self, "sd"))) or (self.newK_flag or self.newV_flag):
             self.hd, self.sd, self.hl, self.su, self.sl, self.hu = self.hamiltonian.get_hs_device(self.kpoint, self.V, block_tridiagonal)
-            # defensive .to(self.device) in case the blocks came back from a cached/legacy path on CPU.
+            # TODO: if all blocks transferred to GPU, OOM may happen for large systems. 
+            # Optimization should be implemented here.
             self.hd = [b.to(self.rgf_device) for b in self.hd]
             self.sd = [b.to(self.rgf_device) for b in self.sd]
             self.hl = [b.to(self.rgf_device) for b in self.hl]
