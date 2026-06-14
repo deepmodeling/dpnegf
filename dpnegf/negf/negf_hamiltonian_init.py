@@ -70,8 +70,9 @@ class NEGFHamiltonianInit(object):
 
         if isinstance(torch_device, str):
             torch_device = torch.device(torch_device)
-        self.torch_device = torch_device   
+        self.torch_device = torch_device
         self.model = model
+        self.model.to(self.torch_device)
         self.AtomicData_options = AtomicData_options
         self.model.eval()
         
@@ -417,8 +418,8 @@ class NEGFHamiltonianInit(object):
                                 f.create_dataset(f"{key}", data=np.array("None", dtype=h5py.string_dtype()))
                         elif key in ["HL", "SL", "HDL", "SDL", "HLL", "SLL"]:
                             # TODO: HDL,SDL can be saved in reduced form by eliminating zero rows
-                            f.create_dataset(f"{key}_real", data=items.real.numpy().astype(numpy_dtype))
-                            f.create_dataset(f"{key}_imag", data=items.imag.numpy().astype(numpy_dtype))
+                            f.create_dataset(f"{key}_real", data=items.real.cpu().numpy().astype(numpy_dtype))
+                            f.create_dataset(f"{key}_imag", data=items.imag.cpu().numpy().astype(numpy_dtype))
                         else:
                             raise ValueError(f"Unsupported key {key} in HS_leads")
                     
@@ -462,11 +463,11 @@ class NEGFHamiltonianInit(object):
                             sub_block_len = len(item)
                             for idx_block in range(sub_block_len):  
                                 # group.create_dataset(f"{key}_k{idx_k}_b{idx_block}", data=item[idx_block].numpy())
-                                group.create_dataset(f"{key}_k{idx_k}_b{idx_block}_real", data=item[idx_block].real.numpy())
-                                group.create_dataset(f"{key}_k{idx_k}_b{idx_block}_imag", data=item[idx_block].imag.numpy())
+                                group.create_dataset(f"{key}_k{idx_k}_b{idx_block}_real", data=item[idx_block].real.cpu().numpy())
+                                group.create_dataset(f"{key}_k{idx_k}_b{idx_block}_imag", data=item[idx_block].imag.cpu().numpy())
                     else:
                         assert key in ["HD", "SD", "Hall", "Sall"], f"Unsupported key {key} for not block_tridiagnal case"
-                        f.create_dataset(f"{key}", data=items.numpy())
+                        f.create_dataset(f"{key}", data=items.cpu().numpy())
                 else:
                     raise ValueError(f"Unsupported key {key} in HS_device")
 
@@ -846,6 +847,15 @@ class NEGFHamiltonianInit(object):
                                                  HS_device["hl"][ik], HS_device["su"][ik], \
                                                  HS_device["sl"][ik], HS_device["hu"][ik]
 
+            # move blocks onto torch_device so downstream RGF runs on the chosen device.
+            hd_k = [b.to(self.torch_device) for b in hd_k]
+            sd_k = [b.to(self.torch_device) for b in sd_k]
+            hl_k = [b.to(self.torch_device) for b in hl_k]
+            su_k = [b.to(self.torch_device) for b in su_k]
+            sl_k = [b.to(self.torch_device) for b in sl_k]
+            hu_k = [b.to(self.torch_device) for b in hu_k]
+            V = torch.as_tensor(V).to(self.torch_device)
+
             if V.shape == torch.Size([]):
                 allorb = sum([hd_k[i].shape[0] for i in range(len(hd_k))])
                 V = V.repeat(allorb)
@@ -855,15 +865,18 @@ class NEGFHamiltonianInit(object):
                 l_slice = slice(counted, counted+hd_k[i].shape[0])
                 V_sub = V[l_slice].view(-1,1).cdouble()
                 hd_k[i] = hd_k[i] - V_sub * sd_k[i]
-                if i<len(hd_k)-1: 
+                if i<len(hd_k)-1:
                     hu_k[i] = hu_k[i] - V_sub * su_k[i]
                 if i > 0:
                     hl_k[i-1] = hl_k[i-1] - V_sub * sl_k[i-1]
                 counted += hd_k[i].shape[0]
-            
+
             return hd_k , sd_k, hl_k , su_k, sl_k, hu_k
         else:
             HD_k, SD_k = HS_device["HD"][ik], HS_device["SD"][ik]
+            HD_k = HD_k.to(self.torch_device)
+            SD_k = SD_k.to(self.torch_device)
+            V = torch.as_tensor(V).to(self.torch_device)
             return HD_k - V*SD_k, SD_k, [], [], [], []
     
     def get_hs_lead(self, kpoint, tab, v):

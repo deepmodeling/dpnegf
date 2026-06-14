@@ -58,7 +58,7 @@ def _make_deviceprop(block_sizes, hd, sd, hl, hu, sl, su):
     dev.structure = None
     dev.results_path = "/tmp"
     dev.cdtype = torch.complex128
-    dev.device = "cpu"
+    dev.rgf_device = "cpu"
     dev.kBT = 0.025
     dev.e_T = 300.0
     dev.chemiPot = None

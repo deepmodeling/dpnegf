@@ -2,6 +2,7 @@ from dpnegf.negf.recursive_green_cal import recursive_gf
 import logging
 import torch
 import os
+from typing import Union
 from dpnegf.negf.negf_utils import update_kmap, update_temp_file,gauss_xw, leggauss
 from dpnegf.negf.density import Ozaki
 from dpnegf.utils.constants import Boltzmann, eV2J,pi
@@ -24,7 +25,7 @@ def _build_s_in_batched(hd, seinL, seinR, idx0, idy0, idx1, idy1):
     here are the already-scaled 1j*(seL - seL.mH) * f tensors of shape [B,n,n]).
     '''
     B = seinL.shape[0]
-    s_in = [torch.zeros((B,) + tuple(blk.shape), dtype=torch.complex128) for blk in hd]
+    s_in = [torch.zeros((B,) + tuple(blk.shape), dtype=torch.complex128, device=blk.device) for blk in hd]
     s_in[0][:, :idx0, :idy0] = s_in[0][:, :idx0, :idy0] + seinL[:, :idx0, :idy0]
     s_in[-1][:, -idx1:, -idy1:] = s_in[-1][:, -idx1:, -idy1:] + seinR[:, -idx1:, -idy1:]
     return s_in
@@ -90,14 +91,17 @@ class DeviceProperty(object):
             calculate density matrix     
         
     '''    
-    def __init__(self, hamiltonian, structure, results_path, e_T=300, 
-                 efermi: dict=None, chemiPot: dict=None, E_ref: float=None ) -> None:
+    def __init__(self, hamiltonian, structure, results_path, e_T=300,
+                 efermi: dict=None, chemiPot: dict=None, E_ref: float=None,
+                 rgf_device: Union[str, torch.device]="cpu") -> None:
         self.greenfuncs = 0
         self.hamiltonian = hamiltonian
         self.structure = structure # ase Atoms
         self.results_path = results_path
         self.cdtype = torch.complex128
-        self.device = "cpu"
+        if isinstance(rgf_device, str):
+            rgf_device = torch.device(rgf_device)
+        self.rgf_device = rgf_device
         self.kBT = Boltzmann * e_T / eV2J
         self.e_T = e_T
         # self.efermi = efermi
@@ -164,7 +168,7 @@ class DeviceProperty(object):
             A boolean parameter that indicates whether the last column blocks of the retarded Green's function are needed.
         '''
         assert len(np.array(kpoint).reshape(-1)) == 3
-        energy = torch.as_tensor(energy, dtype=torch.complex128)
+        energy = torch.as_tensor(energy, dtype=torch.complex128, device=self.rgf_device)
         if energy.ndim == 0:
             energy = energy.reshape(1)
         assert energy.ndim == 1, f"energy must be 0-d, scalar, or 1-D [B]; got shape {tuple(energy.shape)}"
@@ -197,8 +201,9 @@ class DeviceProperty(object):
                 self.V = torch.tensor(0.)
         else:
             self.V = Vbias
-        
+
         assert torch.is_tensor(self.V)
+        self.V = self.V.to(self.rgf_device)
         if not self.oldV is None:
             if torch.abs(self.V - self.oldV).sum() > 1e-5:
                 self.newV_flag = True
@@ -207,8 +212,16 @@ class DeviceProperty(object):
         else:
             self.newV_flag = True  # for the first time to run cal_green_function in Poisson-NEGF SCF
 
-        if (not (hasattr(self, "hd") and hasattr(self, "sd"))) or (self.newK_flag or self.newV_flag):               
+        if (not (hasattr(self, "hd") and hasattr(self, "sd"))) or (self.newK_flag or self.newV_flag):
             self.hd, self.sd, self.hl, self.su, self.sl, self.hu = self.hamiltonian.get_hs_device(self.kpoint, self.V, block_tridiagonal)
+            # TODO: if all blocks transferred to GPU, OOM may happen for large systems. 
+            # Optimization should be implemented here.
+            self.hd = [b.to(self.rgf_device) for b in self.hd]
+            self.sd = [b.to(self.rgf_device) for b in self.sd]
+            self.hl = [b.to(self.rgf_device) for b in self.hl]
+            self.su = [b.to(self.rgf_device) for b in self.su]
+            self.sl = [b.to(self.rgf_device) for b in self.sl]
+            self.hu = [b.to(self.rgf_device) for b in self.hu]
 
 
         tags = ["g_trans","gr_lc", \
@@ -216,8 +229,8 @@ class DeviceProperty(object):
                "gnd", "gnl", "gnu", "gin_left", \
                "gpd", "gpl", "gpu", "gip_left"]
 
-        seL = self.lead_L.se
-        seR = self.lead_R.se
+        seL = self.lead_L.se.to(self.rgf_device)
+        seR = self.lead_R.se.to(self.rgf_device)
         if batched_mode:
             assert seL.ndim == 3 and seR.ndim == 3, f"In batched mode, the self-energy should have shape [B,n,n], but got {seL.shape} and {seR.shape}"
         else:
@@ -254,7 +267,7 @@ class DeviceProperty(object):
             else:
                 seinL = 1j*(seL-seL.conj().T) * self.lead_L.fermi_dirac(energy+self.E_ref).reshape(-1)
                 seinR = 1j*(seR-seR.conj().T) * self.lead_R.fermi_dirac(energy+self.E_ref).reshape(-1)
-                s_in = [torch.zeros(i.shape).cdouble() for i in self.hd]
+                s_in = [torch.zeros(i.shape, dtype=torch.complex128, device=self.rgf_device) for i in self.hd]
                 s_in[0][:idx0,:idy0] = s_in[0][:idx0,:idy0] + seinL[:idx0,:idy0]
                 s_in[-1][-idx1:,-idy1:] = s_in[-1][-idx1:,-idy1:] + seinR[-idx1:,-idy1:]
         else:
@@ -363,8 +376,8 @@ class DeviceProperty(object):
         g_trans = self.g_trans
         batched = g_trans.ndim == 3
         tx, ty = g_trans.shape[-2], g_trans.shape[-1]
-        gammaL_full = self.lead_L.gamma
-        gammaR_full = self.lead_R.gamma
+        gammaL_full = self.lead_L.gamma.to(self.rgf_device)
+        gammaR_full = self.lead_R.gamma.to(self.rgf_device)
         lx = gammaL_full.shape[-2]
         rx = gammaR_full.shape[-2]
         x0 = min(lx, tx)
@@ -372,8 +385,8 @@ class DeviceProperty(object):
 
         gL_shape = (g_trans.shape[0], tx, tx) if batched else (tx, tx)
         gR_shape = (g_trans.shape[0], ty, ty) if batched else (ty, ty)
-        gammaL = torch.zeros(size=gL_shape, dtype=self.cdtype, device=self.device)
-        gammaR = torch.zeros(size=gR_shape, dtype=self.cdtype, device=self.device)
+        gammaL = torch.zeros(size=gL_shape, dtype=self.cdtype, device=self.rgf_device)
+        gammaR = torch.zeros(size=gR_shape, dtype=self.cdtype, device=self.rgf_device)
         if batched:
             gammaL[:, :x0, :x0] = gammaL[:, :x0, :x0] + gammaL_full[:, :x0, :x0]
             gammaR[:, -x1:, -x1:] = gammaR[:, -x1:, -x1:] + gammaR_full[:, -x1:, -x1:]
@@ -394,9 +407,16 @@ class DeviceProperty(object):
         '''
         dos = 0
         #TODO: transfer cal_dos to static method for any k and energy
-        if (not(hasattr(self, "hd") and hasattr(self, "sd"))) or (self.newK_flag or self.newV_flag):               
+        if (not(hasattr(self, "hd") and hasattr(self, "sd"))) or (self.newK_flag or self.newV_flag):
             self.hd, self.sd, self.hl, self.su, self.sl, self.hu = \
                 self.hamiltonian.get_hs_device(self.kpoint, self.V, self.block_tridiagonal)
+            # defensive .to(self.device) in case the blocks came back from a cached/legacy path on CPU.
+            self.hd = [b.to(self.rgf_device) for b in self.hd]
+            self.sd = [b.to(self.rgf_device) for b in self.sd]
+            self.hl = [b.to(self.rgf_device) for b in self.hl]
+            self.su = [b.to(self.rgf_device) for b in self.su]
+            self.sl = [b.to(self.rgf_device) for b in self.sl]
+            self.hu = [b.to(self.rgf_device) for b in self.hu]
 
         for jj in range(len(self.grd)):
             if not self.block_tridiagonal or len(self.gru) == 0:
@@ -460,8 +480,9 @@ class DeviceProperty(object):
         # check the energy grid satisfied the requirement
         
         na = len(self.norbs_per_atom)
-        local_current = torch.zeros(na, na)
+        local_current = torch.zeros(na, na, device=self.rgf_device)
         hd = self.hamiltonian.get_hs_device(kpoint=self.kpoint, V=self.V, block_tridiagonal=self.block_tridiagonal)[0][0]
+        hd = hd.to(self.rgf_device)  # defensive .to(self.device) in case the block came back from a cached/legacy path on CPU.
 
         for i in range(na):
             for j in range(na):
@@ -490,7 +511,7 @@ class DeviceProperty(object):
         
         '''
         dm = Ozaki(**dm_options)
-        DM_eq, DM_neq = dm.integrate(deviceprop=self.device, kpoint=self.kpoint)
+        DM_eq, DM_neq = dm.integrate(deviceprop=self.rgf_device, kpoint=self.kpoint)
 
         return DM_eq, DM_neq
     

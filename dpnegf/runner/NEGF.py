@@ -54,7 +54,7 @@ class NEGF(object):
                 out_tc: bool=False,out_dos: bool=False,out_density: bool=False,out_potential: bool=False,
                 out_current: bool=False,out_current_nscf: bool=False,out_ldos: bool=False,out_lcurrent: bool=False,
                 results_path: Optional[str]=None, plot_blocks: Optional[bool]=False,
-                torch_device: Union[str, torch.device]=torch.device('cpu'),
+                rgf_device: Union[str, torch.device]='cpu',
                 AtomicData_options: Optional[dict]=None,
                 n_cpus: Optional[int]=None,
                 e_batch_size: Optional[int]=None,
@@ -64,7 +64,9 @@ class NEGF(object):
         # self.model = model # No need to set model as property for memory saving
         self.results_path = results_path
         self.cdtype = torch.complex128
-        self.torch_device = torch_device
+        if isinstance(rgf_device, str):
+            rgf_device = torch.device(rgf_device)
+        self.rgf_device = rgf_device
         self.n_cpus = n_cpus
         self.e_batch_size = e_batch_size
                
@@ -154,7 +156,7 @@ class NEGF(object):
                                                     stru_options=self.stru_options,
                                                     unit = self.unit, 
                                                     results_path=self.results_path,
-                                                    torch_device = self.torch_device)
+                                                    torch_device = torch.device("cpu"))
         # if useBloch is None, structure_leads_fold,bloch_sorted_indices,bloch_R_lists = None,None,None
         struct_device, struct_leads,structure_leads_fold,bloch_sorted_indices,bloch_R_lists = \
             self.negf_hamiltonian.initialize(kpoints=self.kpoints,
@@ -182,7 +184,7 @@ class NEGF(object):
         e_fermi = {}; chemiPot = {}
         # calculate Fermi level
         if  self.e_fermi is None:        
-            elec_cal = ElecStruCal(model=model,device=self.torch_device)
+            elec_cal = ElecStruCal(model=model,device=torch.device("cpu"))
             nel_atom_lead = self.get_nel_atom_lead(
                                 struct_leads, 
                                 charge={lead_tag: self.stru_options[lead_tag].get("charge", 0) for lead_tag in ["lead_L", "lead_R"]}
@@ -234,7 +236,8 @@ class NEGF(object):
 
         # initialize deviceprop and leadprop
         self.deviceprop = DeviceProperty(self.negf_hamiltonian, struct_device, results_path=self.results_path,
-                                         efermi=self.e_fermi, chemiPot=chemiPot, E_ref=E_ref)
+                                         efermi=self.e_fermi, chemiPot=chemiPot, E_ref=E_ref,
+                                         rgf_device=self.rgf_device)
         self.deviceprop.set_leadLR(
                 lead_L=LeadProperty(
                 hamiltonian=self.negf_hamiltonian, 
@@ -476,7 +479,7 @@ class NEGF(object):
             # TODO: add k summation operation
             free_charge_allk = torch.zeros_like(torch.tensor(self.device_atom_norbs))
             for ik,k in enumerate(self.kpoints):
-                free_charge_allk += np.real(self.free_charge[str(k)].numpy()) * self.wk[ik]
+                free_charge_allk += np.real(self.free_charge[str(k)].cpu().numpy()) * self.wk[ik]
             interface_poisson.free_charge[atom_gridpoint_index] = free_charge_allk
             
 
@@ -588,13 +591,15 @@ class NEGF(object):
         self.out['k']=[];self.out['wk']=[]
         if hasattr(self, "uni_grid"): self.out["uni_grid"] = self.uni_grid
 
+        # Self-Energy Calculaiton or Loading
         self.prepare_self_energy(scf_require)
 
         for ik, k in enumerate(self.kpoints):
 
             self.out['k'].append(k)
             self.out['wk'].append(self.wk[ik])
-            self.free_charge.update({str(k):torch.zeros_like(torch.tensor(self.device_atom_norbs),dtype=torch.complex128)})
+            self.free_charge.update({str(k):torch.zeros_like(torch.tensor(self.device_atom_norbs),
+                                    dtype=torch.complex128, device=self.rgf_device)})
             log.info(f"Properties computation at k = ({', '.join([f'{kk:>6.4f}' for kk in k])})")
 
             if scf_require:
@@ -701,9 +706,9 @@ class NEGF(object):
                         # Non-SCF: solve a whole chunk of energies in one batched recursive_gf call.
                         chunk = self.e_batch_size if self.e_batch_size is not None else len(self.uni_grid)
                         for e_chunk in torch.split(self.uni_grid, chunk):
-                            b = len(e_chunk)
+                            e_batch_size = len(e_chunk)
                             log.info(
-                                f"computing green's functions for chunk e=[{float(e_chunk[0]):>6.3f}..{float(e_chunk[-1]):>6.3f}], B={b}"
+                                f"computing green's functions for chunk e=[{float(e_chunk[0]):>6.3f}..{float(e_chunk[-1]):>6.3f}], B={e_batch_size}"
                             )
                             seL_list, seR_list = [], []
                             for e in e_chunk:
@@ -720,7 +725,7 @@ class NEGF(object):
                                 seL_list.append(self.deviceprop.lead_L.se)
                                 seR_list.append(self.deviceprop.lead_R.se)
 
-                            if b > 1:
+                            if e_batch_size > 1:
                                 self.deviceprop.lead_L.se = torch.stack(seL_list, dim=0)
                                 self.deviceprop.lead_R.se = torch.stack(seR_list, dim=0)
                             # else: leave the per-E [n,n] in place — preserves scalar contract exactly.
@@ -838,7 +843,7 @@ class NEGF(object):
 
         if scf_require==False:
             self.out["k"] = np.array(self.out["k"])
-            self.out['T_avg'] = torch.tensor(self.out['wk']) @ torch.stack(list(self.out["T_k"].values()))
+            self.out['T_avg'] = torch.tensor(self.out['wk']) @ torch.stack(list(self.out["T_k"].values())).cpu()
             # TODO:check the following code for multiple k points calculation
             if self.out_current_nscf:
                 self.out["BIAS_POTENTIAL_NSCF"], self.out["CURRENT_NSCF"] = self.compute_current_nscf(self.uni_grid, self.out["T_avg"])
