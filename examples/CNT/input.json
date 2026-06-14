@@ -3,6 +3,7 @@
         "task": "negf",
         "scf": false,
         "block_tridiagonal": true,
+        "n_cpus": 8,
         "rgf_device": "cpu",
         "ele_T": 300,
         "unit": "eV",
