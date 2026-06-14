@@ -591,13 +591,15 @@ class NEGF(object):
         self.out['k']=[];self.out['wk']=[]
         if hasattr(self, "uni_grid"): self.out["uni_grid"] = self.uni_grid
 
+        # Self-Energy Calculaiton or Loading
         self.prepare_self_energy(scf_require)
 
         for ik, k in enumerate(self.kpoints):
 
             self.out['k'].append(k)
             self.out['wk'].append(self.wk[ik])
-            self.free_charge.update({str(k):torch.zeros_like(torch.tensor(self.device_atom_norbs),dtype=torch.complex128, device=self.rgf_device)})
+            self.free_charge.update({str(k):torch.zeros_like(torch.tensor(self.device_atom_norbs),
+                                    dtype=torch.complex128, device=self.rgf_device)})
             log.info(f"Properties computation at k = ({', '.join([f'{kk:>6.4f}' for kk in k])})")
 
             if scf_require:
@@ -704,9 +706,9 @@ class NEGF(object):
                         # Non-SCF: solve a whole chunk of energies in one batched recursive_gf call.
                         chunk = self.e_batch_size if self.e_batch_size is not None else len(self.uni_grid)
                         for e_chunk in torch.split(self.uni_grid, chunk):
-                            b = len(e_chunk)
+                            e_batch_size = len(e_chunk)
                             log.info(
-                                f"computing green's functions for chunk e=[{float(e_chunk[0]):>6.3f}..{float(e_chunk[-1]):>6.3f}], B={b}"
+                                f"computing green's functions for chunk e=[{float(e_chunk[0]):>6.3f}..{float(e_chunk[-1]):>6.3f}], B={e_batch_size}"
                             )
                             seL_list, seR_list = [], []
                             for e in e_chunk:
@@ -723,7 +725,7 @@ class NEGF(object):
                                 seL_list.append(self.deviceprop.lead_L.se)
                                 seR_list.append(self.deviceprop.lead_R.se)
 
-                            if b > 1:
+                            if e_batch_size > 1:
                                 self.deviceprop.lead_L.se = torch.stack(seL_list, dim=0)
                                 self.deviceprop.lead_R.se = torch.stack(seR_list, dim=0)
                             # else: leave the per-E [n,n] in place — preserves scalar contract exactly.
