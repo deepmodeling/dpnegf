@@ -273,11 +273,16 @@ class DeviceProperty(object):
         else:
             s_in = 0
 
+        # gr_left is only consumed inside the lesser/greater forward pass of the
+        # kernel. If neither is active, the per-block list would sit on the GPU
+        # unread; ask the kernel to drop it so its slots are freed mid-sweep.
+        keep_gr_left = bool(need_lesser or need_greater)
         ans = recursive_gf(energy, hl=self.hl, hd=self.hd, hu=self.hu,
                             sd=self.sd, su=self.su, sl=self.sl,
                             left_se=seL, right_se=seR, seP=None, s_in=s_in,
                             s_out=None, eta=eta_device, E_ref=self.E_ref,
-                            need_lesser=need_lesser, need_greater=need_greater, need_gr_lc=need_gr_lc)
+                            need_lesser=need_lesser, need_greater=need_greater,
+                            need_gr_lc=need_gr_lc, keep_gr_left=keep_gr_left)
             # green shape [[g_trans, grd, grl,...],[g_trans, ...]]
         
         for t in range(len(tags)):

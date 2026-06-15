@@ -109,8 +109,13 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
             g_trans = gU @ g_trans
             if need_gr_lc:
                 gr_lc.append(g_trans)
+            del gU
         if need_gr_lc:
             gr_lc.reverse()
+        if not need_lesser and not need_greater:
+            # Stacked path: mat_l/mat_u are 4-D and can't be slice-freed mid-loop;
+            # they are dead now if no lesser/greater pass will read them.
+            del mat_l, mat_u
 
         gnd = gnl = gnu = gin_left = None
         if need_lesser:
@@ -207,6 +212,14 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
     grd[-1] = gr_left[-1].clone()
     g_trans = gr_left[-1].clone()
     gr_lc = [g_trans] if need_gr_lc else None
+    # Slots that go dead at the end of iteration q:
+    #   - mat_l_list[q], mat_u_list[q]: only re-read by the lesser/greater branches.
+    #   - gr_left[q]: dead unless the lesser/greater branch will consume it OR
+    #                 the caller asked us to keep the list intact.
+    # Nulling per slot lets the caching allocator coalesce its free list inside the
+    # loop instead of holding a long fragmented tail until the sweep ends.
+    drop_lu = not need_lesser and not need_greater
+    drop_gl = drop_lu and not keep_gr_left
     for q in range(num_of_matrices - 2, -1, -1):
         gU = gr_left[q] @ mat_u_list[q]                            # hoisted
         grl[q] = grd[q + 1] @ mat_l_list[q] @ gr_left[q]           # (B5)
@@ -215,6 +228,12 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
         g_trans = gU @ g_trans
         if need_gr_lc:
             gr_lc.append(g_trans)
+        del gU
+        if drop_lu:
+            mat_l_list[q] = None
+            mat_u_list[q] = None
+        if drop_gl:
+            gr_left[q] = None
     if need_gr_lc:
         gr_lc.reverse()
 
