@@ -4,7 +4,7 @@ import torch
 def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
                      sd, su, sl, s_in=0, s_out=0, eta=1e-5,
                      need_lesser=False, need_greater=False, need_gr_lc=False,
-                     stacked=False):
+                     stacked=False, keep_gr_left=True):
     """The recursive Green's function algorithm is taken from
     M. P. Anantram, M. S. Lundstrom and D. E. Nikonov, Proceedings of the IEEE, 96, 1511 - 1550 (2008)
     DOI: 10.1109/JPROC.2008.927355
@@ -92,10 +92,13 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
                 -mat_d[q + 1] - mat_l[q] @ gr_left[q] @ mat_u[q],
                 eye_bnn,
             )
+        # mat_d is dead after the forward sweep — backward sweep only reads mat_l/mat_u.
+        del mat_d
 
         grl = [None] * (num_of_matrices - 1)
         gru = [None] * (num_of_matrices - 1)
-        grd = [g.clone() for g in gr_left]
+        grd = [None] * num_of_matrices
+        grd[-1] = gr_left[-1].clone()
         g_trans = gr_left[-1].clone()
         gr_lc = [g_trans] if need_gr_lc else None
         for q in range(num_of_matrices - 2, -1, -1):
@@ -120,7 +123,8 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
 
             gnl = [None] * (num_of_matrices - 1)
             gnu = [None] * (num_of_matrices - 1)
-            gnd = [g.clone() for g in gin_left]
+            gnd = [None] * num_of_matrices
+            gnd[-1] = gin_left[-1].clone()
             for q in range(num_of_matrices - 2, -1, -1):
                 gLmH = mat_l[q] @ gr_left[q].mH         # hoisted: used twice
                 gnl[q] = grd[q + 1] @ mat_l[q] @ gin_left[q] + gnd[q + 1] @ gLmH  # (B10)
@@ -140,7 +144,8 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
 
             gpl = [None] * (num_of_matrices - 1)
             gpu = [None] * (num_of_matrices - 1)
-            gpd = [g.clone() for g in gip_left]
+            gpd = [None] * num_of_matrices
+            gpd[-1] = gip_left[-1].clone()
             for q in range(num_of_matrices - 2, -1, -1):
                 lcgc = mat_l[q].conj() @ gr_left[q].conj()  # hoisted: used twice
                 gpl[q] = grd[q + 1] @ mat_l[q] @ gip_left[q] + gpd[q + 1] @ lcgc
@@ -150,6 +155,8 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
                          (gru[q] @ mat_l[q] @ gip_left[q])
                 gpu[q] = gpl[q].mH
 
+        if not keep_gr_left:
+            gr_left = None
         return _pack_ans(g_trans, gr_lc, grd, grl, gru, gr_left,
                          gnd, gnl, gnu, gin_left,
                          gpd, gpl, gpu, gip_left,
@@ -161,7 +168,9 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
     e_bcast = (energy + 1j * eta).view(-1, 1, 1)
 
     for jj in range(len(mat_d_list)):
-        mat_d_list[jj] = mat_d_list[jj] - e_bcast * sd[jj]
+        # In-place: mat_d_list is a fresh tensor (wrapper's `* 1.` copy on D),
+        # so we can fuse the energy shift without the e_bcast*sd transient.
+        mat_d_list[jj].addcmul_(sd[jj], e_bcast, value=-1)
     for jj in range(len(mat_l_list)):
         mat_l_list[jj] = mat_l_list[jj] - e_bcast * sl[jj]
     for jj in range(len(mat_u_list)):
@@ -183,16 +192,19 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
     # ------------------ retarded Green's function ----------------------
     gr_left = [None] * num_of_matrices
     gr_left[0] = tLA.solve(-mat_d_list[0], _batched_eye(mat_shapes[0][-1]))
+    mat_d_list[0] = None  # consumed; free immediately
 
     for q in range(num_of_matrices - 1):  # (B2)
         gr_left[q + 1] = tLA.solve(
             -mat_d_list[q + 1] - mat_l_list[q] @ gr_left[q] @ mat_u_list[q],
             _batched_eye(mat_shapes[q + 1][-1]),
         )
+        mat_d_list[q + 1] = None  # consumed; backward sweep only reads mat_l/mat_u.
 
     grl = [None] * (num_of_matrices - 1)
     gru = [None] * (num_of_matrices - 1)
-    grd = [i.clone() for i in gr_left]
+    grd = [None] * num_of_matrices
+    grd[-1] = gr_left[-1].clone()
     g_trans = gr_left[-1].clone()
     gr_lc = [g_trans] if need_gr_lc else None
     for q in range(num_of_matrices - 2, -1, -1):
@@ -219,7 +231,8 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
 
         gnl = [None] * (num_of_matrices - 1)
         gnu = [None] * (num_of_matrices - 1)
-        gnd = [i.clone() for i in gin_left]
+        gnd = [None] * num_of_matrices
+        gnd[-1] = gin_left[-1].clone()
 
         for q in range(num_of_matrices - 2, -1, -1):
             gLmH = mat_l_list[q] @ gr_left[q].mH                   # hoisted
@@ -243,7 +256,8 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
 
         gpl = [None] * (num_of_matrices - 1)
         gpu = [None] * (num_of_matrices - 1)
-        gpd = [i.clone() for i in gip_left]
+        gpd = [None] * num_of_matrices
+        gpd[-1] = gip_left[-1].clone()
 
         for q in range(num_of_matrices - 2, -1, -1):
             lcgc = mat_l_list[q].conj() @ gr_left[q].conj()        # hoisted
@@ -255,6 +269,8 @@ def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
                      (gru[q] @ mat_l_list[q] @ gip_left[q])
             gpu[q] = gpl[q].mH
 
+    if not keep_gr_left:
+        gr_left = None
     return _pack_ans(g_trans, gr_lc, grd, grl, gru, gr_left,
                      gnd, gnl, gnu, gin_left,
                      gpd, gpl, gpu, gip_left,
@@ -287,7 +303,8 @@ def _pack_ans(g_trans, gr_lc, grd, grl, gru, gr_left,
 
 
 def recursive_gf(energy, hl, hd, hu, sd, su, sl, left_se, right_se, seP=None, E_ref=0.0, s_in=0, s_out=0,
-                 eta=1e-5, need_lesser=False, need_greater=False, need_gr_lc=False):
+                 eta=1e-5, need_lesser=False, need_greater=False, need_gr_lc=False,
+                 keep_gr_left=True):
 
     """The recursive Green's function algorithm is taken from
     M. P. Anantram, M. S. Lundstrom and D. E. Nikonov, Proceedings of the IEEE, 96, 1511 - 1550 (2008)
@@ -364,8 +381,10 @@ def recursive_gf(energy, hl, hd, hu, sd, su, sl, left_se, right_se, seP=None, E_
         return t
 
     temp_mat_d_list = [_to_batch(hd[i]) * 1. for i in range(len(hd))]
-    temp_mat_l_list = [_to_batch(hl[i]) * 1. for i in range(len(hl))]
-    temp_mat_u_list = [_to_batch(hu[i]) * 1. for i in range(len(hu))]
+    # L and U are only subtracted out-of-place inside the kernel; the expanded
+    # view is fine, and skipping the copy saves K x B x n^2 per list.
+    temp_mat_l_list = [_to_batch(hl[i]) for i in range(len(hl))]
+    temp_mat_u_list = [_to_batch(hu[i]) for i in range(len(hu))]
     sd_b = [_to_batch(sd[i]) for i in range(len(sd))]
     sl_b = [_to_batch(sl[i]) for i in range(len(sl))]
     su_b = [_to_batch(su[i]) for i in range(len(su))]
@@ -421,7 +440,8 @@ def recursive_gf(energy, hl, hd, hu, sd, su, sl, left_se, right_se, seP=None, E_
                                need_lesser=need_lesser,
                                need_greater=need_greater,
                                need_gr_lc=need_gr_lc,
-                               stacked=True)
+                               stacked=True,
+                               keep_gr_left=keep_gr_left)
     else:
         ans = recursive_gf_cal(shift_energy, temp_mat_l_list, temp_mat_d_list, temp_mat_u_list,
                                sd_b, su_b, sl_b,
@@ -429,7 +449,8 @@ def recursive_gf(energy, hl, hd, hu, sd, su, sl, left_se, right_se, seP=None, E_
                                need_lesser=need_lesser,
                                need_greater=need_greater,
                                need_gr_lc=need_gr_lc,
-                               stacked=False)
+                               stacked=False,
+                               keep_gr_left=keep_gr_left)
 
     if squeezed:
         ans = _squeeze_ans(ans)
