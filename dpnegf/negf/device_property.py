@@ -135,7 +135,7 @@ class DeviceProperty(object):
 
 
     def cal_green_function(self, energy, kpoint, eta_device=0., block_tridiagonal=True, Vbias=None,
-                           HS_inmem:bool=True, need_lesser:bool=False, need_greater:bool=False, need_gr_lc:bool=True):
+                           HS_inmem:bool=True, need_lesser:bool=False, need_greater:bool=False, need_gr_lc:bool=False):
         ''' computes the Green's function for a given energy and k-point in device.
 
         the tags used here to identify different Green's functions follows the NEGF theory 
