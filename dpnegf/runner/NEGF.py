@@ -54,7 +54,7 @@ class NEGF(object):
                 se_info_display: bool=False, se_numba_jit: Optional[bool]=None,
                 out_tc: bool=False,out_dos: bool=False,out_density: bool=False,out_potential: bool=False,
                 out_current: bool=False,out_current_nscf: bool=False,out_ldos: bool=False,out_lcurrent: bool=False,
-                results_path: Optional[str]=None, plot_blocks: Optional[bool]=False,
+                results_path: Optional[str]=None,
                 rgf_device: Union[str, torch.device]='cpu',
                 AtomicData_options: Optional[dict]=None,
                 n_cpus: Optional[int]=None,
