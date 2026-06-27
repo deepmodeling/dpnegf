@@ -527,6 +527,8 @@ class NEGF(object):
         output_path = os.path.join(self.results_path, "profile_report_negf.html")
         with open(output_path, 'w') as report_file:
             report_file.write(profiler.output_html())
+
+        log.info(msg="dpnegf compute completed.")
         
         return None
 
