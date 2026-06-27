@@ -23,7 +23,8 @@ class ElecStruCal(object):
     def __init__ (
             self, 
             model: torch.nn.Module,
-            device: Union[str, torch.device]=None
+            device: Union[str, torch.device]=None,
+            **kwargs
             ):
         '''It initializes ElecStruCal object with a neural network model, optional results path, GUI
         usage flag, and device information, and sets up eigenvalues  based on model properties.
@@ -68,12 +69,18 @@ class ElecStruCal(object):
             )
         r_max, er_max, oer_max  = get_cutoffs_from_model_options(model.model_options)
         self.cutoffs = {'r_max': r_max, 'er_max': er_max, 'oer_max': oer_max}
+
+        if 'override_overlap' in kwargs and isinstance(kwargs['override_overlap'], str):
+            self.override_overlap = kwargs['override_overlap']
+        else:
+            self.override_overlap = None
+
     def get_data(self,
                  data: Union[AtomicData, ase.Atoms, str],
                  pbc:Union[bool,list]=None,
                  device: Union[str, torch.device]=None,
                  AtomicData_options:dict=None,
-                 override_overlap:Optional[str]=None):
+                 override_overlap:Union[str,bool,None]=None):
         '''The function `get_data` takes input data in the form of a string, ase.Atoms object, or AtomicData
         object, processes it accordingly, and returns the AtomicData class.
         
@@ -88,7 +95,8 @@ class ElecStruCal(object):
         device : Union[str, torch.device]
             The `device` parameter in the `get_data` function is used to specify the device on which the data
         should be processed. If no device is provided, it defaults to `self.device`.
-        override_overlap : the path for overlap.h5 to use and override overlap matrix from model.
+        override_overlap : the path for overlap.h5 to use and override overlap matrix from model. If None, will try
+            to use self.override_overlap; If False, will not try anything.
         
         Returns
         -------
@@ -139,6 +147,7 @@ class ElecStruCal(object):
         else:
             raise ValueError('data should be either a string, ase.Atoms, or AtomicData')
 
+        override_overlap = None if override_overlap == False else override_overlap if override_overlap else self.override_overlap
         if isinstance(override_overlap, str):
             assert os.path.exists(override_overlap), "Overlap file not found."
             overlap_blocks = h5py.File(override_overlap, "r")
@@ -189,14 +198,16 @@ class ElecStruCal(object):
         AtomicData_options : dict
             The `AtomicData_options` parameter is a dictionary that contains options for configuring the
         `AtomicData` object.
-        override_overlap : the path for overlap.h5 to use and override overlap matrix from model.
+        override_overlap : the path for overlap.h5 to use and override overlap matrix from model. If None, will try
+            to use self.override_overlap; If False, will not try anything.
         
         Returns
         -------
             The function `get_eigs` returns the loaded data and the energy eigenvalues as a numpy array.
         
         '''
-            
+
+        override_overlap = None if override_overlap == False else override_overlap if override_overlap else self.override_overlap
         data  = self.get_data(data=data, pbc=pbc, device=self.device,AtomicData_options=AtomicData_options, override_overlap=override_overlap)
         # set the kpoint of the AtomicData
         data[AtomicDataDict.KPOINT_KEY] = \
