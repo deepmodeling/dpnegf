@@ -985,13 +985,21 @@ def merge_hdf5_files(tmp_dir, output_path, pattern, remove=True):
 
 
 def _has_saved_self_energy(root: str) -> bool:
-        from pathlib import Path
-        p = Path(root) if root is not None else None
-        if p is None or not p.exists():
-            return False
-        
-        patterns = ("*.h5", "*.pth")
-        for pat in patterns:
-            if any(p.rglob(pat)):
-                return True
+    from pathlib import Path
+
+    p = Path(root) if root is not None else None
+    if p is None or not p.exists():
         return False
+
+    for file in p.rglob("*"):
+        if not file.is_file():
+            continue
+
+        if file.suffix.lower() not in {".pth", ".h5"}:
+            continue
+
+        name = file.name.lower()
+        if "self_energy" in name or "se" in name:
+            return True
+
+    return False
