@@ -955,6 +955,25 @@ def normalize_test(data):
 
 
 
+def energy_grid_options():
+    doc_espacing = ""
+    doc_emin = ""
+    doc_emax = ""
+    doc_esteps = ""
+    doc_force_zero_point = ""
+    doc_force_espacing = ""
+    doc_energies = ""
+
+    return [
+        Argument("espacing", [int, float], optional=True, default=None, doc=doc_espacing),
+        Argument("emin", [int, float], optional=True, default=None, doc=doc_emin),
+        Argument("emax", [int, float], optional=True, default=None, doc=doc_emax),
+        Argument("esteps", [int, None], optional=True, default=None, doc=doc_esteps),
+        Argument("force_zero_point", bool, optional=True, default=False, doc=doc_force_zero_point),
+        Argument("force_espacing", bool, optional=True, default=False, doc=doc_force_espacing),
+        Argument("energies", [list, None], optional=True, default=None, doc=doc_energies),
+    ]
+
 
 def tbtrans_negf():
     doc_scf = ""
@@ -990,9 +1009,10 @@ def tbtrans_negf():
         Argument("stru_options", dict, optional=False, sub_fields=stru_options(), doc=doc_stru_options),
         Argument("poisson_options", dict, optional=True, default={}, sub_fields=[], sub_variants=[poisson_options()], doc=doc_poisson_options),
         Argument("sgf_solver", str, optional=True, default="Sancho-Rubio", doc=doc_sgf_solver),
-        Argument("espacing", [int, float], optional=False, doc=doc_espacing),
-        Argument("emin", [int, float], optional=False, doc=doc_emin),
-        Argument("emax", [int, float], optional=False, doc=doc_emax),
+        Argument("espacing", [int, float], optional=True, doc=doc_espacing),
+        Argument("emin", [int, float], optional=True, doc=doc_emin),
+        Argument("emax", [int, float], optional=True, doc=doc_emax),
+        Argument("energy_grid_options", dict, optional=True, default={}, sub_fields=energy_grid_options(), doc=""),
         Argument("e_fermi", [int, float], optional=False, doc=doc_e_fermi),
         Argument("density_options", dict, optional=True, default={}, sub_fields=[], sub_variants=[density_options()], doc=doc_density_options),
         Argument("eta_lead", [int, float], optional=True, default=1e-5, doc=doc_eta_lead),
@@ -1053,9 +1073,10 @@ def negf():
         Argument("self_energy_save_path", str, optional=True, default=None, doc="the directory to save the self energy or load the self energy"),
         Argument("se_info_display", bool, optional=True, default=False, doc="whether to display the self energy information"),
         Argument("se_numba_jit", [bool, None], optional=True, default=None, doc="whether to use numba JIT for self energy calculation"),
-        Argument("espacing", [int, float], optional=False, doc=doc_espacing),
-        Argument("emin", [int, float], optional=False, doc=doc_emin),
-        Argument("emax", [int, float], optional=False, doc=doc_emax),
+        Argument("espacing", [int, float], optional=True, doc=doc_espacing),
+        Argument("emin", [int, float], optional=True, doc=doc_emin),
+        Argument("emax", [int, float], optional=True, doc=doc_emax),
+        Argument("energy_grid_options", dict, optional=True, default={}, sub_fields=energy_grid_options(), doc=""),
         Argument("e_fermi", [int, float], optional=True, default=None ,doc=doc_e_fermi),
         Argument("density_options", dict, optional=True, default={}, sub_fields=[], sub_variants=[density_options()], doc=doc_density_options),
         Argument("eta_lead", [int, float], optional=True, default=1e-5, doc=doc_eta_lead),
