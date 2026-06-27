@@ -190,7 +190,7 @@ class Ozaki(Density):
                 deviceprop.lead_L.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead)
                 deviceprop.lead_R.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead)
                 deviceprop.cal_green_function(energy=e, kpoint=kpoint, block_tridiagonal=block_tridiagonal, eta_device=eta_device)
-                gr_gamma_ga = torch.mm(torch.mm(deviceprop.grd[0], deviceprop.lead_R.gamma), deviceprop.grd[0].conj().T).real
+                gr_gamma_ga = torch.mm(torch.mm(deviceprop.grd[0], deviceprop.lead_R.gamma.to(deviceprop.grd[0].device)), deviceprop.grd[0].conj().T).real
                 gr_gamma_ga = gr_gamma_ga * (deviceprop.lead_R.fermi_dirac(e+deviceprop.mu) - deviceprop.lead_L.fermi_dirac(e+deviceprop.mu))
                 DM_neq = DM_neq + wlg[i] * gr_gamma_ga
         else:
@@ -292,10 +292,11 @@ class Fiori(Density):
             x0 = min(lx, tx)
             x1 = min(rx, ty)
 
-            gammaL = torch.zeros(size=(tx, tx), dtype=torch.complex128)
-            gammaL[:x0, :x0] += deviceprop.lead_L.gamma[:x0, :x0]
-            gammaR = torch.zeros(size=(ty, ty), dtype=torch.complex128)
-            gammaR[-x1:, -x1:] += deviceprop.lead_R.gamma[-x1:, -x1:]
+            gf_device = deviceprop.g_trans.device
+            gammaL = torch.zeros(size=(tx, tx), dtype=torch.complex128, device=gf_device)
+            gammaL[:x0, :x0] += deviceprop.lead_L.gamma[:x0, :x0].to(gf_device)
+            gammaR = torch.zeros(size=(ty, ty), dtype=torch.complex128, device=gf_device)
+            gammaR[-x1:, -x1:] += deviceprop.lead_R.gamma[-x1:, -x1:].to(gf_device)
             
             if not block_tridiagonal:
                 A_Rd = [torch.mm(torch.mm(deviceprop.grd[i],gammaR),deviceprop.grd[i].conj().T) for i in range(len(deviceprop.grd))]

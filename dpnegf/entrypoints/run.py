@@ -63,7 +63,10 @@ def run(
     in_common_options = {}
     if jdata.get("device", None):
         in_common_options.update({"device": jdata["device"]})
-    
+    # Otherwise build on the default device (CPU). The NEGF pipeline runs
+    # hamiltonian init and Fermi-level calc on CPU; only RGF runs on
+    # RGF_device, and DeviceProperty handles CPU→RGF_device transfer.
+
     if jdata.get("dtype", None):
         in_common_options.update({"dtype": jdata["dtype"]})
 

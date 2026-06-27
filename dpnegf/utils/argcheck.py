@@ -1077,6 +1077,7 @@ def negf():
         Argument("emin", [int, float], optional=True, doc=doc_emin),
         Argument("emax", [int, float], optional=True, doc=doc_emax),
         Argument("energy_grid_options", dict, optional=True, default={}, sub_fields=energy_grid_options(), doc=""),
+        Argument("e_batch_size", [int, float], optional=True, default=None, doc="the batch size for energy points in NEGF calculation"),
         Argument("e_fermi", [int, float], optional=True, default=None ,doc=doc_e_fermi),
         Argument("density_options", dict, optional=True, default={}, sub_fields=[], sub_variants=[density_options()], doc=doc_density_options),
         Argument("eta_lead", [int, float], optional=True, default=1e-5, doc=doc_eta_lead),
@@ -1091,6 +1092,11 @@ def negf():
         Argument("out_lcurrent", bool, optional=True, default=False, doc=doc_out_lcurrent),
         Argument("n_cpus", [int, None], optional=True, default=None, doc="Number of CPU cores for parallel self-energy calculation. Default None uses os.cpu_count()."),
         Argument("override_overlap", str, optional=True, doc=doc_override_overlap),
+        Argument("rgf_device", str, optional=True, default="cpu",
+                 doc="Device used only for the RGF (recursive Green's function) step. "
+                     "'cpu' (default) or 'cuda'. Hamiltonian initialization always runs "
+                     "on CPU (it is the memory-heavy phase). Self-energy always runs on "
+                     "CPU because it goes through joblib + numba.")
     ]
 
 def stru_options():
