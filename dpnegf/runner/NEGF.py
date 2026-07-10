@@ -40,23 +40,25 @@ class NEGF(object):
                 model: torch.nn.Module,
                 structure: Union[AtomicData, ase.Atoms, str],
                 ele_T: float,
-                emin: float, emax: float, espacing: float,
                 density_options: dict,
                 unit: str,
                 scf: bool, poisson_options: dict,
                 stru_options: dict,eta_lead: float,eta_device: float,
                 block_tridiagonal: bool,
                 sgf_solver: str,
+                emin: float=None, emax: float=None, espacing: float=None,
                 e_fermi: float=None,
+                plot_blocks: bool=False,
                 use_saved_HS: bool=False, saved_HS_path: str=None,
                 use_saved_se: bool=False, self_energy_save_path: str=None, 
                 se_info_display: bool=False, se_numba_jit: Optional[bool]=None,
                 out_tc: bool=False,out_dos: bool=False,out_density: bool=False,out_potential: bool=False,
                 out_current: bool=False,out_current_nscf: bool=False,out_ldos: bool=False,out_lcurrent: bool=False,
-                results_path: Optional[str]=None, plot_blocks: Optional[bool]=False,
+                results_path: Optional[str]=None,
                 rgf_device: Union[str, torch.device]='cpu',
                 AtomicData_options: Optional[dict]=None,
                 n_cpus: Optional[int]=None,
+                energy_grid_options: Optional[dict]=None,
                 e_batch_size: Optional[int]=None,
                 **kwargs):
 
@@ -68,6 +70,7 @@ class NEGF(object):
             rgf_device = torch.device(rgf_device)
         self.rgf_device = rgf_device
         self.n_cpus = n_cpus
+
         self.e_batch_size = e_batch_size
 
         # The RGF q-loop allocates/frees many small slabs; with the default
@@ -89,7 +92,16 @@ class NEGF(object):
         self.kBT = Boltzmann * self.ele_T / eV2J # change to eV
         self.e_fermi = e_fermi
         self.eta_lead = eta_lead; self.eta_device = eta_device
-        self.emin = emin; self.emax = emax; self.espacing = espacing
+
+        assert energy_grid_options or (espacing and emin and emax), "target energy grid not defined"
+        self.energy_grid_options = {} if energy_grid_options is None else energy_grid_options
+        self.emin = self.energy_grid_options.get("emin") if self.energy_grid_options.get("emin") is not None else emin
+        self.emax = self.energy_grid_options.get("emax") if self.energy_grid_options.get("emax") is not None else emax
+        self.espacing = self.energy_grid_options.get("espacing") if self.energy_grid_options.get("espacing") is not None else espacing
+        self.esteps = self.energy_grid_options.get("esteps", None)
+        self.force_zero_point = self.energy_grid_options.get("force_zero_point", False)
+        self.force_espacing = self.energy_grid_options.get("force_espacing", False)
+        self.energies = self.energy_grid_options.get("energies", None)
         self.stru_options = stru_options
         self.poisson_options = poisson_options
         if e_fermi is None:
@@ -132,6 +144,14 @@ class NEGF(object):
             self.kpoints,self.wk = kmesh_sampling_negf(self.stru_options["kmesh"], 
                                                        self.stru_options["gamma_center"],
                                                      self.stru_options["time_reversal_symmetry"])
+
+        if 'override_overlap' in kwargs:
+            assert isinstance(kwargs['override_overlap'], str)
+            self.override_overlap = kwargs['override_overlap']
+            log.info(msg="Using external calculated overlap overriding!")
+        else:
+            self.override_overlap = None
+
         log.info(msg="------ k-point for NEGF -----")
         log.info(msg="Gamma Center: {0}".format(self.stru_options["gamma_center"]))
         log.info(msg="Time Reversal: {0}".format(self.stru_options["time_reversal_symmetry"]))
@@ -198,7 +218,7 @@ class NEGF(object):
         e_fermi = {}; chemiPot = {}
         # calculate Fermi level
         if  self.e_fermi is None:        
-            elec_cal = ElecStruCal(model=model,device=torch.device("cpu"))
+            elec_cal = ElecStruCal(model=model, device=torch.device("cpu"), override_overlap=self.override_overlap)
             nel_atom_lead = self.get_nel_atom_lead(
                                 struct_leads, 
                                 charge={lead_tag: self.stru_options[lead_tag].get("charge", 0) for lead_tag in ["lead_L", "lead_R"]}
@@ -361,8 +381,68 @@ class NEGF(object):
             cal_int_grid = True
 
         if self.out_dos or self.out_tc or self.out_current_nscf or self.out_ldos:
-            # Energy gird is set relative to Fermi level
-            self.uni_grid = torch.linspace(start=self.emin, end=self.emax, steps=int((self.emax-self.emin)/self.espacing))
+            if self.energies is not None:
+                self.uni_grid = torch.as_tensor(self.energies, dtype=torch.get_default_dtype())
+            else:
+                emin = float(self.emin)
+                emax = float(self.emax)
+                espacing = float(self.espacing)
+                if espacing <= 0:
+                    raise ValueError("espacing should be positive")
+                if emax < emin:
+                    raise ValueError("emax should be no less than emin")
+
+                has_esteps = self.esteps is not None
+                if has_esteps:
+                    energy_steps = int(self.esteps)
+                    if energy_steps < 1:
+                        raise ValueError("esteps should be a positive integer")
+                else:
+                    energy_steps = int((emax - emin) / espacing) + 1
+
+                if self.force_zero_point and self.force_espacing:
+                    if energy_steps == 1:
+                        emin = 0.0
+                        emax = 0.0
+                    elif has_esteps:
+                        zero_index = int(np.clip(round((0.0 - emin) / espacing), 0, energy_steps - 1))
+                        emin = -zero_index * espacing
+                        emax = emin + espacing * (energy_steps - 1)
+                        if emin > float(self.emin) or emax < float(self.emax):
+                            raise ValueError("esteps is too small to keep espacing, include zero, and cover [emin, emax]")
+                    else:
+                        left_steps = int(np.ceil(max(0.0, -emin) / espacing - 1e-12))
+                        right_steps = int(np.ceil(max(0.0, emax) / espacing - 1e-12))
+                        energy_steps = max(energy_steps, left_steps + right_steps + 1)
+                        emin = -left_steps * espacing
+                        emax = emin + espacing * (energy_steps - 1)
+                elif self.force_zero_point:
+                    if energy_steps == 1:
+                        emin = 0.0
+                        emax = 0.0
+                    else:
+                        zero_index = int(np.clip(round((0.0 - emin) / (emax - emin) * (energy_steps - 1)), 0, energy_steps - 1))
+                        left_spacing = abs(float(self.emin)) / zero_index if zero_index > 0 else 0.0
+                        right_spacing = abs(float(self.emax)) / (energy_steps - 1 - zero_index) if zero_index < energy_steps - 1 else 0.0
+                        espacing = max(left_spacing, right_spacing, espacing if left_spacing == 0.0 and right_spacing == 0.0 else 0.0)
+                        emin = -zero_index * espacing
+                        emax = (energy_steps - 1 - zero_index) * espacing
+                elif self.force_espacing and energy_steps > 1:
+                    target_width = espacing * (energy_steps - 1)
+                    if target_width < emax - emin:
+                        if has_esteps:
+                            raise ValueError("esteps is too small to keep espacing and cover [emin, emax]")
+                        energy_steps = int(np.ceil((emax - emin) / espacing - 1e-12)) + 1
+                        target_width = espacing * (energy_steps - 1)
+                    center = 0.5 * (emin + emax)
+                    emin = center - 0.5 * target_width
+                    emax = center + 0.5 * target_width
+
+                # Energy gird is set relative to Fermi level
+                if self.force_espacing and energy_steps > 1:
+                    self.uni_grid = emin + espacing * torch.arange(energy_steps, dtype=torch.get_default_dtype())
+                else:
+                    self.uni_grid = torch.linspace(start=emin, end=emax, steps=energy_steps)
 
         if cal_pole and  self.density_options["method"] == "Ozaki":
             self.poles, self.residues = ozaki_residues(M_cut=self.density_options["M_cut"])
@@ -447,6 +527,8 @@ class NEGF(object):
         output_path = os.path.join(self.results_path, "profile_report_negf.html")
         with open(output_path, 'w') as report_file:
             report_file.write(profiler.output_html())
+
+        log.info(msg="dpnegf compute completed.")
         
         return None
 
@@ -571,7 +653,8 @@ class NEGF(object):
         # self energy calculation
         log.info(msg="------Self-energy calculation------")
         if  self.self_energy_save_path is None:
-            self.self_energy_save_path = os.path.join(self.results_path, "self_energy") 
+            self.self_energy_save_path = os.path.join(self.results_path, "self_energy")
+        self.self_energy_save_path = os.path.abspath(self.self_energy_save_path)
         os.makedirs(self.self_energy_save_path, exist_ok=True)
 
         if self.use_saved_se:

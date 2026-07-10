@@ -660,10 +660,25 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
     # Capture the parent's log level so loky workers (which start with a clean
     # logging state and the WARNING default) can match it when they reinit.
     parent_log_level = logging.getLogger().getEffectiveLevel()
+
+    thread_per_task = 1
+    if n_cpus:
+        thread_per_task_from_tasks = int(n_cpus / min(len(total_tasks), batch_size))
+        if thread_per_task_from_tasks > 1:
+            if len(total_tasks) <= batch_size:
+                log.info(f"n_cpus:{n_cpus} is twice more than total_tasks:{len(total_tasks)},")
+            else:
+                log.info(f"n_cpus:{n_cpus} is twice more than batch_size:{batch_size},")
+        thread_per_task_from_jobs = int(n_cpus / safe_n_jobs)
+        if thread_per_task_from_jobs > 1:
+            log.info(f"n_cpus:{n_cpus} is twice more than safe_n_jobs:{safe_n_jobs},")
+        thread_per_task = max(thread_per_task_from_jobs, thread_per_task_from_tasks)
+        log.info(f"allocating {thread_per_task} thread for each task.")
+
     if len(total_tasks) <= batch_size:
-        Parallel(n_jobs=safe_n_jobs, backend="loky")(
+        Parallel(n_jobs=min(safe_n_jobs, len(total_tasks)), backend="loky")(
             delayed(_self_energy_worker_blas1)(k, e, eta, leadL_pack, leadR_pack, 
-                                               self_energy_save_path, se_numba_jit, parent_log_level)
+                                               self_energy_save_path, se_numba_jit, parent_log_level, thread_per_task)
             for k, e in total_tasks
         )
     else:
@@ -671,7 +686,7 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
             batch = total_tasks[i:i+batch_size]
             Parallel(n_jobs=safe_n_jobs, backend="loky")(
                 delayed(_self_energy_worker_blas1)(k, e, eta, leadL_pack, leadR_pack, 
-                                                   self_energy_save_path, se_numba_jit, parent_log_level)
+                                                   self_energy_save_path, se_numba_jit, parent_log_level, thread_per_task)
                 for k, e in batch
             )
 
@@ -875,7 +890,7 @@ def _self_energy_worker_pure(k, e, eta, leadL_pack, leadR_pack, self_energy_save
     write_to_hdf5(save_tmp_R, k, e, seR)
 
 
-def _self_energy_worker_blas1(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path, se_numba_jit, log_level):
+def _self_energy_worker_blas1(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path, se_numba_jit, log_level, thread_per_task):
     """Loky entry point that pins this worker's BLAS/LAPACK runtime to a
     single thread, then delegates to `_self_energy_worker_pure`.
 
@@ -886,7 +901,7 @@ def _self_energy_worker_blas1(k, e, eta, leadL_pack, leadR_pack, self_energy_sav
     `solve` / `inv` / matmul calls where single-threaded BLAS already wins
     per-call; outer joblib-level parallelism handles scaling.
     """
-    with threadpool_limits(limits=1, user_api='blas'):
+    with threadpool_limits(limits=thread_per_task, user_api='blas'):
         return _self_energy_worker_pure(
             k, e, eta, leadL_pack, leadR_pack,
             self_energy_save_path, se_numba_jit, log_level,
@@ -985,13 +1000,21 @@ def merge_hdf5_files(tmp_dir, output_path, pattern, remove=True):
 
 
 def _has_saved_self_energy(root: str) -> bool:
-        from pathlib import Path
-        p = Path(root) if root is not None else None
-        if p is None or not p.exists():
-            return False
-        
-        patterns = ("*.h5", "*.pth")
-        for pat in patterns:
-            if any(p.rglob(pat)):
-                return True
+    from pathlib import Path
+
+    p = Path(root) if root is not None else None
+    if p is None or not p.exists():
         return False
+
+    for file in p.rglob("*"):
+        if not file.is_file():
+            continue
+
+        if file.suffix.lower() not in {".pth", ".h5"}:
+            continue
+
+        name = file.name.lower()
+        if "self_energy" in name or "se" in name:
+            return True
+
+    return False
