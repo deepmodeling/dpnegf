@@ -523,8 +523,8 @@ def _estimate_worker_memory(lead_L, lead_R, kpoint=None, temp_allocation_factor=
     return total_estimate
 
 
-def _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1, max_memory_fraction=0.9, 
-                     min_workers=1, kpoint=None, n_cpus=None):
+def _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-1, max_memory_fraction=0.9,
+                        min_workers=1, kpoint=None, cpu_budget=None):
     """
     Calculate safe number of parallel workers based on available system memory.
 
@@ -532,23 +532,24 @@ def _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1, max_memory_fraction=0.
     ----------
     lead_L, lead_R : LeadProperty
         Lead objects for memory estimation.
-    requested_n_jobs : int
-        User-requested n_jobs. -1 means auto-detect.
+    requested_n_workers : int
+        User-requested n_workers. -1 means auto-detect.
     max_memory_fraction : float
         Maximum fraction of available memory to use. Default 0.9.
     min_workers : int
         Minimum number of workers to use. Default 1.
     kpoint : array-like, optional
         A sample k-point for fetching Hamiltonian matrices to estimate memory.
-    n_cpus : int or None
-        Number of CPU cores to use for memory estimation. If None, uses os.cpu_count().
+    cpu_budget : int or None
+        Total CPU cores the self-energy pool is allowed to size against.
+        If None, uses os.cpu_count().
 
     Returns
     -------
     int
         Safe number of parallel workers.
     """
-    cpu_count = n_cpus if n_cpus is not None else os.cpu_count()
+    cpu_count = cpu_budget if cpu_budget is not None else os.cpu_count()
     if cpu_count is None or cpu_count < 1:
         cpu_count = 1
         log.warning("os.cpu_count() returned None or invalid value. Defaulting to 1 CPU core.")
@@ -570,37 +571,37 @@ def _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1, max_memory_fraction=0.
     max_workers = min(max_workers_by_memory, cpu_count)
 
     safe_n_worker = 0
-    # check requested_n_jobs is a number
-    if not isinstance(requested_n_jobs, int):
-        log.warning(f"Requested n_jobs={requested_n_jobs} is not an integer. \n"
+    # check requested_n_workers is a number
+    if not isinstance(requested_n_workers, int):
+        log.warning(f"Requested n_workers={requested_n_workers} is not an integer. \n"
                     f"Using min_workers={min_workers}.")
         safe_n_worker = min_workers
 
-    if requested_n_jobs == -1:
+    if requested_n_workers == -1:
         safe_n_worker = max_workers
-    elif requested_n_jobs == 0:
-        log.warning(f"Requested n_jobs=0 is invalid. Using min_workers={min_workers}.")
+    elif requested_n_workers == 0:
+        log.warning(f"Requested n_workers=0 is invalid. Using min_workers={min_workers}.")
         safe_n_worker = min_workers
-    elif requested_n_jobs > 0:
-        if requested_n_jobs > max_workers:
-            log.warning(f"Requested n_jobs={requested_n_jobs} may exceed available memory. "
+    elif requested_n_workers > 0:
+        if requested_n_workers > max_workers:
+            log.warning(f"Requested n_workers={requested_n_workers} may exceed available memory. "
                        f"Limiting to {max_workers} workers "
                        f"(available: {available_memory / 1e9:.1f} GB, "
                        f"est. per worker: {memory_per_worker / 1e9:.1f} GB)")
             safe_n_worker = max_workers
         else:
-            safe_n_worker = requested_n_jobs
+            safe_n_worker = requested_n_workers
     else:
-        # Negative values other than -1: joblib interprets as (cpu_count + 1 + n_jobs)
-        effective_n_jobs = max(cpu_count + 1 + requested_n_jobs, min_workers)
-        safe_n_worker = min(effective_n_jobs, max_workers)
+        # Negative values other than -1: joblib interprets as (cpu_count + 1 + n_workers)
+        effective_n_workers = max(cpu_count + 1 + requested_n_workers, min_workers)
+        safe_n_worker = min(effective_n_workers, max_workers)
 
-    log.info(f"Estimated safe n_jobs={safe_n_worker} based on available memory.")
+    log.info(f"Estimated safe n_workers={safe_n_worker} based on available memory.")
     return safe_n_worker
 
 
 def _autotune_blas_threads(leadL_pack, sample_kpoint, sample_energy, eta_lead,
-                            n_jobs, cpu_count, se_numba_jit, requested=None):
+                            n_workers, cpu_count, se_numba_jit, requested=None):
     """Pick per-worker BLAS threads by timing the real surface-green code path.
 
     The Lopez-Sancho loop in ``surface_green._surface_green_{numba,scipy}_core``
@@ -624,7 +625,7 @@ def _autotune_blas_threads(leadL_pack, sample_kpoint, sample_energy, eta_lead,
         computed so N and dtype match production.
     eta_lead : float
         Same broadening as production.
-    n_jobs : int
+    n_workers : int
         Number of joblib workers about to be launched; bounds per-worker CPU.
     cpu_count : int
         Total CPU budget.
@@ -640,8 +641,8 @@ def _autotune_blas_threads(leadL_pack, sample_kpoint, sample_energy, eta_lead,
     int
         BLAS threads to give each loky worker via ``threadpool_limits``.
     """
-    n_jobs = max(int(n_jobs), 1)
-    per_worker_budget = max(int(cpu_count) // n_jobs, 1)
+    n_workers = max(int(n_workers), 1)
+    per_worker_budget = max(int(cpu_count) // n_workers, 1)
 
     if requested is not None:
         if not isinstance(requested, int) or requested < 1:
@@ -650,7 +651,7 @@ def _autotune_blas_threads(leadL_pack, sample_kpoint, sample_energy, eta_lead,
         else:
             if requested > per_worker_budget:
                 log.warning(f"Requested blas_threads={requested} exceeds per-worker "
-                            f"CPU budget ({per_worker_budget} = cpu_count // n_jobs). "
+                            f"CPU budget ({per_worker_budget} = cpu_count // n_workers). "
                             f"Clamping to {per_worker_budget}.")
             threads = min(requested, per_worker_budget)
             log.info(f"BLAS threads per worker: {threads} (user-requested).")
@@ -707,7 +708,7 @@ def _autotune_blas_threads(leadL_pack, sample_kpoint, sample_energy, eta_lead,
 
     best = min(timings, key=timings.get)
     log.info(f"BLAS threads per worker: {best} "
-             f"(autotuned, N={sample_dim}, n_jobs={n_jobs}, cpu_count={cpu_count}).")
+             f"(autotuned, N={sample_dim}, n_workers={n_workers}, cpu_count={cpu_count}).")
     return best
 
 
@@ -734,7 +735,7 @@ def _sample_principal_layer_dim(pack, sample_kpoint):
 
 def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
                             self_energy_save_path=None, ek_batch_size=200,
-                            n_cpus=None, n_jobs=-1, se_numba_jit=None, blas_threads=None):
+                            cpu_budget=None, n_workers=-1, se_numba_jit=None, blas_threads=None):
     """
     Computes and saves self-energy matrices for all combinations of k-points and energy values
     for left and right leads.
@@ -758,17 +759,19 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
         Directory to save self-energy files. If None, uses lead_L's results_path.
     ek_batch_size : int, optional
         Number of (k, e) tasks per parallel batch. Default is 200.
-    n_cpus : int or None, optional
-        Number of CPU cores to use for memory estimation. If None, uses os.cpu_count().
-    n_jobs : int, optional
-        Number of parallel jobs to use. Default is -1 (use all available CPUs).
+    cpu_budget : int or None, optional
+        Total CPU cores the self-energy pool is allowed to size against.
+        If None, uses os.cpu_count().
+    n_workers : int, optional
+        Number of parallel joblib workers to use. Default is -1 (auto-select
+        based on `cpu_budget` and available memory).
     se_numba_jit : bool or None, optional
         Boolean flag controlling whether to use the Numba-accelerated surface Green's function core.
         If None, Numba will be used when available. Default is None.
     blas_threads : int or None, optional
         BLAS threads to give each worker. None (default) autotunes by timing
-        `_compute_self_energy_from_pack` across a few candidate thread counts and picking the fastest. 
-        Pass an int to force that value; it is still clamped to `cpu_count // n_jobs` to avoid
+        `_compute_self_energy_from_pack` across a few candidate thread counts and picking the fastest.
+        Pass an int to force that value; it is still clamped to `cpu_budget // n_workers` to avoid
         oversubscription.
 
     Returns
@@ -785,14 +788,14 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
     # Calculate safe number of workers based on available memory
     # Use first k-point for memory estimation
     sample_kpoint = kpoints_grid[0] if len(kpoints_grid) > 0 else None
-    safe_n_jobs = _get_safe_n_jobs(lead_L, lead_R, 
-                                   requested_n_jobs=n_jobs, 
-                                   kpoint=sample_kpoint, 
-                                   n_cpus=n_cpus)
-    if n_jobs == -1:
-        log.info(f"Auto-detected safe n_jobs={safe_n_jobs} based on available memory")
-    elif safe_n_jobs < n_jobs:
-        log.info(f"Adjusted n_jobs from {n_jobs} to {safe_n_jobs} due to memory constraints")
+    safe_n_workers = _get_safe_n_workers(lead_L, lead_R,
+                                         requested_n_workers=n_workers,
+                                         kpoint=sample_kpoint,
+                                         cpu_budget=cpu_budget)
+    if n_workers == -1:
+        log.info(f"Auto-detected safe n_workers={safe_n_workers} based on available memory")
+    elif safe_n_workers < n_workers:
+        log.info(f"Adjusted n_workers from {n_workers} to {safe_n_workers} due to memory constraints")
 
     # Precompute all k-dependent matrices in the parent so workers receive
     # only plain tensors (the hamiltonian holds a torch.jit.ScriptFunction-
@@ -803,11 +806,11 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
     # Choose BLAS threads-per-worker by autotuning on the real code path at the
     # sample (k, E). Cheaper than a hardware-agnostic table and always correct
     # for the actual N / BLAS backend the workers will run under.
-    cpu_budget = n_cpus if n_cpus is not None else os.cpu_count()
+    cpu_count = cpu_budget if cpu_budget is not None else os.cpu_count()
     sample_energy = energy_grid[0] if len(energy_grid) > 0 else 0.0
     blas_threads_per_worker = _autotune_blas_threads(
         leadL_pack, sample_kpoint, sample_energy, eta,
-        safe_n_jobs, cpu_budget, se_numba_jit, requested=blas_threads,
+        safe_n_workers, cpu_count, se_numba_jit, requested=blas_threads,
     )
 
     total_tasks = [(k, e) for k in kpoints_grid for e in energy_grid]
@@ -815,7 +818,7 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
     # logging state and the WARNING default) can match it when they reinit.
     parent_log_level = logging.getLogger().getEffectiveLevel()
     if len(total_tasks) <= ek_batch_size:
-        Parallel(n_jobs=min(safe_n_jobs, len(total_tasks)), backend="loky")(
+        Parallel(n_jobs=min(safe_n_workers, len(total_tasks)), backend="loky")(
             delayed(_self_energy_worker_blas)(k, e, eta, leadL_pack, leadR_pack,
                                                self_energy_save_path, se_numba_jit,
                                                parent_log_level, blas_threads_per_worker)
@@ -824,7 +827,7 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
     else:
         for i in range(0, len(total_tasks), ek_batch_size):
             batch = total_tasks[i:i+ek_batch_size]
-            Parallel(n_jobs=min(safe_n_jobs, len(batch)), backend="loky")(
+            Parallel(n_jobs=min(safe_n_workers, len(batch)), backend="loky")(
                 delayed(_self_energy_worker_blas)(k, e, eta, leadL_pack, leadR_pack,
                                                    self_energy_save_path, se_numba_jit,
                                                    parent_log_level, blas_threads_per_worker)
@@ -1077,7 +1080,7 @@ def _self_energy_worker_blas(k, e, eta, leadL_pack, leadR_pack, self_energy_save
     `solve` / `inv` / matmul calls whose payoff from BLAS threading depends on
     the principal-layer dimension N: single-threaded already wins for small N,
     but multi-threaded solve/GEMM helps for larger N when the CPU budget left
-    over from the memory-driven `n_jobs` cap is not zero.
+    over from the memory-driven `n_workers` cap is not zero.
 
     `blas_threads` is chosen by `_autotune_blas_threads` in the parent and
     passed in per call; default 1 preserves the historical behavior for any

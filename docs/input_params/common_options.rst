@@ -1,6 +1,7 @@
-========================================
+==============
 Common Options
-========================================
+==============
+
 .. _`common_options`: 
 
 common_options: 
@@ -37,7 +38,7 @@ common_options:
         | type: ``str``, optional, default: ``float32``
         | argument path: ``common_options/dtype``
 
-        The digital number's precison, choose among: 
+        The digital number's precison, choose among:
                             Default: `float32`
                                 - `float32`: indicating torch.float32
                                 - `float64`: indicating torch.float64

@@ -1,5 +1,14 @@
 import torch
-from dpnegf.negf.negf_utils import quad, gauss_xw,leggauss,update_kmap
+import ase
+import numpy as np
+import logging
+import json
+from typing import Optional, Union
+from pyinstrument import Profiler
+import os
+
+from dptb.utils.argcheck import get_cutoffs_from_model_options
+from dpnegf.negf.negf_utils import gauss_xw
 from dpnegf.utils.constants import valence_electron
 from dpnegf.negf.ozaki_res_cal import ozaki_residues
 from dpnegf.negf.negf_hamiltonian_init import NEGFHamiltonianInit
@@ -7,19 +16,11 @@ from dpnegf.utils.elec_struc_cal import ElecStruCal
 from dpnegf.negf.density import Ozaki,Fiori
 from dpnegf.negf.device_property import DeviceProperty
 from dpnegf.negf.lead_property import LeadProperty, compute_all_self_energy, _has_saved_self_energy
-from dpnegf.negf.negf_utils import is_fully_covered
-import ase
 from dpnegf.utils.constants import Boltzmann, eV2J
-import numpy as np
 from dpnegf.utils.make_kpoints import kmesh_sampling_negf
-import logging
-import json
 from dpnegf.negf.poisson_init import Grid,Interface3D,Dirichlet,Dielectric
 from dpnegf.negf.scf_method import PDIISMixer,DIISMixer,BroydenFirstMixer,BroydenSecondMixer,AndersonMixer
-from typing import Optional, Union
-from dpnegf.utils.tools import apply_gaussian_filter_3d
-from pyinstrument import Profiler
-import os
+
 
 log = logging.getLogger(__name__)
 
@@ -46,29 +47,47 @@ class NEGF(object):
                 scf: bool, poisson_options: dict,
                 stru_options: dict,eta_lead: float,eta_device: float,
                 block_tridiagonal: bool,
-                sgf_solver: str,
+                self_energy_options: Optional[dict] = None,
+                rgf_options: Optional[dict] = None,
+                hs_cache: Optional[dict] = None,
+                output_options: Optional[dict] = None,
                 e_fermi: float=None,
-                use_saved_HS: bool=False, saved_HS_path: str=None,
-                use_saved_se: bool=False, self_energy_save_path: str=None, 
-                se_info_display: bool=False, se_numba_jit: Optional[bool]=None,
-                out_tc: bool=False,out_dos: bool=False,out_density: bool=False,out_potential: bool=False,
-                out_current: bool=False,out_current_nscf: bool=False,out_ldos: bool=False,out_lcurrent: bool=False,
                 results_path: Optional[str]=None, plot_blocks: Optional[bool]=False,
-                rgf_device: Union[str, torch.device]='cpu',
                 AtomicData_options: Optional[dict]=None,
-                n_cpus: Optional[int]=None,
-                e_batch_size: Optional[int]=None,
                 **kwargs):
 
 
         # self.model = model # No need to set model as property for memory saving
         self.results_path = results_path
         self.cdtype = torch.complex128
+
+        # --- unpack the three nested option groups added in the schema refactor ---
+        # rgf_options: device placement and energy-loop chunking for the RGF sweep
+        rgf_options = dict(rgf_options or {})
+        rgf_device = rgf_options.get("device", "cpu")
         if isinstance(rgf_device, str):
             rgf_device = torch.device(rgf_device)
         self.rgf_device = rgf_device
-        self.n_cpus = n_cpus
-        self.e_batch_size = e_batch_size
+        self.e_batch_size = rgf_options.get("e_batch_size", None)
+
+        # self_energy_options: solver, cache, and CPU parallelism for the SE sweep
+        se_opts = dict(self_energy_options or {})
+        self.sgf_solver = se_opts.get("solver", "Sancho-Rubio")
+        self.se_numba_jit = se_opts.get("numba_jit", None)
+        self.se_info_display = se_opts.get("info_display", False)
+        se_cache = dict(se_opts.get("cache", {}) or {})
+        self.use_saved_se = se_cache.get("use_saved", False)
+        self.self_energy_save_path = se_cache.get("save_path", None)
+        se_parallel = dict(se_opts.get("parallel", {}) or {})
+        self.cpu_budget = se_parallel.get("cpu_budget", None)
+        self.n_workers = se_parallel.get("n_workers", -1)
+        self.blas_threads = se_parallel.get("blas_threads", None)
+        self.ek_batch_size = se_parallel.get("ek_batch_size", 200)
+
+        # hs_cache: on-disk cache of device H / S
+        hs_cache = dict(hs_cache or {})
+        self.use_saved_HS = hs_cache.get("use_saved", False)
+        self.saved_HS_path = hs_cache.get("save_path", None)
 
         # The RGF q-loop allocates/frees many small slabs; with the default
         # cudaMalloc-backed caching allocator this fragments quickly on long
@@ -83,7 +102,7 @@ class NEGF(object):
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True BEFORE invoking "
                     "dpnegf (must be set before torch's CUDA context initializes)."
                 )
-               
+
         # get the parameters
         self.ele_T = ele_T
         self.kBT = Boltzmann * self.ele_T / eV2J # change to eV
@@ -97,14 +116,6 @@ class NEGF(object):
                 assert "kmesh_lead_Ef" in self.stru_options[lead], f"{lead} must have 'kmesh_lead_Ef' set in stru_options if e_fermi is None"
 
 
-        self.use_saved_HS = use_saved_HS
-        self.saved_HS_path = saved_HS_path
-
-        self.sgf_solver = sgf_solver
-        self.use_saved_se = use_saved_se # whether to use the saved self-energy or not
-        self.self_energy_save_path = self_energy_save_path # The directory to save the self-energy or for saved self-energy
-        self.se_info_display = se_info_display # whether to display the self-energy information after calculation
-        self.se_numba_jit = se_numba_jit
         self.pbc = self.stru_options["pbc"]
 
         if  self.stru_options["lead_L"]["useBloch"] or self.stru_options["lead_R"]["useBloch"]:
@@ -298,14 +309,15 @@ class NEGF(object):
 
 
         # geting the output settings
-        self.out_tc = out_tc
-        self.out_dos = out_dos
-        self.out_density = out_density
-        self.out_potential = out_potential
-        self.out_current = out_current
-        self.out_current_nscf = out_current_nscf
-        self.out_ldos = out_ldos
-        self.out_lcurrent = out_lcurrent
+        out_opts = dict(output_options or {})
+        self.out_tc = out_opts.get("tc", False)
+        self.out_dos = out_opts.get("dos", False)
+        self.out_density = out_opts.get("density", False)
+        self.out_potential = out_opts.get("potential", False)
+        self.out_current = out_opts.get("current", False)
+        self.out_current_nscf = out_opts.get("current_nscf", False)
+        self.out_ldos = out_opts.get("ldos", False)
+        self.out_lcurrent = out_opts.get("lcurrent", False)
         assert not (self.out_lcurrent and self.block_tridiagonal)
         self.out = {}
         # initialize density class
@@ -588,13 +600,19 @@ class NEGF(object):
                 #         self.deviceprop.lead_L.self_energy(kpoint=k, energy=e, eta_lead=self.eta_lead, save=True)
                 #         self.deviceprop.lead_R.self_energy(kpoint=k, energy=e, eta_lead=self.eta_lead, save=True)
                 compute_all_self_energy(self.eta_lead, self.deviceprop.lead_L, self.deviceprop.lead_R,
-                                        self.kpoints, self.density.integrate_range, self.self_energy_save_path, 
-                                        n_cpus=self.n_cpus, se_numba_jit=self.se_numba_jit)
+                                        self.kpoints, self.density.integrate_range, self.self_energy_save_path,
+                                        ek_batch_size=self.ek_batch_size,
+                                        cpu_budget=self.cpu_budget, n_workers=self.n_workers,
+                                        se_numba_jit=self.se_numba_jit,
+                                        blas_threads=self.blas_threads)
             elif not self.scf:
                 # In non-scf case, the self-energy of the leads is calculated for each energy point in the energy grid.
                 compute_all_self_energy(self.eta_lead, self.deviceprop.lead_L, self.deviceprop.lead_R,
-                                        self.kpoints, self.uni_grid, self.self_energy_save_path, 
-                                        n_cpus=self.n_cpus, se_numba_jit=self.se_numba_jit)
+                                        self.kpoints, self.uni_grid, self.self_energy_save_path,
+                                        ek_batch_size=self.ek_batch_size,
+                                        cpu_budget=self.cpu_budget, n_workers=self.n_workers,
+                                        se_numba_jit=self.se_numba_jit,
+                                        blas_threads=self.blas_threads)
         log.info(msg="-----------------------------------\n")
 
 
@@ -998,7 +1016,6 @@ class NEGF(object):
             dict: The updated or initialized AtomicData_options dictionary.
         """
         if AtomicData_options is None:
-            from dptb.utils.argcheck import get_cutoffs_from_model_options
             # get the cutoffs from model options
             r_max, er_max, oer_max  = get_cutoffs_from_model_options(model.model_options)
             AtomicData_options = {'r_max': r_max, 'er_max': er_max, 'oer_max': oer_max}

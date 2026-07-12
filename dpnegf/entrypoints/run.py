@@ -54,6 +54,10 @@ def run(
     jdata = j_loader(INPUT)
     jdata = normalize_run(jdata)
 
+    if output:
+        with open(os.path.join(str(output), "run_config.json"), "w") as fp:
+            json.dump(jdata, fp, indent=4)
+
     task_options = j_must_have(jdata, "task_options")
     task = task_options["task"]
     use_gui = jdata.get("use_gui", False)

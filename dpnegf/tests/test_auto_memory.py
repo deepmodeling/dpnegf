@@ -3,7 +3,7 @@ Unit tests for automatic memory detection functions in lead_property.py.
 
 Tests cover:
 - _estimate_worker_memory: Memory estimation per worker
-- _get_safe_n_jobs: Safe parallel worker calculation
+- _get_safe_n_workers: Safe parallel worker calculation
 """
 
 import numpy as np
@@ -11,7 +11,7 @@ import pytest
 import torch
 from unittest.mock import Mock, patch, MagicMock
 
-from dpnegf.negf.lead_property import _estimate_worker_memory, _get_safe_n_jobs
+from dpnegf.negf.lead_property import _estimate_worker_memory, _get_safe_n_workers
 
 
 class MockHamiltonian:
@@ -192,23 +192,23 @@ class TestEstimateWorkerMemory:
 
 
 # =============================================================================
-# Tests for _get_safe_n_jobs
+# Tests for _get_safe_n_workers
 # =============================================================================
 
 class TestGetSafeNJobs:
-    """Tests for _get_safe_n_jobs function."""
+    """Tests for _get_safe_n_workers function."""
 
     @patch('dpnegf.negf.lead_property.psutil')
     @patch('dpnegf.negf.lead_property.os')
     def test_auto_detect_n_jobs(self, mock_os, mock_psutil):
-        """Test auto-detection with n_jobs=-1."""
+        """Test auto-detection with n_workers=-1."""
         mock_os.cpu_count.return_value = 8
         mock_psutil.virtual_memory.return_value = Mock(available=16 * 1024**3)  # 16 GB
 
         lead_L = MockLead("lead_L", matrix_size=10)
         lead_R = MockLead("lead_R", matrix_size=10)
 
-        result = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1)
+        result = _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-1)
 
         # Should return a positive integer
         assert isinstance(result, int)
@@ -218,21 +218,21 @@ class TestGetSafeNJobs:
     @patch('dpnegf.negf.lead_property.psutil')
     @patch('dpnegf.negf.lead_property.os')
     def test_respects_requested_n_jobs(self, mock_os, mock_psutil):
-        """Test that requested n_jobs is respected when safe."""
+        """Test that requested n_workers is respected when safe."""
         mock_os.cpu_count.return_value = 16
         mock_psutil.virtual_memory.return_value = Mock(available=64 * 1024**3)  # 64 GB
 
         lead_L = MockLead("lead_L", matrix_size=10)
         lead_R = MockLead("lead_R", matrix_size=10)
 
-        result = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=4)
+        result = _get_safe_n_workers(lead_L, lead_R, requested_n_workers=4)
 
         assert result == 4
 
     @patch('dpnegf.negf.lead_property.psutil')
     @patch('dpnegf.negf.lead_property.os')
     def test_limits_when_memory_constrained(self, mock_os, mock_psutil):
-        """Test that n_jobs is limited when memory is constrained."""
+        """Test that n_workers is limited when memory is constrained."""
         mock_os.cpu_count.return_value = 16
         # Only 1 GB available - should limit workers
         mock_psutil.virtual_memory.return_value = Mock(available=1 * 1024**3)
@@ -241,7 +241,7 @@ class TestGetSafeNJobs:
         lead_R = MockLead("lead_R", matrix_size=100)
 
         # Request many workers
-        result = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=16)
+        result = _get_safe_n_workers(lead_L, lead_R, requested_n_workers=16)
 
         # Should be limited due to memory constraints
         assert result < 16
@@ -256,37 +256,37 @@ class TestGetSafeNJobs:
         lead_L = MockLead("lead_L", matrix_size=100)
         lead_R = MockLead("lead_R", matrix_size=100)
 
-        result = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1, min_workers=2)
+        result = _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-1, min_workers=2)
 
         assert result >= 2
 
     @patch('dpnegf.negf.lead_property.psutil')
     @patch('dpnegf.negf.lead_property.os')
     def test_handles_zero_n_jobs(self, mock_os, mock_psutil):
-        """Test handling of n_jobs=0 (invalid)."""
+        """Test handling of n_workers=0 (invalid)."""
         mock_os.cpu_count.return_value = 4
         mock_psutil.virtual_memory.return_value = Mock(available=8 * 1024**3)
 
         lead_L = MockLead("lead_L", matrix_size=10)
         lead_R = MockLead("lead_R", matrix_size=10)
 
-        result = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=0, min_workers=1)
+        result = _get_safe_n_workers(lead_L, lead_R, requested_n_workers=0, min_workers=1)
 
-        # Should return min_workers when n_jobs=0
+        # Should return min_workers when n_workers=0
         assert result == 1
 
     @patch('dpnegf.negf.lead_property.psutil')
     @patch('dpnegf.negf.lead_property.os')
     def test_handles_negative_n_jobs(self, mock_os, mock_psutil):
-        """Test handling of negative n_jobs (joblib convention)."""
+        """Test handling of negative n_workers (joblib convention)."""
         mock_os.cpu_count.return_value = 8
         mock_psutil.virtual_memory.return_value = Mock(available=32 * 1024**3)
 
         lead_L = MockLead("lead_L", matrix_size=10)
         lead_R = MockLead("lead_R", matrix_size=10)
 
-        # n_jobs=-2 means (cpu_count + 1 + (-2)) = cpu_count - 1 = 7
-        result = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-2)
+        # n_workers=-2 means (cpu_count + 1 + (-2)) = cpu_count - 1 = 7
+        result = _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-2)
 
         assert result >= 1
         assert result <= 8
@@ -301,7 +301,7 @@ class TestGetSafeNJobs:
         lead_L = MockLead("lead_L", matrix_size=10)
         lead_R = MockLead("lead_R", matrix_size=10)
 
-        result = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1)
+        result = _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-1)
 
         # Should default to 1 CPU and still work
         assert result >= 1
@@ -317,9 +317,9 @@ class TestGetSafeNJobs:
         lead_R = MockLead("lead_R", matrix_size=10)
 
         # With higher fraction, should allow more workers
-        result_high = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1,
+        result_high = _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-1,
                                         max_memory_fraction=0.9)
-        result_low = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1,
+        result_low = _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-1,
                                        max_memory_fraction=0.3)
 
         assert result_high >= result_low
@@ -327,7 +327,7 @@ class TestGetSafeNJobs:
     @patch('dpnegf.negf.lead_property.psutil')
     @patch('dpnegf.negf.lead_property.os')
     def test_handles_non_integer_n_jobs(self, mock_os, mock_psutil):
-        """Test handling of non-integer n_jobs logs a warning."""
+        """Test handling of non-integer n_workers logs a warning."""
         mock_os.cpu_count.return_value = 4
         mock_psutil.virtual_memory.return_value = Mock(available=8 * 1024**3)
 
@@ -337,7 +337,7 @@ class TestGetSafeNJobs:
         # Pass a float instead of int - function logs warning but continues
         # Note: current implementation has a bug where final_worker is set to min_workers
         # but subsequent conditionals may overwrite it. This test documents current behavior.
-        result = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=2.5, min_workers=1)
+        result = _get_safe_n_workers(lead_L, lead_R, requested_n_workers=2.5, min_workers=1)
 
         # Result should still be a valid positive number
         assert result >= 1
@@ -353,7 +353,7 @@ class TestGetSafeNJobs:
         lead_L = MockLead("lead_L", matrix_size=10)
         lead_R = MockLead("lead_R", matrix_size=10)
 
-        result = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1)
+        result = _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-1)
 
         # Should be capped at CPU count
         assert result <= 4
@@ -377,7 +377,7 @@ class TestMemoryEstimationIntegration:
         lead_L = MockLead("lead_L", matrix_size=10)
         lead_R = MockLead("lead_R", matrix_size=10)
 
-        result = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1)
+        result = _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-1)
 
         # With 8GB and tiny matrices, should allow many workers
         assert result >= 4
@@ -394,7 +394,7 @@ class TestMemoryEstimationIntegration:
         lead_R = MockLead("lead_R", matrix_size=1000)
 
         memory_estimate = _estimate_worker_memory(lead_L, lead_R)
-        n_jobs = _get_safe_n_jobs(lead_L, lead_R, requested_n_jobs=-1)
+        n_workers = _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-1)
 
         # Memory per worker should be significant (> 500 MB)
         # 1000x1000 matrices: 2 leads * 6 matrices * 1000^2 * 16 bytes * 3.0 factor + 100MB overhead
@@ -402,7 +402,7 @@ class TestMemoryEstimationIntegration:
         assert memory_estimate > 500 * 1024**2  # > 500 MB
 
         # Should limit workers due to memory (4 GB * 0.9 / ~676 MB per worker ~= 5, below CPU count of 16)
-        assert n_jobs <= 8
+        assert n_workers <= 8
 
     def test_consistent_estimates(self):
         """Test that estimates are consistent across calls."""
