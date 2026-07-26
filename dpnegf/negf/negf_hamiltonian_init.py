@@ -17,7 +17,9 @@ from dptb.nn.hr2hk import HR2HK
 from dpnegf.negf.bloch import Bloch
 from dpnegf.negf.sort_btd import sort_lexico, sort_projection, sort_capacitance
 from dpnegf.negf.split_btd import show_blocks,split_into_subblocks,split_into_subblocks_optimized
+from dpnegf.negf.split_btd import constrained_subblocks
 from dpnegf.negf.negf_utils import natsorted
+from dpnegf.negf.lead_property import inspect_self_energy_cache
 
 '''
 a Hamiltonian object  that initializes and manipulates device and  lead Hamiltonians for NEGF
@@ -59,8 +61,10 @@ class NEGFHamiltonianInit(object):
                  pbc_negf: List[bool],
                  stru_options:dict, 
                  unit: str,
+                 use_saved_se: bool=False,
+                 self_energy_save_path: Optional[str]=None,
                  results_path:Optional[str]=None,
-                 torch_device: Union[str, torch.device]=torch.device('cpu')
+                 torch_device: Union[str, torch.device]=torch.device('cpu'),
                  ) -> None:
         
         # TODO: add dtype and device setting to the model
@@ -104,6 +108,10 @@ class NEGFHamiltonianInit(object):
         self.results_path = results_path
         self.saved_HS_path = None
         self.subblocks = None
+        self.use_saved_se = use_saved_se
+        self.self_energy_save_path = self_energy_save_path
+        self.self_energy_cache_format = "h5"  # default to h5 format for self-energy cache
+        self._self_energy_cache_edge_sizes = None
 
         self.h2k = HR2HK(
             idp=model.idp, 
@@ -225,6 +233,17 @@ class NEGFHamiltonianInit(object):
                 bloch_sorted_indices[kk],bloch_R_lists[kk] = self.get_lead_structure(kk,n_proj_atom_lead,\
                                 useBloch=useBloch,bloch_factor=bloch_factor) 
 
+        if self.use_saved_se:
+            if self.self_energy_save_path is None:
+                self.self_energy_save_path = os.path.join(self.results_path, "self_energy")
+            left_size, right_size, self.self_energy_cache_format = \
+                inspect_self_energy_cache(self.self_energy_save_path)
+            if block_tridiagnal and not use_saved_HS:
+                self._self_energy_cache_edge_sizes = (left_size, right_size)
+                log.info(msg="Cache-driven BTD active: using left/right block sizes "
+                        "{} and {} read directly from the {} self-energy cache."
+                        .format(left_size, right_size, self.self_energy_cache_format))
+                
         # Hamiltonian initialization
         if use_saved_HS:
             if saved_HS_path is None:
@@ -477,6 +496,9 @@ class NEGFHamiltonianInit(object):
                                                                 plot_blocks=plot_blocks)
             HS_device.update({"hd":hd, "hu":hu, "hl":hl, "sd":sd, "su":su, "sl":sl, \
                               "subblocks":subblocks, "block_tridiagonal":True})
+            if self._self_energy_cache_edge_sizes is not None:
+                log.info(msg="Cache-driven BTD active: using left/right-most block sizes {} and {} from self-energy cache {}."
+                        .format(self._self_energy_cache_edge_sizes[0], self._self_energy_cache_edge_sizes[1], self.self_energy_cache_format))
 
         self.subblocks = subblocks
         # torch.save(HS_device, os.path.join(self.results_path, "HS_device.pth"))
@@ -697,6 +719,8 @@ class NEGFHamiltonianInit(object):
             Number of orbitals in the leftmost block. If None, it is determined from the structure.
         rightmost_size : int or None
             Number of orbitals in the rightmost block. If None, it is determined from the structure.
+        plot_blocks : bool, optional
+            Whether to visualize the block structure using `show_blocks`. Default is False.
         Returns
         -------
         hd : list
@@ -733,11 +757,29 @@ class NEGFHamiltonianInit(object):
             rightmost_atoms_index = np.where(structase.positions[:,2]==max(structase.positions[:,2]))[0]
             rightmost_size = sum([self.atom_norbs[rightmost_atoms_index[i]] for i in range(len(rightmost_atoms_index))])
         
-        subblocks = split_into_subblocks_optimized(HK[0],leftmost_size,rightmost_size)
-        if subblocks[0] < leftmost_size or subblocks[-1] < rightmost_size:
-            subblocks = split_into_subblocks(HK[0],leftmost_size,rightmost_size)
-            log.info(msg="The optimized block tridiagonalization is not successful, \
-                     the original block tridiagonalization is used.")
+        if self._self_energy_cache_edge_sizes is not None:
+            cache_leftmost_size, cache_rightmost_size = \
+                self._self_energy_cache_edge_sizes
+            if cache_leftmost_size < leftmost_size:
+                msg = (f"The cached left self-energy size {cache_leftmost_size} is smaller "
+                       f"than the lead_L coupling width {leftmost_size}; it cannot "
+                       f"contain the full device-lead coupling.")
+                log.error(msg=msg)
+                raise ValueError(msg)
+            if cache_rightmost_size < rightmost_size:
+                msg = (f"The cached right self-energy size {cache_rightmost_size} is smaller "
+                       f"than the lead_R coupling width {rightmost_size}; it cannot "
+                       f"contain the full device-lead coupling.")
+                log.error(msg=msg)
+                raise ValueError(msg)
+            subblocks = constrained_subblocks(
+                HK[0], SK[0], cache_leftmost_size, cache_rightmost_size)
+        else:
+            subblocks = split_into_subblocks_optimized(HK[0],leftmost_size,rightmost_size)
+            if subblocks[0] < leftmost_size or subblocks[-1] < rightmost_size:
+                subblocks = split_into_subblocks(HK[0],leftmost_size,rightmost_size)
+                log.info(msg="The optimized block tridiagonalization is not successful, \
+                         the original block tridiagonalization is used.")
         subblocks = [0]+subblocks
         
         
