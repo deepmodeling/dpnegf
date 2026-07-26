@@ -12,8 +12,8 @@ This module tests the two pieces of the fix:
 
 * ``inspect_self_energy_cache`` — infers the required first/last device block
   sizes from a saved self-energy cache (HDF5 preferred, legacy PTH fallback).
-* ``NEGFHamiltonianInit._constrained_subblocks`` /
-  ``_validate_block_tridiagonal`` — partition the device with the first/last
+* ``dpnegf.negf.split_btd.constrained_subblocks`` /
+  ``validate_block_tridiagonal`` — partition the device with the first/last
   block sizes pinned exactly, growing only the interior, and reject layouts
   incompatible with the device sparsity.
 """
@@ -30,6 +30,8 @@ from dpnegf.negf.lead_property import inspect_self_energy_cache, write_to_hdf5
 from dpnegf.negf.split_btd import (
     split_into_subblocks,
     split_into_subblocks_optimized,
+    constrained_subblocks,
+    validate_block_tridiagonal,
 )
 
 
@@ -59,9 +61,8 @@ def _make_btd_device(blocks, coupling=0.5, onsite=1.0):
 def _bare_ham():
     """A NEGFHamiltonianInit instance without running __init__.
 
-    ``_constrained_subblocks`` only reaches ``self`` to call the static
-    ``_validate_block_tridiagonal``, so an uninitialized instance is enough to
-    exercise the partitioning logic without building a model.
+    Used to exercise ``get_block_tridiagonal`` on synthetic Hamiltonians
+    without building a model.
     """
     return object.__new__(NEGFHamiltonianInit)
 
@@ -196,12 +197,11 @@ def test_inspect_cache_mixed_shape(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _constrained_subblocks / _validate_block_tridiagonal
+# constrained_subblocks / validate_block_tridiagonal
 # ---------------------------------------------------------------------------
 def test_constrained_endpoints_preserved():
-    ham = _bare_ham()
     H, S = _make_btd_device([3, 2, 2, 3])
-    sub = ham._constrained_subblocks(H, S, 3, 3)
+    sub = constrained_subblocks(H, S, 3, 3)
     assert sub[0] == 3 and sub[-1] == 3
     assert sum(sub) == H.shape[0]
 
@@ -212,30 +212,27 @@ def test_constrained_endpoints_stable_under_interior_change():
     This is the whole point of the fix: cached self-energy edge sizes stay
     reusable across scattering-region variants.
     """
-    ham = _bare_ham()
     for interior in ([2, 2], [5], [2, 4], [3, 3, 2]):
         H, S = _make_btd_device([3] + interior + [3])
-        sub = ham._constrained_subblocks(H, S, 3, 3)
+        sub = constrained_subblocks(H, S, 3, 3)
         assert sub[0] == 3, (interior, sub)
         assert sub[-1] == 3, (interior, sub)
         assert sum(sub) == H.shape[0]
-        assert NEGFHamiltonianInit._validate_block_tridiagonal(
+        assert validate_block_tridiagonal(
             (H.abs() + S.abs()) != 0, sub)
 
 
 def test_constrained_full_coverage_and_tridiagonal():
-    ham = _bare_ham()
     H, S = _make_btd_device([4, 3, 3, 4])
-    sub = ham._constrained_subblocks(H, S, 4, 4)
+    sub = constrained_subblocks(H, S, 4, 4)
     assert sum(sub) == H.shape[0]
     mask = (H.abs() + S.abs()) != 0
-    assert NEGFHamiltonianInit._validate_block_tridiagonal(mask, sub)
+    assert validate_block_tridiagonal(mask, sub)
 
 
 def test_constrained_two_block_exact_tiling():
-    ham = _bare_ham()
     H, S = _make_btd_device([5, 5])
-    sub = ham._constrained_subblocks(H, S, 5, 5)
+    sub = constrained_subblocks(H, S, 5, 5)
     assert sub == [5, 5]
 
 
@@ -244,33 +241,30 @@ def test_validate_rejects_non_tridiagonal_partition():
     # makes block 0 couple block 2 -> not block-tridiagonal.
     H, S = _make_btd_device([3, 2, 2, 3])
     mask = (H.abs() + S.abs()) != 0
-    assert not NEGFHamiltonianInit._validate_block_tridiagonal(mask, [2, 2, 2, 2, 2])
-    assert NEGFHamiltonianInit._validate_block_tridiagonal(mask, [3, 2, 2, 3])
+    assert not validate_block_tridiagonal(mask, [2, 2, 2, 2, 2])
+    assert validate_block_tridiagonal(mask, [3, 2, 2, 3])
 
 
 # ---------------------------------------------------------------------------
 # Expected failures
 # ---------------------------------------------------------------------------
 def test_constrained_edge_exceeds_device():
-    ham = _bare_ham()
     H, S = _make_btd_device([3, 2, 3])
     with pytest.raises(ValueError, match="exceed"):
-        ham._constrained_subblocks(H, S, H.shape[0] + 1, 3)
+        constrained_subblocks(H, S, H.shape[0] + 1, 3)
 
 
 def test_constrained_non_positive_edge():
-    ham = _bare_ham()
     H, S = _make_btd_device([3, 2, 3])
     with pytest.raises(ValueError, match="positive"):
-        ham._constrained_subblocks(H, S, 0, 3)
+        constrained_subblocks(H, S, 0, 3)
 
 
 def test_constrained_no_interior_no_tiling():
-    ham = _bare_ham()
     H, S = _make_btd_device([3, 2, 3])  # D = 8
     # 6 + 6 > 8 but 6 + 6 != 8 -> cannot tile.
     with pytest.raises(ValueError, match="no room|tile"):
-        ham._constrained_subblocks(H, S, 6, 6)
+        constrained_subblocks(H, S, 6, 6)
 
 
 def test_constrained_edge_too_small_for_coupling():
@@ -279,10 +273,9 @@ def test_constrained_edge_too_small_for_coupling():
     The greedy splitter would grow the edge to 7, which the constrained path
     must reject because the cached (3x3) self-energy would not fit.
     """
-    ham = _bare_ham()
     H, S = _make_btd_device([5, 5])
     with pytest.raises(ValueError, match="incompatible"):
-        ham._constrained_subblocks(H, S, 3, 3)
+        constrained_subblocks(H, S, 3, 3)
 
 
 # ---------------------------------------------------------------------------
