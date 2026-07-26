@@ -17,7 +17,9 @@ from dptb.nn.hr2hk import HR2HK
 from dpnegf.negf.bloch import Bloch
 from dpnegf.negf.sort_btd import sort_lexico, sort_projection, sort_capacitance
 from dpnegf.negf.split_btd import show_blocks,split_into_subblocks,split_into_subblocks_optimized
+from dpnegf.negf.split_btd import compute_edge, compute_blocks
 from dpnegf.negf.negf_utils import natsorted
+from dpnegf.negf.lead_property import inspect_self_energy_cache
 
 '''
 a Hamiltonian object  that initializes and manipulates device and  lead Hamiltonians for NEGF
@@ -59,8 +61,10 @@ class NEGFHamiltonianInit(object):
                  pbc_negf: List[bool],
                  stru_options:dict, 
                  unit: str,
+                 use_saved_se: bool=False,
+                 self_energy_save_path: Optional[str]=None,
                  results_path:Optional[str]=None,
-                 torch_device: Union[str, torch.device]=torch.device('cpu')
+                 torch_device: Union[str, torch.device]=torch.device('cpu'),
                  ) -> None:
         
         # TODO: add dtype and device setting to the model
@@ -104,6 +108,10 @@ class NEGFHamiltonianInit(object):
         self.results_path = results_path
         self.saved_HS_path = None
         self.subblocks = None
+        self.use_saved_se = use_saved_se
+        self.self_energy_save_path = self_energy_save_path
+        self.self_energy_cache_format = "h5"  # default to h5 format for self-energy cache
+        self._self_energy_cache_edge_sizes = None
 
         self.h2k = HR2HK(
             idp=model.idp, 
@@ -225,6 +233,17 @@ class NEGFHamiltonianInit(object):
                 bloch_sorted_indices[kk],bloch_R_lists[kk] = self.get_lead_structure(kk,n_proj_atom_lead,\
                                 useBloch=useBloch,bloch_factor=bloch_factor) 
 
+        if self.use_saved_se:
+            if self.self_energy_save_path is None:
+                self.self_energy_save_path = os.path.join(self.results_path, "self_energy")
+            left_size, right_size, self.self_energy_cache_format = \
+                inspect_self_energy_cache(self.self_energy_save_path)
+            if block_tridiagnal and not use_saved_HS:
+                self._self_energy_cache_edge_sizes = (left_size, right_size)
+                log.info(msg="Cache-driven BTD active: using left/right block sizes "
+                        "{} and {} read directly from the {} self-energy cache."
+                        .format(left_size, right_size, self.self_energy_cache_format))
+                
         # Hamiltonian initialization
         if use_saved_HS:
             if saved_HS_path is None:
@@ -477,6 +496,9 @@ class NEGFHamiltonianInit(object):
                                                                 plot_blocks=plot_blocks)
             HS_device.update({"hd":hd, "hu":hu, "hl":hl, "sd":sd, "su":su, "sl":sl, \
                               "subblocks":subblocks, "block_tridiagonal":True})
+            if self._self_energy_cache_edge_sizes is not None:
+                log.info(msg="Cache-driven BTD active: using left/right-most block sizes {} and {} from self-energy cache {}."
+                        .format(self._self_energy_cache_edge_sizes[0], self._self_energy_cache_edge_sizes[1], self.self_energy_cache_format))
 
         self.subblocks = subblocks
         # torch.save(HS_device, os.path.join(self.results_path, "HS_device.pth"))
@@ -697,6 +719,8 @@ class NEGFHamiltonianInit(object):
             Number of orbitals in the leftmost block. If None, it is determined from the structure.
         rightmost_size : int or None
             Number of orbitals in the rightmost block. If None, it is determined from the structure.
+        plot_blocks : bool, optional
+            Whether to visualize the block structure using `show_blocks`. Default is False.
         Returns
         -------
         hd : list
@@ -733,11 +757,29 @@ class NEGFHamiltonianInit(object):
             rightmost_atoms_index = np.where(structase.positions[:,2]==max(structase.positions[:,2]))[0]
             rightmost_size = sum([self.atom_norbs[rightmost_atoms_index[i]] for i in range(len(rightmost_atoms_index))])
         
-        subblocks = split_into_subblocks_optimized(HK[0],leftmost_size,rightmost_size)
-        if subblocks[0] < leftmost_size or subblocks[-1] < rightmost_size:
-            subblocks = split_into_subblocks(HK[0],leftmost_size,rightmost_size)
-            log.info(msg="The optimized block tridiagonalization is not successful, \
-                     the original block tridiagonalization is used.")
+        if self._self_energy_cache_edge_sizes is not None:
+            cache_leftmost_size, cache_rightmost_size = \
+                self._self_energy_cache_edge_sizes
+            if cache_leftmost_size < leftmost_size:
+                msg = (f"The cached left self-energy size {cache_leftmost_size} is smaller "
+                       f"than the lead_L coupling width {leftmost_size}; it cannot "
+                       f"contain the full device-lead coupling.")
+                log.error(msg=msg)
+                raise ValueError(msg)
+            if cache_rightmost_size < rightmost_size:
+                msg = (f"The cached right self-energy size {cache_rightmost_size} is smaller "
+                       f"than the lead_R coupling width {rightmost_size}; it cannot "
+                       f"contain the full device-lead coupling.")
+                log.error(msg=msg)
+                raise ValueError(msg)
+            subblocks = self._constrained_subblocks(
+                HK[0], SK[0], cache_leftmost_size, cache_rightmost_size)
+        else:
+            subblocks = split_into_subblocks_optimized(HK[0],leftmost_size,rightmost_size)
+            if subblocks[0] < leftmost_size or subblocks[-1] < rightmost_size:
+                subblocks = split_into_subblocks(HK[0],leftmost_size,rightmost_size)
+                log.info(msg="The optimized block tridiagonalization is not successful, \
+                         the original block tridiagonalization is used.")
         subblocks = [0]+subblocks
         
         
@@ -776,6 +818,140 @@ class NEGFHamiltonianInit(object):
         
         return hd, hu, hl, sd, su, sl, subblocks
 
+    def _constrained_subblocks(self, HK0, SK0, leftmost_size:int, rightmost_size:int):
+        """Partition the device into block-tridiagonal subblocks with fixed edges.
+
+        Cache-driven BTD requires the first and last subblocks to keep exactly
+        ``leftmost_size`` / ``rightmost_size`` so the reused lead self-energy stays
+        dimension-compatible (see :meth:`LeadProperty.HDL_reduced`). Only the
+        interior is grown freely.
+
+        The greedy splitter :func:`split_btd.compute_blocks` is run on the combined
+        ``|H| + |S|`` sparsity with the requested edge sizes as the leftmost /
+        rightmost blocks. Unlike the optimized splitter, it honours the requested
+        outer sizes *exactly* whenever they are compatible with the sparsity: it
+        pins ``blocks[0] == nL`` and, walking from the right, ``blocks[-1] == nR``.
+        When the requested size is too small to contain the block's coupling, the
+        greedy algorithm grows that edge block instead — which we detect and reject,
+        because the cached self-energy would then be dimension-incompatible.
+
+        Parameters
+        ----------
+        HK0, SK0 : torch.Tensor
+            Gamma-point Hamiltonian / overlap of the device, shape (D, D).
+        leftmost_size, rightmost_size : int
+            The exact required first / last block sizes.
+
+        Returns
+        -------
+        list[int]
+            Subblock sizes with ``subblocks[0] == leftmost_size`` and
+            ``subblocks[-1] == rightmost_size`` summing to ``D``.
+
+        Raises
+        ------
+        ValueError
+            If the requested edge sizes cannot form a valid block-tridiagonal
+            layout (too large for the device, no room for the interior, the greedy
+            splitter could not honour an edge size, or the couplings extend beyond
+            neighbouring blocks).
+        """
+        D = int(HK0.shape[0])
+        nL = int(leftmost_size)
+        nR = int(rightmost_size)
+
+        if nL <= 0 or nR <= 0:
+            raise ValueError(f"Cache-driven BTD edge sizes must be positive, got leftmost={nL}, rightmost={nR}.")
+        if nL > D or nR > D:
+            raise ValueError(f"Cache-driven BTD edge sizes (leftmost={nL}, rightmost={nR}) exceed the device basis size {D}.")
+
+        # Build the combined sparsity mask once; used for the greedy split and the
+        # final block-tridiagonality validation.
+        mask = (HK0.abs() + SK0.abs()) != 0
+
+        if nL + nR >= D:
+            # No interior room: the device is (at most) the two edge blocks. Valid
+            # only if they exactly tile the device (BTD is trivial for <=2 blocks).
+            if nL + nR != D:
+                raise ValueError(
+                    f"Cache-driven BTD edge sizes (leftmost={nL}, rightmost={nR}) leave "
+                    f"no room for the interior and do not tile the device basis {D}.")
+            subblocks = [nL, nR]
+        else:
+            edge, edge1 = compute_edge(mask.detach().cpu().numpy())
+            subblocks = [int(b) for b in compute_blocks(nL, nR, edge, edge1)]
+            # The greedy splitter grows an edge block when the requested size cannot
+            # contain its coupling. A grown edge means the cached self-energy shape
+            # would not match the first/last Hamiltonian block, so reject it.
+            if subblocks[0] != nL:
+                raise ValueError(
+                    f"Cache-driven leftmost block size {nL} is incompatible with the "
+                    f"device sparsity: the block-tridiagonal splitter requires at least "
+                    f"{subblocks[0]} orbitals in the first block. The cached self-energy "
+                    f"cannot be reused for this device.")
+            if subblocks[-1] != nR:
+                raise ValueError(
+                    f"Cache-driven rightmost block size {nR} is incompatible with the "
+                    f"device sparsity: the block-tridiagonal splitter requires at least "
+                    f"{subblocks[-1]} orbitals in the last block. The cached self-energy "
+                    f"cannot be reused for this device.")
+
+        subblocks = [int(b) for b in subblocks]
+        if sum(subblocks) != D:
+            raise ValueError(
+                f"Cache-driven BTD partition {subblocks} sums to {sum(subblocks)} but the "
+                f"device basis size is {D}.")
+
+        if not self._validate_block_tridiagonal(mask, subblocks):
+            raise ValueError(
+                f"Cache-driven BTD partition with fixed edges (leftmost={nL}, "
+                f"rightmost={nR}) is not block-tridiagonal: the Hamiltonian/overlap "
+                f"couples non-neighbouring blocks. The cached self-energy edge sizes "
+                f"are incompatible with the current device sparsity.")
+
+        return subblocks
+
+    @staticmethod
+    def _validate_block_tridiagonal(mask, subblocks) -> bool:
+        """Check that ``mask`` is block-tridiagonal under the given partition.
+
+        A partition is block-tridiagonal iff no nonzero entry couples blocks that
+        are more than one apart. Using the per-row sparsity profile (last nonzero
+        column per row, an O(D) quantity, cf. :func:`split_btd.compute_edge`), a
+        row belonging to block ``i`` must not reach past the end of block ``i+1``,
+        and by symmetry of the coupling structure this also bounds the lower part.
+
+        Parameters
+        ----------
+        mask : torch.Tensor
+            Boolean / 0-1 matrix marking nonzero entries of ``|H| + |S|``.
+        subblocks : list[int]
+            Candidate diagonal block sizes.
+
+        Returns
+        -------
+        bool
+            True if the layout is block-tridiagonal.
+        """
+        mat = mask.detach().cpu().numpy()
+        edge, edge1 = compute_edge(mat)  # edge[i]: 1 + last nonzero col in row i
+        bounds = np.cumsum([0] + list(subblocks))  # block boundaries
+        for bi in range(len(subblocks)):
+            r0, r1 = bounds[bi], bounds[bi + 1]
+            # Rightmost column any row in this block may reach: end of next block.
+            allowed = bounds[min(bi + 2, len(subblocks))]
+            if r1 > r0 and int(edge[r0:r1].max()) > allowed:
+                return False
+            # Lower part: leftmost column reachable is start of previous block.
+            # edge1 is the 180-degree-rotated profile; reuse the same bound from
+            # the other side to catch couplings below the sub-diagonal blocks.
+            allowed_lo = bounds[len(subblocks)] - bounds[max(bi - 1, 0)]
+            rr0 = bounds[len(subblocks)] - r1
+            rr1 = bounds[len(subblocks)] - r0
+            if rr1 > rr0 and int(edge1[rr0:rr1].max()) > allowed_lo:
+                return False
+        return True
+    
     def get_hs_device(self, kpoint=[0,0,0], V=None, block_tridiagonal=False, only_subblocks=False):
         """ get the device Hamiltonian and overlap matrix at a specific kpoint
 

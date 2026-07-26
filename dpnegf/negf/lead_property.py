@@ -1195,3 +1195,181 @@ def _has_saved_self_energy(root: str) -> bool:
             if any(p.rglob(pat)):
                 return True
         return False
+
+
+def _collect_h5_self_energy_size(h5_path: str, tab: str) -> int:
+    """Return the single invariant matrix size of an HDF5 self-energy cache.
+
+    The HDF5 layout written by :func:`write_to_hdf5` is a set of ``E_<energy>``
+    groups, each holding ``k_<kx>_<ky>_<kz>`` datasets of a square self-energy
+    matrix. This walks every (k, E) entry, requires every matrix to be square,
+    and requires a single invariant size across the whole file.
+
+    Parameters
+    ----------
+    h5_path : str
+        Path to ``self_energy_leadL.h5`` / ``self_energy_leadR.h5``.
+    tab : str
+        Lead tag used only for error messages.
+
+    Returns
+    -------
+    int
+        The invariant matrix size ``n`` (matrices are ``n x n``).
+    """
+    size = None
+    n_entries = 0
+    with h5py.File(h5_path, "r") as f:
+        for group_name in f.keys():
+            group = f[group_name]
+            if not isinstance(group, h5py.Group):
+                continue
+            for dset_name in group.keys():
+                shape = group[dset_name].shape
+                if len(shape) != 2 or shape[0] != shape[1]:
+                    raise ValueError(
+                        f"Self-energy cache {h5_path} contains a non-square matrix "
+                        f"of shape {tuple(shape)} at {group_name}/{dset_name} for {tab}."
+                    )
+                if size is None:
+                    size = int(shape[0])
+                elif int(shape[0]) != size:
+                    raise ValueError(
+                        f"Self-energy cache {h5_path} for {tab} has mixed matrix sizes "
+                        f"({size} vs {shape[0]}). A reusable cache must have a single "
+                        f"invariant size across all k-points and energies."
+                    )
+                n_entries += 1
+    if n_entries == 0 or size is None:
+        raise ValueError(
+            f"Self-energy cache {h5_path} for {tab} is empty (no saved matrices)."
+        )
+    return size
+
+
+def _collect_pth_self_energy_size(pth_paths: List[str], tab: str) -> int:
+    """Return the single invariant matrix size of a legacy PTH self-energy cache.
+
+    Each ``se_<tab>_k*_E*.pth`` file stores one square self-energy tensor. This
+    requires every file to hold a square matrix and a single invariant size
+    across all files for the lead.
+
+    Parameters
+    ----------
+    pth_paths : list[str]
+        Sorted list of PTH cache files for one lead.
+    tab : str
+        Lead tag used only for error messages.
+
+    Returns
+    -------
+    int
+        The invariant matrix size ``n`` (matrices are ``n x n``).
+    """
+    size = None
+    for path in pth_paths:
+        try:
+            se = torch.load(path, weights_only=False)
+        except Exception as e:  # pragma: no cover - IO error path
+            raise IOError(f"Failed to load self-energy cache {path} for {tab}.") from e
+        shape = tuple(se.shape)
+        if len(shape) != 2 or shape[0] != shape[1]:
+            raise ValueError(
+                f"Self-energy cache {path} for {tab} is not a square matrix "
+                f"(shape {shape})."
+            )
+        if size is None:
+            size = int(shape[0])
+        elif int(shape[0]) != size:
+            raise ValueError(
+                f"Legacy PTH self-energy cache for {tab} has mixed matrix sizes "
+                f"({size} vs {shape[0]}). A reusable cache must have a single "
+                f"invariant size across all k-points and energies."
+            )
+    if size is None:
+        raise ValueError(f"No PTH self-energy files found for {tab}.")
+    return size
+
+
+def inspect_self_energy_cache(save_path: str):
+    """Infer the required left/right device edge block sizes from a saved cache.
+
+    Reusing a cached lead self-energy across nearby scattering-region variants
+    only works if the block-tridiagonal (BTD) partition keeps the same first and
+    last device block sizes, because the lead self-energy shape is pinned to
+    those outer blocks (see :meth:`LeadProperty.HDL_reduced`). This inspects the
+    saved self-energy cache and returns the exact matrix sizes so the BTD
+    construction can preserve them.
+
+    Discovery order:
+
+    * a valid pair of standard HDF5 caches ``self_energy_leadL.h5`` /
+      ``self_energy_leadR.h5`` (preferred), else
+    * legacy per-(k, E) PTH files ``se_lead_L_k*_E*.pth`` /
+      ``se_lead_R_k*_E*.pth``.
+
+    If both cache styles are present, HDF5 is used and the choice is logged.
+
+    Parameters
+    ----------
+    save_path : str
+        Directory that holds the self-energy cache files.
+
+    Returns
+    -------
+    (nL, nR, fmt) : tuple[int, int, str]
+        Left and right invariant self-energy matrix sizes, and the detected
+        cache format (``"h5"`` or ``"pth"``).
+
+    Raises
+    ------
+    ValueError
+        If the cache is missing, empty, incomplete (only one lead), contains a
+        non-square matrix, or has mixed matrix shapes for a lead.
+    """
+    if save_path is None or not os.path.isdir(save_path):
+        raise ValueError(
+            f"Self-energy cache directory {save_path} does not exist; cannot infer "
+            f"cache-driven BTD edge block sizes."
+        )
+
+    h5_L = os.path.join(save_path, "self_energy_leadL.h5")
+    h5_R = os.path.join(save_path, "self_energy_leadR.h5")
+    has_h5 = os.path.isfile(h5_L) and os.path.isfile(h5_R)
+
+    pth_L = sorted(glob.glob(os.path.join(save_path, "se_lead_L_k*_E*.pth")))
+    pth_R = sorted(glob.glob(os.path.join(save_path, "se_lead_R_k*_E*.pth")))
+    has_pth = bool(pth_L) and bool(pth_R)
+
+    if has_h5:
+        if has_pth:
+            log.info(
+                "Both HDF5 and legacy PTH self-energy caches found in "
+                f"{save_path}; using HDF5 to infer BTD edge block sizes."
+            )
+        nL = _collect_h5_self_energy_size(h5_L, "lead_L")
+        nR = _collect_h5_self_energy_size(h5_R, "lead_R")
+        fmt = "h5"
+    elif has_pth:
+        nL = _collect_pth_self_energy_size(pth_L, "lead_L")
+        nR = _collect_pth_self_energy_size(pth_R, "lead_R")
+        fmt = "pth"
+    else:
+        # Distinguish partial caches (one lead only) from a fully absent cache.
+        only_h5 = os.path.isfile(h5_L) or os.path.isfile(h5_R)
+        only_pth = bool(pth_L) or bool(pth_R)
+        if only_h5 or only_pth:
+            raise ValueError(
+                f"Incomplete self-energy cache in {save_path}: both left and right "
+                f"lead caches are required to infer BTD edge block sizes."
+            )
+        raise ValueError(
+            f"No self-energy cache (self_energy_leadL.h5/self_energy_leadR.h5 or "
+            f"se_lead_L_k*_E*.pth/se_lead_R_k*_E*.pth) found in {save_path}."
+        )
+
+    log.info(
+        f"Inferred cache-driven BTD edge block sizes from {fmt} self-energy cache: "
+        f"leftmost={nL}, rightmost={nR}."
+    )
+    return nL, nR, fmt

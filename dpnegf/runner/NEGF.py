@@ -78,6 +78,9 @@ class NEGF(object):
         se_cache = dict(se_opts.get("cache", {}) or {})
         self.use_saved_se = se_cache.get("use_saved", False)
         self.self_energy_save_path = se_cache.get("save_path", None)
+        # Detected self-energy cache format
+        # defaults to HDF5
+        self.se_cache_format = "h5"
         se_parallel = dict(se_opts.get("parallel", {}) or {})
         self.cpu_budget = se_parallel.get("cpu_budget", None)
         self.n_workers = se_parallel.get("n_workers", -1)
@@ -181,13 +184,19 @@ class NEGF(object):
                                                     stru_options=self.stru_options,
                                                     unit = self.unit, 
                                                     results_path=self.results_path,
-                                                    torch_device = torch.device("cpu"))
+                                                    torch_device = torch.device("cpu"),
+                                                    use_saved_se = self.use_saved_se,
+                                                    self_energy_save_path = self.self_energy_save_path)
         # if useBloch is None, structure_leads_fold,bloch_sorted_indices,bloch_R_lists = None,None,None
         struct_device, struct_leads,structure_leads_fold,bloch_sorted_indices,bloch_R_lists = \
             self.negf_hamiltonian.initialize(kpoints=self.kpoints,
                                              block_tridiagnal=self.block_tridiagonal, plot_blocks=self.plot_blocks,\
                                              useBloch=self.useBloch,bloch_factor=self.bloch_factor,
                                              use_saved_HS=self.use_saved_HS, saved_HS_path=self.saved_HS_path)
+        self.self_energy_save_path = \
+            self.negf_hamiltonian.self_energy_save_path # update the self_energy_save_path in case it is None before
+        self.se_cache_format = \
+            self.negf_hamiltonian.self_energy_cache_format # update the se_cache_format in case it is None before
         profiler.stop()
         output_path = os.path.join(self.results_path, "profile_report_ham_init.html")
         with open(output_path, 'w') as report_file:
@@ -749,6 +758,7 @@ class NEGF(object):
                                         eta_lead=self.eta_lead,
                                         method=self.sgf_solver,
                                         save_path=self.self_energy_save_path,
+                                        save_format=self.se_cache_format,
                                         se_info_display=self.se_info_display
                                         )
 
@@ -800,6 +810,7 @@ class NEGF(object):
                                             eta_lead=self.eta_lead,
                                             method=self.sgf_solver,
                                             save_path=self.self_energy_save_path,
+                                            save_format=self.se_cache_format,
                                             se_info_display=self.se_info_display
                                             )
                                 seL_list.append(self.deviceprop.lead_L.se)
@@ -914,6 +925,7 @@ class NEGF(object):
                                         eta_lead=self.eta_lead,
                                         method=self.sgf_solver,
                                         save_path=self.self_energy_save_path,
+                                        save_format=self.se_cache_format,
                                         se_info_display=self.se_info_display
                                         )
                                     
