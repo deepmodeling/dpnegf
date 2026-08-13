@@ -93,7 +93,10 @@ class NEGF(object):
         self.e_fermi = e_fermi
         self.eta_lead = eta_lead; self.eta_device = eta_device
 
-        assert energy_grid_options or (espacing and emin and emax), "target energy grid not defined"
+        has_energy_grid_options = energy_grid_options is not None and len(energy_grid_options) > 0
+        has_legacy_grid = (espacing is not None) and (emin is not None) and (emax is not None)
+        if not (has_energy_grid_options or has_legacy_grid):
+            raise ValueError("target energy grid not defined")
         self.energy_grid_options = {} if energy_grid_options is None else energy_grid_options
         self.emin = self.energy_grid_options.get("emin") if self.energy_grid_options.get("emin") is not None else emin
         self.emax = self.energy_grid_options.get("emax") if self.energy_grid_options.get("emax") is not None else emax
