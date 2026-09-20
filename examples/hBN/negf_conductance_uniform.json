@@ -12,7 +12,8 @@
             "gamma_center": false,
             "time_reversal_symmetry": true,
             "nel_atom": {
-                "C": 4
+                "B": 3,
+                "N": 5
             },
             "kmesh": [
                 1,
@@ -28,6 +29,7 @@
                 "id": "32-64",
                 "sort": true
             },
+            "compute_band_edges": true,
             "lead_L": {
                 "id": "0-32",
                 "voltage": 0.0,
@@ -59,20 +61,30 @@
         },
         "self_energy_options": {
             "solver": "Sancho-Rubio",
-            "numba_jit": true
+            "numba_jit": true,
+            "parallel": {
+                "cpu_budget": 32,
+                "n_workers": 1,
+                "blas_threads": 1
+            }
         },
         "output_options": {
+            "dos": true,
             "tc": true,
+            "ldos": true,
+            "current_nscf": false,
             "conductance": true
         },
-        "energy_grid": {
-            "method": "clenshaw_curtis",
-            "num_points": 33,
-            "half_width": 0.4
+        "energy_grid":{
+            "method": "uniform",
+            "emin": -10,
+            "emax": 10,
+            "num_points": 4001
         },
         "conductance_options": {
             "mu": [
-                "Ef"
+                "Ev",
+                "Ec"
             ],
             "lead": "lead_L"
         },

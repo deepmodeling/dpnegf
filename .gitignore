@@ -34,6 +34,7 @@ examples/hBN/negf_output_k20/self_energy/self_energy_leadL.h5
 examples/hBN/negf_output_k20/self_energy/self_energy_leadR.h5
 examples/hBN/negf_output_k50/self_energy/*
 examples/hBN/negf_output_k70/self_energy/*
+examples/hBN/conductance_*
 examples/CNT/negf_profiling
 examples/CNT/output*
 examples/CNT/*long*

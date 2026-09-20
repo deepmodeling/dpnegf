@@ -69,7 +69,8 @@
             "dos": true,
             "tc": true,
             "ldos": true,
-            "current_nscf": false
+            "current_nscf": false,
+            "conductance": true
         }
     }
 }

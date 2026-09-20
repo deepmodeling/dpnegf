@@ -88,6 +88,81 @@ def tbtrans_negf():
 
 
 
+def energy_grid_options():
+    return Variant("method", [
+        Argument("uniform", dict, [
+            Argument("emin", [int, float], optional=False, doc="Lower energy relative to E_ref."),
+            Argument("emax", [int, float], optional=False, doc="Upper energy relative to E_ref."),
+            Argument("num_points", [int, None], optional=True, default=None,
+                     doc="Number of nodes including endpoints; mutually exclusive with espacing."),
+            Argument("espacing", [int, float, None], optional=True, default=None,
+                     doc="Legacy parameter: point count is int((emax-emin)/espacing), including endpoints."),
+        ]),
+        Argument("clenshaw_curtis", dict, [
+            Argument("num_points", int, optional=True, default=33,
+                     doc="Odd node count >=3 per target. 17/33/65 nodes are nested at fixed temperature and window."),
+            Argument("half_width", [int, float], optional=True, default=0.4,
+                     doc="Half window in eV about each mu. Tails are not extrapolated or renormalized."),
+        ]),
+    ], optional=True, default_tag="uniform")
+
+
+def conductance_options():
+    return [
+        Argument("mu", list, optional=True, default=["Ef"],
+                 doc="Nonempty list of Ef/Ev/Ec or numeric eV relative to E_ref. Does not change Hamiltonian or occupancy."),
+        Argument("lead", str, optional=True, default="lead_L",
+                 doc="lead_L or lead_R for Ef/Ev/Ec. Band edges are calculated automatically when requested."),
+        Argument("spin_degeneracy", [int, None], optional=True, default=None,
+                 doc="1 for explicit spin, 2 for spin-degenerate transmission. None uses model SOC convention."),
+    ]
+
+
+def validate_energy_options(task):
+    """Cross-field validation shared by normalized JSON and the Python API."""
+    import numpy as np
+    from dpnegf.utils.energy_grid import uniform_nodes, clenshaw_curtis_nodes
+
+    grid = task["energy_grid"]
+    method = grid.get("method", "uniform")
+    conductance = task.get("output_options", {}).get("conductance", False)
+    if method == "uniform":
+        uniform_nodes(grid)
+    elif method == "clenshaw_curtis":
+        clenshaw_curtis_nodes(grid.get("num_points", 33), task["ele_T"], grid.get("half_width", 0.4))
+    else:
+        raise ValueError(f"Unknown energy-grid method: {method}")
+    if conductance or method == "clenshaw_curtis":
+        if task.get("unit", "Hartree") != "eV":
+            raise ValueError("Conductance and Clenshaw-Curtis currently require unit='eV'")
+        if task.get("scf", False):
+            raise ValueError("Conductance and Clenshaw-Curtis currently require scf=false")
+        if not np.isfinite(task["ele_T"]) or task["ele_T"] <= 0:
+            raise ValueError("Conductance requires ele_T > 0")
+        for lead in ("lead_L", "lead_R"):
+            voltage = task["stru_options"][lead]["voltage"]
+            if not np.isfinite(voltage) or abs(voltage) > 1e-12:
+                raise ValueError("Conductance and Clenshaw-Curtis require zero lead voltages")
+        opts = task.get("conductance_options") or {}
+        mu = opts.get("mu", ["Ef"])
+        if not isinstance(mu, list) or not mu:
+            raise ValueError("conductance_options.mu must be a nonempty list")
+        for center in mu:
+            if isinstance(center, str):
+                if center not in ("Ef", "Ev", "Ec"):
+                    raise ValueError("mu labels must be Ef, Ev or Ec")
+            elif isinstance(center, bool) or not isinstance(center, (int, float)) or not np.isfinite(center):
+                raise ValueError("numeric mu must be a finite energy in eV")
+        if opts.get("lead", "lead_L") not in ("lead_L", "lead_R"):
+            raise ValueError("conductance_options.lead must be lead_L or lead_R")
+        if opts.get("spin_degeneracy") not in (None, 1, 2):
+            raise ValueError("spin_degeneracy must be 1 or 2")
+        if any(center in ("Ev", "Ec") for center in mu):
+            task["stru_options"]["compute_band_edges"] = True
+    if method == "clenshaw_curtis":
+        outputs = task.get("output_options", {})
+        if any(outputs.get(key, False) for key in ("density", "potential", "current", "current_nscf", "lcurrent")):
+            raise ValueError("Clenshaw-Curtis is a transmission grid, not a density or finite-bias current grid")
 
 def negf():
     doc_scf = "Whether to run a self-consistent (Poisson-NEGF) loop. Default: False (non-self-consistent transport)."
@@ -127,9 +202,10 @@ def negf():
         Argument("stru_options", dict, optional=False, sub_fields=stru_options(), doc=doc_stru_options),
         Argument("poisson_options", dict, optional=True, default={}, sub_fields=[], sub_variants=[poisson_options()], doc=doc_poisson_options),
         Argument("self_energy_options", dict, optional=True, default={}, sub_fields=self_energy_options(), doc=doc_self_energy_options),
-        Argument("espacing", [int, float], optional=False, doc=doc_espacing),
-        Argument("emin", [int, float], optional=False, doc=doc_emin),
-        Argument("emax", [int, float], optional=False, doc=doc_emax),
+        Argument("energy_grid", dict, optional=True, default={}, sub_fields=[], sub_variants=[energy_grid_options()], 
+                 doc="Fixed transmission grad. Legacy emin/emax/espacing migrate to uniform. CC uses eV relative to E_ref."),
+        Argument("conductance_options", dict, optional=True, default={}, 
+                 sub_fields=conductance_options(), doc="Finite-temperature Landauer integration targets"),
         Argument("rgf_options", dict, optional=True, default={}, sub_fields=rgf_options_group(), doc=doc_rgf_options),
         Argument("e_fermi", [int, float], optional=True, default=None ,doc=doc_e_fermi),
         Argument("density_options", dict, optional=True, default={}, sub_fields=[], sub_variants=[density_options()], doc=doc_density_options),
@@ -143,6 +219,8 @@ def output_options():
     return [
         Argument("dos", bool, optional=True, default=False, doc="Write density of states."),
         Argument("tc", bool, optional=True, default=False, doc="Write transmission coefficient."),
+        Argument("conductance", bool, optional=True, default=False, 
+                 doc="Write zero-bias non-SCF conductance; requires unit=eV and ele_T>0."),
         Argument("density", bool, optional=True, default=False, doc="Write electron density."),
         Argument("potential", bool, optional=True, default=False, doc="Write electrostatic potential."),
         Argument("current", bool, optional=True, default=False, doc="Write self-consistent current."),
@@ -490,12 +568,18 @@ def normalize_run(data):
     data = run_op.normalize_value(data)
     run_op.check_value(data, strict=True)
 
+    if data.get("task_options", {}).get("task") == "negf":
+        validate_energy_options(data["task_options"])
+
     return data
 
 
 # (flat legacy key)  -> tuple describing where it now lives inside task_options.
 # Tuples of length 1 = top-level under task_options; length 2 = one sub-dict; etc.
 _NEGF_LEGACY_KEY_MAP = {
+    "emin":                  ("energy_grid", "emin"),
+    "emax":                  ("energy_grid", "emax"),
+    "espacing":              ("energy_grid", "espacing"),
     "sgf_solver":            ("self_energy_options", "solver"),
     "se_numba_jit":          ("self_energy_options", "numba_jit"),
     "se_info_display":       ("self_energy_options", "info_display"),
@@ -540,6 +624,7 @@ def _migrate_legacy_negf_task_options(data):
     if task_options.get("task") != "negf":
         return
 
+    explicit_grid = "energy_grid" in task_options
     for legacy_key, path in _NEGF_LEGACY_KEY_MAP.items():
         if legacy_key not in task_options:
             continue
@@ -550,6 +635,13 @@ def _migrate_legacy_negf_task_options(data):
             f"use '{new_location}' instead. "
             f"Migrating value automatically for this run."
         )
+
+        if explicit_grid and legacy_key in ("emin", "emax", "espacing"):
+            log.warning(
+                f"NEGF task_options: both legacy '{legacy_key}' and "
+                f"'energy_grid' are set; keeping the value from 'energy_grid'."
+            )
+            continue
 
         cursor = task_options
         for parent in path[:-1]:

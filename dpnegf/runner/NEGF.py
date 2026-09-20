@@ -19,6 +19,9 @@ from dpnegf.negf.lead_property import LeadProperty, compute_all_self_energy, _ha
 from dpnegf.utils.constants import Boltzmann, eV2J
 from dpnegf.utils.make_kpoints import kmesh_sampling_negf
 from dpnegf.utils.band_edge import validate_fermi_in_band_gap
+from dpnegf.utils.energy_grid import build_energy_grid, uniform_nodes
+from dpnegf.utils.conductance import integrate_conductance
+from dpnegf.utils.argcheck import validate_energy_options
 from dpnegf.negf.poisson_init import Grid,Interface3D,Dirichlet,Dielectric
 from dpnegf.negf.scf_method import PDIISMixer,DIISMixer,BroydenFirstMixer,BroydenSecondMixer,AndersonMixer
 
@@ -42,12 +45,12 @@ class NEGF(object):
                 model: torch.nn.Module,
                 structure: Union[AtomicData, ase.Atoms, str],
                 ele_T: float,
-                emin: float, emax: float, espacing: float,
-                density_options: dict,
-                unit: str,
-                scf: bool, poisson_options: dict,
-                stru_options: dict,eta_lead: float,eta_device: float,
-                block_tridiagonal: bool,
+                emin: float=None, emax: float=None, espacing: float=None,
+                density_options: dict=None,
+                unit: str="eV",
+                scf: bool=False, poisson_options: dict=None,
+                stru_options: dict=None,eta_lead: float=1e-5,eta_device: float=0.,
+                block_tridiagonal: bool=False,
                 self_energy_options: Optional[dict] = None,
                 rgf_options: Optional[dict] = None,
                 hs_cache: Optional[dict] = None,
@@ -55,9 +58,40 @@ class NEGF(object):
                 e_fermi: float=None,
                 results_path: Optional[str]=None, plot_blocks: Optional[bool]=False,
                 AtomicData_options: Optional[dict]=None,
+                energy_grid: Optional[dict]=None,
+                conductance_options: Optional[dict]=None,
                 **kwargs):
 
-
+        # Use an explicitly supplied energy grid; otherwise preserve
+        # the legacy uniform-grid configuration.
+        self.energy_grid_options = (
+            dict(energy_grid)
+            if energy_grid is not None
+            else {
+                "method": "uniform",
+                "emin": emin,
+                "emax": emax,
+                "espacing": espacing,
+            }
+        )
+        self.conductance_options = dict(conductance_options or {})
+        self.out_conductance = (output_options or {}).get(
+            "conductance",False,)
+        self.spin_degeneracy = self.conductance_options.get(
+            "spin_degeneracy")
+        if self.spin_degeneracy is None:
+            self.spin_degeneracy = 1 if hasattr(model, "soc_param") else 2
+        validate_energy_options(
+            {
+                "energy_grid": self.energy_grid_options,
+                "conductance_options": self.conductance_options,
+                "output_options": output_options or {},
+                "ele_T": ele_T,
+                "unit": unit,
+                "scf": scf,
+                "stru_options": stru_options,
+            }
+        )
         # self.model = model # No need to set model as property for memory saving
         self.results_path = results_path
         self.cdtype = torch.complex128
@@ -350,7 +384,7 @@ class NEGF(object):
 
         # geting the output settings
         out_opts = dict(output_options or {})
-        self.out_tc = out_opts.get("tc", False)
+        self.out_tc = out_opts.get("tc", False) or self.out_conductance
         self.out_dos = out_opts.get("dos", False)
         self.out_density = out_opts.get("density", False)
         self.out_potential = out_opts.get("potential", False)
@@ -435,10 +469,39 @@ class NEGF(object):
         if self.out_current:
             cal_int_grid = True
 
-        if self.out_dos or self.out_tc or self.out_current_nscf or self.out_ldos:
+        if (self.out_dos or self.out_tc or self.out_current_nscf or self.out_ldos
+            or self.energy_grid_options.get("method") == "clenshaw_curtis"):
             # Energy gird is set relative to Fermi level
-            self.uni_grid = torch.linspace(start=self.emin, end=self.emax, steps=int((self.emax-self.emin)/self.espacing))
+            if self.out_conductance or self.energy_grid_options.get("method") == "clenshaw_curtis":
+                if abs(self.chemiPot["lead_L"]-self.chemiPot["lead_R"]) > 5e-4:
+                    if self.out_conductance:
+                        raise ValueError("Conductance calculation is not supported for non-zero bias case in this version.")
+                    if self.energy_grid_options.get("method") == "clenshaw_curtis":
+                        raise ValueError("Clenshaw-Curtis energy grid is not supported for non-zero bias case in this version.")
+                lead = self.conductance_options.get("lead", "lead_L")
+                labels = self.conductance_options.get("mu", ["Ef"])
+                reference = float(self.deviceprop.E_ref)
+                centers = []
+                for label in labels:
+                    if label == "Ef":
+                        absolute = self.e_fermi[lead]
+                    elif label == "Ev":
+                        absolute = self.E_v[lead]
+                    elif label == "Ec":
+                        absolute = self.E_c[lead]
+                    else:
+                        # label is a number that relates to the reference energy
+                        centers.append(float(label)) 
+                        continue
+                    centers.append(absolute - reference)
+                self.quadrature_grid = build_energy_grid(
+                    self.energy_grid_options, centers, self.ele_T, labels)
+                self.uni_grid = torch.from_numpy(self.quadrature_grid.energies.copy())
+            else:
+                self.uni_grid = torch.from_numpy(uniform_nodes(self.energy_grid_options))
+            self.energy_grid = self.uni_grid
 
+                
         if cal_pole and  self.density_options["method"] == "Ozaki":
             self.poles, self.residues = ozaki_residues(M_cut=self.density_options["M_cut"])
             self.poles = 1j* self.poles * self.kBT + self.deviceprop.lead_L.chemiPot - self.deviceprop.chemiPot
@@ -718,7 +781,13 @@ class NEGF(object):
         
         assert scf_require is not None, "scf_require should be set to True or False"
         self.out['k']=[];self.out['wk']=[]
-        if hasattr(self, "uni_grid"): self.out["uni_grid"] = self.uni_grid
+        if hasattr(self, "uni_grid"): 
+            self.out["uni_grid"] = self.uni_grid # compatibility alias, possibly non-unifrom
+            self.out["energy_grid"] = self.uni_grid # compatibility alias, possibly non-unifrom
+            self.out["E_ref"] = float(self.deviceprop.E_ref)
+            self.out["energy_grid_options"] = dict(self.energy_grid_options)
+        if hasattr(self, "quadrature_grid"):
+            self.out["energy_grid_metadata"] = self.quadrature_grid.metadata()
 
         # Self-Energy Calculaiton or Loading
         self.prepare_self_energy(scf_require)
@@ -1001,7 +1070,17 @@ class NEGF(object):
 
         if scf_require==False:
             self.out["k"] = np.array(self.out["k"])
-            self.out['T_avg'] = torch.tensor(self.out['wk']) @ torch.stack(list(self.out["T_k"].values())).cpu()
+            if "T_k" in self.out:
+                self.out['T_avg'] = torch.tensor(self.out['wk']) @ torch.stack(list(self.out["T_k"].values())).cpu()
+            if self.out_conductance:
+                records = integrate_conductance(self.out["T_avg"], self.quadrature_grid, self.spin_degeneracy)
+                for record in records:
+                    record["E_ref_eV"] = float(self.deviceprop.E_ref)
+                    record["mu_absolute_eV"] = record["mu_eV"] + record["E_ref_eV"]
+                self.out["conductance"] = records
+                with open(os.path.join(self.results_path, "conductance.json"), 'w') as f:
+                    json.dump(records, f, indent=2)
+                log.info("Landauer conductance (G/G0): %s", [r["G_over_G0"] for r in records])
             # TODO:check the following code for multiple k points calculation
             if self.out_current_nscf:
                 self.out["BIAS_POTENTIAL_NSCF"], self.out["CURRENT_NSCF"] = self.compute_current_nscf(self.uni_grid, self.out["T_avg"])
