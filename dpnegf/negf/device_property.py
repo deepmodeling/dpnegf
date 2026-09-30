@@ -295,14 +295,20 @@ class DeviceProperty(object):
 
         # self.green = update_temp_file(update_fn=fn, file_path=GFpath, ee=ee, tags=tags, info="Computing Green's Function")
 
-    def release_greenfuncs(self):
+    def release_greenfuncs(self, empty_cache: bool=False):
         '''Drop the Green's-function dict so the underlying rgf_device storage
         can be freed before the next energy chunk. H/S blocks are kept resident
         (they are k,V-dependent, not energy-dependent). The runner is
         responsible for restoring scalar lead.se references before calling
-        this, so any batched [B,n,n] copies become collectable too.'''
+        this, so any batched [B,n,n] copies become collectable too.
+        
+        CUDA caching is retained during the normal energy loop for allocator reusage.
+        '''
         self.greenfuncs = 0
-        if isinstance(self.rgf_device, torch.device) and self.rgf_device.type == "cuda":
+        if ( empty_cache and
+            isinstance(self.rgf_device, torch.device) and 
+            self.rgf_device.type == "cuda"
+        ):
             torch.cuda.empty_cache()
 
     def _cal_current_(self, espacing):

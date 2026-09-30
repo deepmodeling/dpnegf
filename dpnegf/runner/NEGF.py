@@ -924,62 +924,56 @@ class NEGF(object):
                                 f"computing green's functions for chunk e=[{float(e_chunk[0]):>6.3f}..{float(e_chunk[-1]):>6.3f}], B={e_batch_size}"
                             )
                             seL_list, seR_list = [], []
-                            for e in e_chunk:
-                                for ll in self.stru_options.keys():
-                                    if ll.startswith("lead"):
-                                        getattr(self.deviceprop, ll).self_energy(
-                                            energy=e,
-                                            kpoint=k,
-                                            eta_lead=self.eta_lead,
-                                            method=self.sgf_solver,
-                                            save_path=self.self_energy_save_path,
-                                            save_format=self.se_cache_format,
-                                            se_info_display=self.se_info_display
-                                            )
-                                seL_list.append(self.deviceprop.lead_L.se)
-                                seR_list.append(self.deviceprop.lead_R.se)
+                            try:
+                                for e in e_chunk:
+                                    for ll in self.stru_options.keys():
+                                        if ll.startswith("lead"):
+                                            getattr(self.deviceprop, ll).self_energy(
+                                                energy=e,
+                                                kpoint=k,
+                                                eta_lead=self.eta_lead,
+                                                method=self.sgf_solver,
+                                                save_path=self.self_energy_save_path,
+                                                save_format=self.se_cache_format,
+                                                se_info_display=self.se_info_display
+                                                )
+                                    seL_list.append(self.deviceprop.lead_L.se)
+                                    seR_list.append(self.deviceprop.lead_R.se)
 
-                            if e_batch_size > 1:
-                                self.deviceprop.lead_L.se = torch.stack(seL_list, dim=0)
-                                self.deviceprop.lead_R.se = torch.stack(seR_list, dim=0)
-                            # else: leave the per-E [n,n] in place — preserves scalar contract exactly.
+                                if e_batch_size > 1:
+                                    self.deviceprop.lead_L.se = torch.stack(seL_list, dim=0)
+                                    self.deviceprop.lead_R.se = torch.stack(seR_list, dim=0)
+                                # else: leave the per-E [n,n] in place — preserves scalar contract exactly.
 
-                            self.deviceprop.cal_green_function(
-                                energy=e_chunk, kpoint=k,
-                                eta_device=self.eta_device,
-                                block_tridiagonal=self.block_tridiagonal,
-                                Vbias=Vbias,
-                                need_lesser=False,
-                                need_greater=False,
-                                need_gr_lc=False, # set to False for memory saving, can be set to True for lead spectral function G^r * \Gamma * G^a
-                                )
+                                self.deviceprop.cal_green_function(
+                                    energy=e_chunk, kpoint=k,
+                                    eta_device=self.eta_device,
+                                    block_tridiagonal=self.block_tridiagonal,
+                                    Vbias=Vbias,
+                                    need_lesser=False,
+                                    need_greater=False,
+                                    need_gr_lc=False, # set to False for memory saving, can be set to True for lead spectral function G^r * \Gamma * G^a
+                                    )
 
-                            if self.out_dos:
-                                self.out.setdefault('DOS', {}).setdefault(str(k), []).append(self.compute_DOS(k).reshape(-1).cpu())
-                            if self.out_tc or self.out_current_nscf:
-                                self.out.setdefault('T_k', {}).setdefault(str(k), []).append(self.compute_TC(k).reshape(-1).cpu())
-                            if self.out_ldos:
-                                ldos_chunk = self.compute_LDOS(k)
-                                if ldos_chunk.ndim == 1:  # scalar-E chunk → [na]
-                                    ldos_chunk = ldos_chunk.unsqueeze(0)
-                                self.out.setdefault('LDOS', {}).setdefault(str(k), []).append(ldos_chunk.cpu())
+                                if self.out_dos:
+                                    self.out.setdefault('DOS', {}).setdefault(str(k), []).append(self.compute_DOS(k).reshape(-1).cpu())
+                                if self.out_tc or self.out_current_nscf:
+                                    self.out.setdefault('T_k', {}).setdefault(str(k), []).append(self.compute_TC(k).reshape(-1).cpu())
+                                if self.out_ldos:
+                                    ldos_chunk = self.compute_LDOS(k)
+                                    if ldos_chunk.ndim == 1:  # scalar-E chunk → [na]
+                                        ldos_chunk = ldos_chunk.unsqueeze(0)
+                                    self.out.setdefault('LDOS', {}).setdefault(str(k), []).append(ldos_chunk.cpu())
 
-                        # Restore lead.se to a scalar [n,n] before releasing the GF
-                        # dict. For B>1 we clone the last per-E tensor so the new
-                        # lead.se doesn't share storage with anything still
-                        # referenced through seL_list/seR_list, then drop both
-                        # lists so release_greenfuncs's empty_cache() has the per-E
-                        # and stacked [B,n,n] copies to release.
-                        if e_batch_size > 1:
-                            self.deviceprop.lead_L.se = seL_list[-1].detach().clone()
-                            self.deviceprop.lead_R.se = seR_list[-1].detach().clone()
-                        else:
-                            # B=1 path: lead.se already IS the per-E [n,n] tensor;
-                            # preserve byte-identical behavior for the scalar case.
-                            self.deviceprop.lead_L.se = seL_list[-1]
-                            self.deviceprop.lead_R.se = seR_list[-1]
-                        del seL_list, seR_list
-                        self.deviceprop.release_greenfuncs()
+                            finally:
+                                self.deviceprop.release_greenfuncs()
+                                if seL_list:
+                                    self.deviceprop.lead_L.se = seL_list[-1]
+                                if seR_list:
+                                    self.deviceprop.lead_R.se = seR_list[-1]
+                                del seL_list, seR_list
+                                
+                        
                             
                     # over energy loop in uni_gird
                     # The following code is for output properties before NEGF ends
