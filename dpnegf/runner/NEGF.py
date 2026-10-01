@@ -3,6 +3,7 @@ import ase
 import numpy as np
 import logging
 import json
+from contextlib import contextmanager
 from typing import Optional, Union
 from pyinstrument import Profiler
 import os
@@ -28,6 +29,17 @@ from dpnegf.negf.scf_method import PDIISMixer,DIISMixer,BroydenFirstMixer,Broyde
 
 log = logging.getLogger(__name__)
 
+@contextmanager
+def _profile_to_html(output_path: str):
+    profiler = Profiler()
+    profiler.start()
+    try:
+        yield
+    finally:
+        profiler.stop()
+
+    with open(output_path, 'w') as report_file:
+        report_file.write(profiler.output_html())
 
 try:
     from dptb.data import AtomicData, AtomicDataDict
@@ -213,33 +225,31 @@ class NEGF(object):
         AtomicData_options = self.update_atomicdata_options(model,AtomicData_options)
 
         # computing the hamiltonian
-        profiler = Profiler()
-        profiler.start() 
-        self.negf_hamiltonian = NEGFHamiltonianInit(model=model,
-                                                    AtomicData_options=AtomicData_options, 
-                                                    structure=structure,
-                                                    block_tridiagonal=self.block_tridiagonal,
-                                                    pbc_negf = self.pbc, 
-                                                    stru_options=self.stru_options,
-                                                    unit = self.unit, 
-                                                    results_path=self.results_path,
-                                                    torch_device = torch.device("cpu"),
-                                                    use_saved_se = self.use_saved_se,
-                                                    self_energy_save_path = self.self_energy_save_path)
-        # if useBloch is None, structure_leads_fold,bloch_sorted_indices,bloch_R_lists = None,None,None
-        struct_device, struct_leads,structure_leads_fold,bloch_sorted_indices,bloch_R_lists = \
-            self.negf_hamiltonian.initialize(kpoints=self.kpoints,
-                                             block_tridiagnal=self.block_tridiagonal, plot_blocks=self.plot_blocks,\
-                                             useBloch=self.useBloch,bloch_factor=self.bloch_factor,
-                                             use_saved_HS=self.use_saved_HS, saved_HS_path=self.saved_HS_path)
+        output_path = os.path.join(
+            self.results_path, "profile_report_ham_init.html"
+        )
+        with _profile_to_html(output_path):
+            self.negf_hamiltonian = NEGFHamiltonianInit(model=model,
+                                                        AtomicData_options=AtomicData_options, 
+                                                        structure=structure,
+                                                        block_tridiagonal=self.block_tridiagonal,
+                                                        pbc_negf = self.pbc, 
+                                                        stru_options=self.stru_options,
+                                                        unit = self.unit, 
+                                                        results_path=self.results_path,
+                                                        torch_device = torch.device("cpu"),
+                                                        use_saved_se = self.use_saved_se,
+                                                        self_energy_save_path = self.self_energy_save_path)
+            # if useBloch is None, structure_leads_fold,bloch_sorted_indices,bloch_R_lists = None,None,None
+            struct_device, struct_leads,structure_leads_fold,bloch_sorted_indices,bloch_R_lists = \
+                self.negf_hamiltonian.initialize(kpoints=self.kpoints,
+                                                block_tridiagnal=self.block_tridiagonal, plot_blocks=self.plot_blocks,\
+                                                useBloch=self.useBloch,bloch_factor=self.bloch_factor,
+                                                use_saved_HS=self.use_saved_HS, saved_HS_path=self.saved_HS_path)
         self.self_energy_save_path = \
             self.negf_hamiltonian.self_energy_save_path # update the self_energy_save_path in case it is None before
         self.se_cache_format = \
             self.negf_hamiltonian.self_energy_cache_format # update the se_cache_format in case it is None before
-        profiler.stop()
-        output_path = os.path.join(self.results_path, "profile_report_ham_init.html")
-        with open(output_path, 'w') as report_file:
-            report_file.write(profiler.output_html())
 
         self.free_charge = {} # net charge: hole - electron
         #  Regions for Poisson equation
@@ -593,13 +603,9 @@ class NEGF(object):
 
         # otherwise, the non-self-consistent calculation is performed
         assert not self.scf
-        profiler = Profiler()
-        profiler.start() 
-        self.negf_compute(scf_require=False,Vbias=None)
-        profiler.stop()
         output_path = os.path.join(self.results_path, "profile_report_negf.html")
-        with open(output_path, 'w') as report_file:
-            report_file.write(profiler.output_html())
+        with _profile_to_html(output_path):
+            self.negf_compute(scf_require=False,Vbias=None)
         
         return None
 
