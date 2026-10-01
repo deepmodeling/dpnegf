@@ -72,6 +72,8 @@ class NEGF(object):
                 AtomicData_options: Optional[dict]=None,
                 energy_grid: Optional[dict]=None,
                 conductance_options: Optional[dict]=None,
+                btd_initialization: str="dense",
+                direct_btd_max_mib: Optional[float]=None,
                 **kwargs):
 
         # Use an explicitly supplied energy grid; otherwise preserve
@@ -239,7 +241,9 @@ class NEGF(object):
                                                         results_path=self.results_path,
                                                         torch_device = torch.device("cpu"),
                                                         use_saved_se = self.use_saved_se,
-                                                        self_energy_save_path = self.self_energy_save_path)
+                                                        self_energy_save_path = self.self_energy_save_path,
+                                                        btd_initialization = btd_initialization,
+                                                        direct_btd_max_mib = direct_btd_max_mib,)
             # if useBloch is None, structure_leads_fold,bloch_sorted_indices,bloch_R_lists = None,None,None
             struct_device, struct_leads,structure_leads_fold,bloch_sorted_indices,bloch_R_lists = \
                 self.negf_hamiltonian.initialize(kpoints=self.kpoints,

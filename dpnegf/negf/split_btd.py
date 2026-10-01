@@ -662,7 +662,7 @@ def compute_edge(mat):
     return edge, edge1
 
 
-def compute_blocks(left_block, right_block, edge, edge1):
+def compute_blocks(left_block, right_block, edge, edge1, *, use_jit=True):
     """This is an implementation of the greedy algorithm for
      computing block-tridiagonal representation of a matrix.
      The information regarding the input matrix is represented
@@ -722,7 +722,12 @@ def compute_blocks(left_block, right_block, edge, edge1):
     # let the JIT core return the actual length.
     size = edge_arr.shape[0]
     out = np.empty(size + 2, dtype=np.int64)
-    n = _compute_blocks_into(left_block, right_block, edge_arr, edge1_arr, out, 0)
+    kernel = (
+        _compute_blocks_into
+        if use_jit
+        else getattr(_compute_blocks_into, "py_func", _compute_blocks_into)
+    )
+    n = kernel(left_block, right_block, edge_arr, edge1_arr, out, 0)
     return out[:n].tolist()
 
 

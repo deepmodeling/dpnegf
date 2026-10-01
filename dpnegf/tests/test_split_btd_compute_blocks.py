@@ -25,6 +25,18 @@ from dpnegf.negf.split_btd import (
     split_into_subblocks_optimized,
 )
 
+@pytest.mark.parametrize("seed", range(20))
+def test_nonjit_partition_matches_jit(seed):
+    random = np.random.default_rng(seed)
+    mask = random.random((80, 80)) > .95
+    mask |= mask.T.copy()
+    edge, reverse = compute_edge(mask)
+    assert compute_blocks(
+        3, 7, edge, reverse, use_jit=False
+    ) == compute_blocks(
+        3, 7, edge, reverse, use_jit=True
+    ) 
+
 
 # ---------------------------------------------------------------------------
 # Legacy oracles — verbatim copies of the pre-refactor implementations.

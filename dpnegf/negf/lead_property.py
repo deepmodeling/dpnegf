@@ -309,8 +309,17 @@ class LeadProperty(object):
                     = self.hamiltonian.get_hs_lead(kpoint, tab=self.tab, v=self.voltage)
                 self.voltage_old = self.voltage
                 self.kpoint = torch.tensor(kpoint)
-
-            HDL_reduced, SDL_reduced = self.HDL_reduced(self.HDLk, self.SDLk,subblocks)
+            
+            metadata = getattr(
+                self.hamiltonian, "contact_metadata", {}
+            ).get(self.tab, {})
+            HDL_reduced, SDL_reduced = self.HDL_reduced(
+                self.HDLk, 
+                self.SDLk,
+                subblocks,
+                tab = self.tab,
+                reduced=metadata.get("contact_reduced", False),
+            )
             
             self.se, _ = selfEnergy(
                 ee=energy,
@@ -385,7 +394,8 @@ class LeadProperty(object):
         return self.se
 
     @staticmethod
-    def HDL_reduced(HDL: torch.Tensor, SDL: torch.Tensor, subblocks: np.ndarray) -> torch.Tensor:
+    def HDL_reduced(HDL: torch.Tensor, SDL: torch.Tensor, subblocks: np.ndarray,
+                    tab=None, reduced=False,) -> torch.Tensor:
         '''This function takes in Hamiltonian/Overlap matrix between lead and device and reduces 
         it based on the subblocks results or non-zero range of the Hamiltonian matrix.
 
@@ -408,7 +418,37 @@ class LeadProperty(object):
         assert len(SDL.shape) == 2, "The shape of SDL should be 2."
         assert HDL.shape == SDL.shape, "The shape of HDL and SDL should be the same."
 
-        HDL_nonzero_range = (HDL.nonzero().min(dim=0).values, HDL.nonzero().max(dim=0).values)
+        if reduced:
+            if tab not in ("lead_L", "lead_R") or subblocks is None:
+                raise ValueError(
+                    "Reduced contacts require explicit lead identity and "
+                    "device blocks."
+                )
+            expected = (
+                subblocks[0] if tab == "lead_L" else subblocks[-1]
+            )
+            if HDL.shape[0] != expected:
+                raise ValueError(
+                    "Reduced contact height does not match its device boundary."
+                )
+            return HDL, SDL
+
+        if tab is not None and subblocks is not None:
+            if tab == "lead_L":
+                return HDL[:subblocks[0]], SDL[:subblocks[0]]
+            if tab == "lead_R":
+                return HDL[-subblocks[-1]:], SDL[-subblocks[-1]:]
+            raise ValueError("Unknown lead identity.")
+        nonzero = ((HDL.abs() + SDL.abs()) != 0).nonzero()
+        if not len(nonzero):
+            raise ValueError(
+                "Cannot infer lead identity from an empty legacy contact."
+            )
+        HDL_nonzero_range = (
+            nonzero.min(dim=0).values,
+            nonzero.max(dim=0).values,
+        )
+
         if subblocks is None:
             cut_range = HDL_nonzero_range
         else:
@@ -892,6 +932,13 @@ def _precompute_lead_kdata(lead, kpoints_grid):
                 k, tab=lead.tab, v=lead.voltage
             )
             pack["kdata"][key] = _pack_lead_matrices(HLk, HLLk, HDLk, SLk, SLLk, SDLk, subblocks)
+            metadata = getattr(
+                lead.hamiltonian, "contact_metadata", {}
+            ).get(lead.tab, {})
+            pack["kdata"][key].update(
+                contact_reduced=metadata.get("contact_reduced", False),
+                lead_tab=lead.tab
+            )
         else:
             kpoints_bloch = bloch_unfolder.unfold_points(list(np.asarray(k, dtype=float).reshape(3)))
             bloch_entries = []
@@ -964,7 +1011,11 @@ def _compute_self_energy_from_pack(pack, k, e, eta_lead, method="Lopez-Sancho", 
 
     if not pack["useBloch"]:
         HDL_reduced, SDL_reduced = LeadProperty.HDL_reduced(
-            entry["HDLk"], entry["SDLk"], subblocks
+            entry["HDLk"], 
+            entry["SDLk"], 
+            subblocks,
+            tab=entry.get("lead_tab"),
+            reduced=entry.get("contact_reduced", False)
         )
         se, _ = selfEnergy(
             ee=energy,

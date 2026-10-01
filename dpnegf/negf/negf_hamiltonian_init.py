@@ -1,5 +1,4 @@
 import os
-import re
 import h5py
 import logging
 from typing import Optional, Union, List
@@ -18,7 +17,6 @@ from dpnegf.negf.bloch import Bloch
 from dpnegf.negf.sort_btd import sort_lexico, sort_projection, sort_capacitance
 from dpnegf.negf.split_btd import show_blocks,split_into_subblocks,split_into_subblocks_optimized
 from dpnegf.negf.split_btd import constrained_subblocks
-from dpnegf.negf.negf_utils import natsorted
 from dpnegf.negf.lead_property import inspect_self_energy_cache
 
 '''
@@ -65,6 +63,8 @@ class NEGFHamiltonianInit(object):
                  self_energy_save_path: Optional[str]=None,
                  results_path:Optional[str]=None,
                  torch_device: Union[str, torch.device]=torch.device('cpu'),
+                 btd_initialization: str="dense",
+                 direct_btd_max_mib: Optional[float]=None,
                  ) -> None:
         
         # TODO: add dtype and device setting to the model
@@ -75,6 +75,17 @@ class NEGFHamiltonianInit(object):
         if isinstance(torch_device, str):
             torch_device = torch.device(torch_device)
         self.torch_device = torch_device
+        if btd_initialization not in ["dense", "direct"]:
+            raise ValueError(
+                f"Invalid btd_initialization value: {btd_initialization}. "
+                "Must be 'dense' or 'direct'.")
+        if btd_initialization == "direct" and not block_tridiagonal:
+            raise ValueError("Direct BTD initialization requires block_tridiagonal=True.")
+        if direct_btd_max_mib is not None and direct_btd_max_mib <= 0:
+            raise ValueError("direct_btd_max_mib must be a positive number.")
+        self.btd_initialization = btd_initialization
+        self.direct_btd_max_mib = direct_btd_max_mib
+        self.contact_metadata = {}
         self.model = model
         self.model.to(self.torch_device)
         self.AtomicData_options = AtomicData_options
@@ -215,6 +226,17 @@ class NEGFHamiltonianInit(object):
         
         '''
 
+        if self.btd_initialization == "direct":
+            if useBloch or not block_tridiagnal:
+                raise ValueError("Direct BTD initialization requires block_tridiagonal=True "
+                "and don't support Bloch expansion for lead self energy calculations.")
+            if plot_blocks:
+                raise ValueError("Direct BTD initialization does not support plot_blocks "
+                                 "because it avoids the full Hamiltonian construction.")
+            if set(self.lead_ids) != {"lead_L", "lead_R"}:
+                raise ValueError("Direct BTD initialization requires exactly two leads: 'lead_L' and 'lead_R'.")
+
+
         # structure initialization       
         self.structase.set_pbc(self.pbc_negf)
         self.structase.pbc[2] = True
@@ -256,7 +278,11 @@ class NEGFHamiltonianInit(object):
             log.info(msg="=="*40)
         else:
             self.saved_HS_path = self.results_path
-            self.Hamiltonian_initialized(kpoints,useBloch,bloch_factor,block_tridiagnal,plot_blocks,\
+            if self.btd_initialization == "direct":
+                from dpnegf.utils.direct_btd import initialize_direct
+                initialize_direct(self, kpoints, structure_leads)
+            else:
+                self.Hamiltonian_initialized(kpoints,useBloch,bloch_factor,block_tridiagnal,plot_blocks,\
                                                  lead_atom_range,structure_leads,structure_leads_fold)
             log.info(msg="--"*40)
             log.info(msg=f"The Hamiltonian has been initialized by model.")
@@ -869,88 +895,58 @@ class NEGFHamiltonianInit(object):
         HS_device_path_pth = os.path.join(self.saved_HS_path, "HS_device.pth")
         HS_device_path_h5 = os.path.join(self.saved_HS_path, "HS_device.h5")
 
-        torch_dtype = torch.float32 if torch.get_default_dtype() == torch.float32 else torch.float64
-        #in this version, we only support complex128 for complex dtype to ensure the accuracy.
-        #TODO: check other complex dtype
-        complex_dtype = torch.complex128 if torch_dtype == torch.float32 else torch.complex128
-        
         if os.path.exists(HS_device_path_h5):
-            # log.info(msg="The HS_device.h5 exists in the saved path {}.".format(self.saved_HS_path))
-            HS_device_path = HS_device_path_h5
-            HS_device = {}
-            with h5py.File(HS_device_path, "r") as f:
-                for key in f.keys():
-                    if isinstance(f[key], h5py.Dataset): 
-                        if key in ["kpoints", "subblocks"]:
-                            HS_device[key] = np.array(f[key])
-                        elif key == "block_tridiagonal":
-                            HS_device[key] = f[key][()]
-                        else:
-                            assert isinstance(f[key][()], np.ndarray),f"Expected np.ndarray, but got {type(f[key][()])}"
-                            # read NumPy array: HD, SD
-                            HS_device[key] = torch.tensor(f[key][()])
-                    else:  
-                        group = f[key]
-                        items = [];sublist = []
-                        sub_keys = natsorted(group.keys())  # ensure the order of subblocks
-                        current_idx_k = -1
-                        for sub_key in sub_keys: # sub_key format: f"{key}_k{idx_k}_b{idx_block}_real"
-                            sub_key_type = sub_key.split("_")[-1]
-                            if sub_key_type == "real":
-                                parts = sub_key.split("_k")
-                                if len(parts) < 2:
-                                    raise ValueError(f"Unexpected dataset format: {sub_key}")
-                                match = re.search(r'_k(\d+)_', sub_key)
-                                if not match:
-                                    raise ValueError(f"Unexpected dataset format: {sub_key}")
-                                idx_k = int(match.group(1))
-                                if idx_k != current_idx_k:
-                                    if sublist:
-                                        items.append(sublist)  # store the previous sublist
-                                    sublist = []  # begin a new sublist
-                                    current_idx_k = idx_k
-                                real_part = torch.tensor(group[sub_key][()], dtype=torch_dtype)
-                                imag_part = torch.tensor(group[re.sub(r"(_real|_imag)$", "", sub_key)+"_imag"][()], dtype=torch_dtype)
-                                sublist.append(torch.complex(real_part, imag_part).to(complex_dtype))
-                                # sublist.append(torch.tensor(group[sub_key][()]))
-                        if sublist:
-                            items.append(sublist)  # store the last sublist
-                        HS_device[key] = items # idx_k, idx_block
-        
+            with h5py.File(HS_device_path_h5, "r") as f:
+                if (
+                    f.attrs.get("layout_version", 1) == 2
+                    and not f.attrs.get("complete", False)
+                ):
+                    raise ValueError(
+                        "Incomplete direct BTD cache; initialization did not "
+                        "finish."
+                    )
+                if only_subblocks:
+                    if "subblocks" not in f:
+                        log.warning(msg=" 'subblocks' might not be saved in the HS_device.h5 for old version.")
+                        log.error(msg="The subblocks are not saved in the HS_device.h5.")
+                        raise ValueError
+                    return f["subblocks"][()]
+
+                if block_tridiagonal:
+                    from dpnegf.utils.hs_cache import read_btd_kpoint
+                    return read_btd_kpoint(
+                        f, kpoint, V, self.torch_device
+                    )
+                from dpnegf.utils.hs_cache import find_kpoint_index
+                ik = find_kpoint_index(f["kpoints"][()], kpoint)
+                HD_k = torch.from_numpy(f["HD"][ik])
+                SD_k = torch.from_numpy(f["SD"][ik])
+
         elif os.path.exists(HS_device_path_pth):
             # log.info(msg="The HS_device.pth exists in the saved path {}.".format(self.saved_HS_path))
-            HS_device_path = HS_device_path_pth
-            HS_device = torch.load(HS_device_path)
+            HS_device = torch.load(HS_device_path_pth)
+            if only_subblocks:
+                if "subblocks" not in HS_device:
+                    log.warning(msg=" 'subblocks' might not be saved in the HS_device.pth for old version.")
+                    log.error(msg="The subblocks are not saved in the HS_device.pth.")
+                    raise ValueError
+                return HS_device["subblocks"]
+
+            ik = self._find_kpoint_index(HS_device["kpoints"], kpoint)
+            if block_tridiagonal:
+                hd_k, sd_k, hl_k, su_k, sl_k, hu_k = (
+                    HS_device["hd"][ik], HS_device["sd"][ik],
+                    HS_device["hl"][ik], HS_device["su"][ik],
+                    HS_device["sl"][ik], HS_device["hu"][ik],
+                )
+            else:
+                HD_k, SD_k = HS_device["HD"][ik], HS_device["SD"][ik]
         else:
             raise FileNotFoundError(f"Neither HS_device.pth nor HS_device.h5 found in {self.saved_HS_path}. " )
-                  
-                
-        if only_subblocks:
-            if "subblocks" not in HS_device:
-                log.warning(msg=" 'subblocks' might not be saved in the HS_device.pth for old version.")
-                log.error(msg="The subblocks are not saved in the HS_device.pth.")
-                
-                raise ValueError
-            subblocks = HS_device["subblocks"]
-            return subblocks
-        
-        kpoints = HS_device["kpoints"]
-        ik = None
-        for i, k in enumerate(kpoints):
-            if np.abs(np.array(k) - np.array(kpoint)).sum() < 1e-8:
-                ik = i
-                break
-
-        assert ik is not None
 
             
         
         if block_tridiagonal:
-            # hd format: ( k_index,block_index, orb, orb)
-            hd_k, sd_k, hl_k, su_k, sl_k, hu_k = HS_device["hd"][ik], HS_device["sd"][ik],\
-                                                 HS_device["hl"][ik], HS_device["su"][ik], \
-                                                 HS_device["sl"][ik], HS_device["hu"][ik]
-
             # move blocks onto torch_device so downstream RGF runs on the chosen device.
             hd_k = [b.to(self.torch_device) for b in hd_k]
             sd_k = [b.to(self.torch_device) for b in sd_k]
@@ -977,12 +973,16 @@ class NEGFHamiltonianInit(object):
 
             return hd_k , sd_k, hl_k , su_k, sl_k, hu_k
         else:
-            HD_k, SD_k = HS_device["HD"][ik], HS_device["SD"][ik]
             HD_k = HD_k.to(self.torch_device)
             SD_k = SD_k.to(self.torch_device)
             V = torch.as_tensor(V).to(self.torch_device)
             return HD_k - V*SD_k, SD_k, [], [], [], []
     
+    @staticmethod
+    def _find_kpoint_index(kpoints, kpoint):
+        from dpnegf.utils.hs_cache import find_kpoint_index
+        return find_kpoint_index(kpoints, kpoint)
+
     def get_hs_lead(self, kpoint, tab, v):
         """get the lead Hamiltonian and overlap matrix at a specific kpoint
         
@@ -1006,76 +1006,115 @@ class NEGFHamiltonianInit(object):
         HS_lead_path_pth = os.path.join(self.saved_HS_path, "HS_{0}.pth".format(tab))
         HS_lead_path_h5 = os.path.join(self.saved_HS_path, "HS_{0}.h5".format(tab))
 
-        torch_dtype = torch.float32 if torch.get_default_dtype() == torch.float32 else torch.float64
-        #in this version, we only support complex128 for complex dtype to ensure the accuracy.
-        complex_dtype = torch.complex128 if torch_dtype == torch.float32 else torch.complex128
-
-        HS_leads = {}
         if os.path.exists(HS_lead_path_h5):
-            # log.info(msg="The HS_{0}.h5 exists in the saved path {1}.".format(tab, self.saved_HS_path))
-            HS_lead_path = HS_lead_path_h5
-            with h5py.File(HS_lead_path, "r") as f:
-                for key in f.keys():
-                    dataset = f[key]  
-                    if key == "useBloch":
-                        HS_leads[key] = bool(dataset[()])
-                    elif key == "kpoints":
-                        HS_leads[key] = dataset[()]
-                    elif key in ["kpoints_bloch", "bloch_factor"]:
+            with h5py.File(HS_lead_path_h5, "r") as f:
+                from dpnegf.utils.hs_cache import read_complex
 
-                        if isinstance(dataset[()], np.ndarray):
-                            HS_leads[key] = dataset[()]
-                        else:
-                            try :
-                                assert dataset[()].decode() == "None"
-                                HS_leads[key] = None
-                            except:
-                                raise ValueError(f"Unsupported value {dataset[()]} for key {key}")
-                    else:
-                        HSkey = key.split("_")
-                        if HSkey[1] == "real":
-                            HS_leads[HSkey[0]] = torch.tensor(dataset[()], dtype=torch_dtype) \
-                                                + 1j * torch.tensor(f[HSkey[0]+"_imag"][()], dtype=torch_dtype)
-                            HS_leads[HSkey[0]] = HS_leads[HSkey[0]].to(complex_dtype)
+                metadata = dict(f.attrs)
+                if metadata.get("contact_reduced", False):
+                    if (
+                        metadata.get("layout_version") != 2
+                        or metadata.get("lead") != tab
+                    ):
+                        raise ValueError(
+                            "Invalid reduced-contact cache metadata."
+                        )
+                    device_path = os.path.join(
+                        self.saved_HS_path, "HS_device.h5"
+                    )
+                    with h5py.File(device_path, "r") as device_cache:
+                        if (
+                            not device_cache.attrs.get("complete", False)
+                            or metadata.get("cache_id")
+                            != device_cache.attrs.get("cache_id")
+                        ):
+                            raise ValueError(
+                                "Reduced contact and device cache identities "
+                                "do not match."
+                            )
+                    subblocks = self.get_hs_device(only_subblocks=True)
+                    boundary = (
+                        0 if tab == "lead_L" else len(subblocks) - 1
+                    )
+                    if (
+                        metadata["device_block"] != boundary
+                        or metadata["device_orbital_offset"]
+                        != sum(subblocks[:boundary])
+                        or metadata["device_orbitals"] != sum(subblocks)
+                        or f["HDL_real"].shape[1] != subblocks[boundary]
+                    ):
+                        raise ValueError(
+                            "Reduced contact and device cache partitions do "
+                            "not match."
+                        )
+                if not hasattr(self, "contact_metadata"):
+                    self.contact_metadata = {}
+                self.contact_metadata[tab] = metadata
+                kpoints = f["kpoints"][()]
+                kpoints_bloch = self._read_optional_hdf5_metadata(f["kpoints_bloch"])
+                bloch_factor = self._read_optional_hdf5_metadata(f["bloch_factor"])
+
+                if kpoints_bloch is None:
+                    ik = self._find_kpoint_index(kpoints, kpoint)
+                    assert len(kpoints) == f["HL_real"].shape[0], "The number of kpoints in the lead Hamiltonian file does not match the number of kpoints."
+                    lead_index = ik
+                    coupling_index = ik
+                else:
+                    multi_k_num = int(bloch_factor[0]*bloch_factor[1])
+                    ik_bloch = self._find_kpoint_index(kpoints_bloch, kpoint)
+                    coupling_index = int(ik_bloch/multi_k_num)
+                    assert len(kpoints_bloch) == f["HL_real"].shape[0], "The number of kpoints in the lead Hamiltonian file does not match the number of kpoints."
+                    assert len(kpoints) == f["HDL_real"].shape[0], "The number of kpoints in the lead Hamiltonian file does not match the number of kpoints."
+                    lead_index = ik_bloch
+
+                hL = read_complex(f, "HL", index=lead_index)
+                hLL = read_complex(f, "HLL", index=lead_index)
+                sL = read_complex(f, "SL", index=lead_index)
+                sLL = read_complex(f, "SLL", index=lead_index)
+                hDL = read_complex(f, "HDL", index=coupling_index)
+                sDL = read_complex(f, "SDL", index=coupling_index)
+
+
         elif os.path.exists(HS_lead_path_pth):
-            # log.info(msg="The HS_{0}.pth exists in the saved path {1}.".format(tab, self.saved_HS_path))
             HS_leads = torch.load(HS_lead_path_pth)
+            if hasattr(self, "contact_metadata"):
+                self.contact_metadata.pop(tab, None)
+            kpoints = HS_leads["kpoints"]
+            kpoints_bloch = HS_leads["kpoints_bloch"]
+            bloch_factor = HS_leads["bloch_factor"]
+
+            if kpoints_bloch is None:
+                ik = self._find_kpoint_index(kpoints, kpoint)
+                assert len(kpoints) == HS_leads['HL'].shape[0], "The number of kpoints in the lead Hamiltonian file does not match the number of kpoints."
+                hL, hLL, sL, sLL = HS_leads["HL"][ik], HS_leads["HLL"][ik],HS_leads["SL"][ik], HS_leads["SLL"][ik]
+                hDL,sDL = HS_leads["HDL"][ik], HS_leads["SDL"][ik]
+            else:
+                multi_k_num = int(bloch_factor[0]*bloch_factor[1])
+                ik_bloch = self._find_kpoint_index(kpoints_bloch, kpoint)
+                ik = int(ik_bloch/multi_k_num)
+                assert len(kpoints_bloch) == HS_leads['HL'].shape[0], "The number of kpoints in the lead Hamiltonian file does not match the number of kpoints."
+                assert len(kpoints) == HS_leads['HDL'].shape[0], "The number of kpoints in the lead Hamiltonian file does not match the number of kpoints."
+                hL, hLL, sL, sLL = HS_leads["HL"][ik_bloch], HS_leads["HLL"][ik_bloch],\
+                                HS_leads["SL"][ik_bloch], HS_leads["SLL"][ik_bloch]
+                hDL,sDL = HS_leads["HDL"][ik], HS_leads["SDL"][ik]
         else:
             log.error(msg="The HS_{0}.pth or HS_{0}.h5 does not exist in the saved path {1}.".format(tab, self.saved_HS_path))
             raise ValueError
-        
-        kpoints = HS_leads["kpoints"]
-        kpoints_bloch = HS_leads["kpoints_bloch"]
-        bloch_factor = HS_leads["bloch_factor"]
 
-        if kpoints_bloch is None:
-            ik = None
-            for i, k in enumerate(kpoints):
-                if np.abs(np.array(k) - np.array(kpoint)).sum() < 1e-8:
-                    ik = i
-                    break
-
-            assert ik is not None
-            assert len(kpoints) == HS_leads['HL'].shape[0], "The number of kpoints in the lead Hamiltonian file does not match the number of kpoints."
-            hL, hLL, sL, sLL = HS_leads["HL"][ik], HS_leads["HLL"][ik],HS_leads["SL"][ik], HS_leads["SLL"][ik]
-            hDL,sDL = HS_leads["HDL"][ik], HS_leads["SDL"][ik]
-
-        else:
-            multi_k_num = int(bloch_factor[0]*bloch_factor[1])
-            ik = None; ik_bloch = None
-            for i, k in enumerate(kpoints_bloch):
-                if np.abs(np.array(k) - np.array(kpoint)).sum() < 1e-8:
-                    ik_bloch = i
-                    ik = int(i/multi_k_num)
-                    break
-            assert ik is not None
-            assert len(kpoints_bloch) == HS_leads['HL'].shape[0], "The number of kpoints in the lead Hamiltonian file does not match the number of kpoints."
-            assert len(kpoints) == HS_leads['HDL'].shape[0], "The number of kpoints in the lead Hamiltonian file does not match the number of kpoints."
-            hL, hLL, sL, sLL = HS_leads["HL"][ik_bloch], HS_leads["HLL"][ik_bloch],\
-                               HS_leads["SL"][ik_bloch], HS_leads["SLL"][ik_bloch]
-            hDL,sDL = HS_leads["HDL"][ik], HS_leads["SDL"][ik]
 
         return hL-v*sL, hLL-v*sLL, hDL, sL, sLL, sDL         
+
+
+    @staticmethod
+    def _read_optional_hdf5_metadata(dataset):
+        value = dataset[()]
+        if isinstance(value, np.ndarray):
+            return value
+        if isinstance(value, bytes) and value.decode() == "None":
+            return None
+        if isinstance(value, str) and value == "None":
+            return None
+        raise ValueError(f"Unsupported value {value} in HDF5 dataset {dataset.name}")
 
     @property
     def device_norbs(self):
