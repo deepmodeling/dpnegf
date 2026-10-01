@@ -89,6 +89,28 @@ def test_fresh_btd_uses_historical_splitter_path():
         HK, SK, structase=None, leftmost_size=3, rightmost_size=3)
     assert actual == expected
 
+def test_btd_blocks_own_storage_and_apply_output_conversion():
+    ham = _bare_ham()
+    ham._self_energy_cache_edge_sizes = None
+    ham.results_path = None
+    H, S = _make_btd_device([3, 2, 2, 3])
+    HK = H.unsqueeze(0)
+    SK = S.unsqueeze(0)
+
+    hd, hu, hl, sd, su, sl, _ = ham.get_block_tridiagonal(
+        HK, SK, structase=None, leftmost_size=3, rightmost_size=3,
+        h_factor=2.0, overlap_dtype=torch.complex128)
+
+    for block in hd[0] + hu[0] + hl[0]:
+        assert block.untyped_storage().data_ptr() != HK.untyped_storage().data_ptr()
+    for block in sd[0] + su[0] + sl[0]:
+        assert block.untyped_storage().data_ptr() != SK.untyped_storage().data_ptr()
+        assert block.dtype == torch.complex128
+
+    np.testing.assert_allclose(hd[0][0].numpy(), (2.0 * H[:3, :3]).numpy())
+    np.testing.assert_allclose(sd[0][0].numpy(), S[:3, :3].numpy())
+
+
 
 def _write_h5_cache(path, tab, size, ks, es):
     """Write a valid HDF5 self-energy cache with a single invariant size."""

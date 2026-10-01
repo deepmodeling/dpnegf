@@ -3,6 +3,7 @@ import ase
 import numpy as np
 import logging
 import json
+from contextlib import contextmanager
 from typing import Optional, Union
 from pyinstrument import Profiler
 import os
@@ -28,6 +29,17 @@ from dpnegf.negf.scf_method import PDIISMixer,DIISMixer,BroydenFirstMixer,Broyde
 
 log = logging.getLogger(__name__)
 
+@contextmanager
+def _profile_to_html(output_path: str):
+    profiler = Profiler()
+    profiler.start()
+    try:
+        yield
+    finally:
+        profiler.stop()
+
+    with open(output_path, 'w') as report_file:
+        report_file.write(profiler.output_html())
 
 try:
     from dptb.data import AtomicData, AtomicDataDict
@@ -213,33 +225,31 @@ class NEGF(object):
         AtomicData_options = self.update_atomicdata_options(model,AtomicData_options)
 
         # computing the hamiltonian
-        profiler = Profiler()
-        profiler.start() 
-        self.negf_hamiltonian = NEGFHamiltonianInit(model=model,
-                                                    AtomicData_options=AtomicData_options, 
-                                                    structure=structure,
-                                                    block_tridiagonal=self.block_tridiagonal,
-                                                    pbc_negf = self.pbc, 
-                                                    stru_options=self.stru_options,
-                                                    unit = self.unit, 
-                                                    results_path=self.results_path,
-                                                    torch_device = torch.device("cpu"),
-                                                    use_saved_se = self.use_saved_se,
-                                                    self_energy_save_path = self.self_energy_save_path)
-        # if useBloch is None, structure_leads_fold,bloch_sorted_indices,bloch_R_lists = None,None,None
-        struct_device, struct_leads,structure_leads_fold,bloch_sorted_indices,bloch_R_lists = \
-            self.negf_hamiltonian.initialize(kpoints=self.kpoints,
-                                             block_tridiagnal=self.block_tridiagonal, plot_blocks=self.plot_blocks,\
-                                             useBloch=self.useBloch,bloch_factor=self.bloch_factor,
-                                             use_saved_HS=self.use_saved_HS, saved_HS_path=self.saved_HS_path)
+        output_path = os.path.join(
+            self.results_path, "profile_report_ham_init.html"
+        )
+        with _profile_to_html(output_path):
+            self.negf_hamiltonian = NEGFHamiltonianInit(model=model,
+                                                        AtomicData_options=AtomicData_options, 
+                                                        structure=structure,
+                                                        block_tridiagonal=self.block_tridiagonal,
+                                                        pbc_negf = self.pbc, 
+                                                        stru_options=self.stru_options,
+                                                        unit = self.unit, 
+                                                        results_path=self.results_path,
+                                                        torch_device = torch.device("cpu"),
+                                                        use_saved_se = self.use_saved_se,
+                                                        self_energy_save_path = self.self_energy_save_path)
+            # if useBloch is None, structure_leads_fold,bloch_sorted_indices,bloch_R_lists = None,None,None
+            struct_device, struct_leads,structure_leads_fold,bloch_sorted_indices,bloch_R_lists = \
+                self.negf_hamiltonian.initialize(kpoints=self.kpoints,
+                                                block_tridiagnal=self.block_tridiagonal, plot_blocks=self.plot_blocks,\
+                                                useBloch=self.useBloch,bloch_factor=self.bloch_factor,
+                                                use_saved_HS=self.use_saved_HS, saved_HS_path=self.saved_HS_path)
         self.self_energy_save_path = \
             self.negf_hamiltonian.self_energy_save_path # update the self_energy_save_path in case it is None before
         self.se_cache_format = \
             self.negf_hamiltonian.self_energy_cache_format # update the se_cache_format in case it is None before
-        profiler.stop()
-        output_path = os.path.join(self.results_path, "profile_report_ham_init.html")
-        with open(output_path, 'w') as report_file:
-            report_file.write(profiler.output_html())
 
         self.free_charge = {} # net charge: hole - electron
         #  Regions for Poisson equation
@@ -393,6 +403,21 @@ class NEGF(object):
         self.out_ldos = out_opts.get("ldos", False)
         self.out_lcurrent = out_opts.get("lcurrent", False)
         assert not (self.out_lcurrent and self.block_tridiagonal)
+        transmission_only = (
+            not self.scf
+            and (self.out_tc or self.out_current_nscf or self.out_conductance)
+            and not (
+                self.out_dos
+                or self.out_ldos
+                or self.out_density
+                or self.out_potential
+                or self.out_current
+                or self.out_lcurrent
+            )
+        )
+        self.gf_cal_mode = "transmission_only" if transmission_only else "full"
+        if self.gf_cal_mode == "transmission_only":
+            log.info("using transmission-only recursive Green's function")
         self.out = {}
         if self.compute_band_edges:
             self.out["E_c"] = dict(self.E_c)
@@ -578,13 +603,9 @@ class NEGF(object):
 
         # otherwise, the non-self-consistent calculation is performed
         assert not self.scf
-        profiler = Profiler()
-        profiler.start() 
-        self.negf_compute(scf_require=False,Vbias=None)
-        profiler.stop()
         output_path = os.path.join(self.results_path, "profile_report_negf.html")
-        with open(output_path, 'w') as report_file:
-            report_file.write(profiler.output_html())
+        with _profile_to_html(output_path):
+            self.negf_compute(scf_require=False,Vbias=None)
         
         return None
 
@@ -924,62 +945,57 @@ class NEGF(object):
                                 f"computing green's functions for chunk e=[{float(e_chunk[0]):>6.3f}..{float(e_chunk[-1]):>6.3f}], B={e_batch_size}"
                             )
                             seL_list, seR_list = [], []
-                            for e in e_chunk:
-                                for ll in self.stru_options.keys():
-                                    if ll.startswith("lead"):
-                                        getattr(self.deviceprop, ll).self_energy(
-                                            energy=e,
-                                            kpoint=k,
-                                            eta_lead=self.eta_lead,
-                                            method=self.sgf_solver,
-                                            save_path=self.self_energy_save_path,
-                                            save_format=self.se_cache_format,
-                                            se_info_display=self.se_info_display
-                                            )
-                                seL_list.append(self.deviceprop.lead_L.se)
-                                seR_list.append(self.deviceprop.lead_R.se)
+                            try:
+                                for e in e_chunk:
+                                    for ll in self.stru_options.keys():
+                                        if ll.startswith("lead"):
+                                            getattr(self.deviceprop, ll).self_energy(
+                                                energy=e,
+                                                kpoint=k,
+                                                eta_lead=self.eta_lead,
+                                                method=self.sgf_solver,
+                                                save_path=self.self_energy_save_path,
+                                                save_format=self.se_cache_format,
+                                                se_info_display=self.se_info_display
+                                                )
+                                    seL_list.append(self.deviceprop.lead_L.se)
+                                    seR_list.append(self.deviceprop.lead_R.se)
 
-                            if e_batch_size > 1:
-                                self.deviceprop.lead_L.se = torch.stack(seL_list, dim=0)
-                                self.deviceprop.lead_R.se = torch.stack(seR_list, dim=0)
-                            # else: leave the per-E [n,n] in place — preserves scalar contract exactly.
+                                if e_batch_size > 1:
+                                    self.deviceprop.lead_L.se = torch.stack(seL_list, dim=0)
+                                    self.deviceprop.lead_R.se = torch.stack(seR_list, dim=0)
+                                # else: leave the per-E [n,n] in place — preserves scalar contract exactly.
 
-                            self.deviceprop.cal_green_function(
-                                energy=e_chunk, kpoint=k,
-                                eta_device=self.eta_device,
-                                block_tridiagonal=self.block_tridiagonal,
-                                Vbias=Vbias,
-                                need_lesser=False,
-                                need_greater=False,
-                                need_gr_lc=False, # set to False for memory saving, can be set to True for lead spectral function G^r * \Gamma * G^a
-                                )
+                                self.deviceprop.cal_green_function(
+                                    energy=e_chunk, kpoint=k,
+                                    eta_device=self.eta_device,
+                                    block_tridiagonal=self.block_tridiagonal,
+                                    Vbias=Vbias,
+                                    need_lesser=False,
+                                    need_greater=False,
+                                    need_gr_lc=False, # set to False for memory saving, can be set to True for lead spectral function G^r * \Gamma * G^a
+                                    gf_cal_mode=self.gf_cal_mode,
+                                    )
 
-                            if self.out_dos:
-                                self.out.setdefault('DOS', {}).setdefault(str(k), []).append(self.compute_DOS(k).reshape(-1).cpu())
-                            if self.out_tc or self.out_current_nscf:
-                                self.out.setdefault('T_k', {}).setdefault(str(k), []).append(self.compute_TC(k).reshape(-1).cpu())
-                            if self.out_ldos:
-                                ldos_chunk = self.compute_LDOS(k)
-                                if ldos_chunk.ndim == 1:  # scalar-E chunk → [na]
-                                    ldos_chunk = ldos_chunk.unsqueeze(0)
-                                self.out.setdefault('LDOS', {}).setdefault(str(k), []).append(ldos_chunk.cpu())
+                                if self.out_dos:
+                                    self.out.setdefault('DOS', {}).setdefault(str(k), []).append(self.compute_DOS(k).reshape(-1).cpu())
+                                if self.out_tc or self.out_current_nscf:
+                                    self.out.setdefault('T_k', {}).setdefault(str(k), []).append(self.compute_TC(k).reshape(-1).cpu())
+                                if self.out_ldos:
+                                    ldos_chunk = self.compute_LDOS(k)
+                                    if ldos_chunk.ndim == 1:  # scalar-E chunk → [na]
+                                        ldos_chunk = ldos_chunk.unsqueeze(0)
+                                    self.out.setdefault('LDOS', {}).setdefault(str(k), []).append(ldos_chunk.cpu())
 
-                        # Restore lead.se to a scalar [n,n] before releasing the GF
-                        # dict. For B>1 we clone the last per-E tensor so the new
-                        # lead.se doesn't share storage with anything still
-                        # referenced through seL_list/seR_list, then drop both
-                        # lists so release_greenfuncs's empty_cache() has the per-E
-                        # and stacked [B,n,n] copies to release.
-                        if e_batch_size > 1:
-                            self.deviceprop.lead_L.se = seL_list[-1].detach().clone()
-                            self.deviceprop.lead_R.se = seR_list[-1].detach().clone()
-                        else:
-                            # B=1 path: lead.se already IS the per-E [n,n] tensor;
-                            # preserve byte-identical behavior for the scalar case.
-                            self.deviceprop.lead_L.se = seL_list[-1]
-                            self.deviceprop.lead_R.se = seR_list[-1]
-                        del seL_list, seR_list
-                        self.deviceprop.release_greenfuncs()
+                            finally:
+                                self.deviceprop.release_greenfuncs()
+                                if seL_list:
+                                    self.deviceprop.lead_L.se = seL_list[-1]
+                                if seR_list:
+                                    self.deviceprop.lead_R.se = seR_list[-1]
+                                del seL_list, seR_list
+                                
+                        
                             
                     # over energy loop in uni_gird
                     # The following code is for output properties before NEGF ends

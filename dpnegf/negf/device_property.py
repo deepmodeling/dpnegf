@@ -1,4 +1,7 @@
-from dpnegf.negf.recursive_green_cal import recursive_gf
+from dpnegf.negf.recursive_green_cal import (
+    recursive_gf,
+    recursive_gf_transmission_only,
+)
 import logging
 import torch
 import os
@@ -135,7 +138,8 @@ class DeviceProperty(object):
 
 
     def cal_green_function(self, energy, kpoint, eta_device=0., block_tridiagonal=True, Vbias=None,
-                           HS_inmem:bool=True, need_lesser:bool=False, need_greater:bool=False, need_gr_lc:bool=False):
+                           HS_inmem:bool=True, need_lesser:bool=False, need_greater:bool=False, 
+                           need_gr_lc:bool=False, gf_cal_mode:str="full"):
         ''' computes the Green's function for a given energy and k-point in device.
 
         the tags used here to identify different Green's functions follows the NEGF theory 
@@ -166,6 +170,9 @@ class DeviceProperty(object):
             The greater Green's function is used to calculate the hole density and phase-breaking scattering.
         need_gr_lc
             A boolean parameter that indicates whether the last column blocks of the retarded Green's function are needed.
+        gf_cal_mode
+            "full" or "transmission_only". If set to "full", all Green's functions are calculated.
+            If set to "transmission_only", only the end-to-end retarded Green's function is calculated.
         '''
         assert len(np.array(kpoint).reshape(-1)) == 3
         energy = torch.as_tensor(energy, dtype=torch.complex128, device=self.rgf_device)
@@ -273,20 +280,30 @@ class DeviceProperty(object):
         else:
             s_in = 0
 
-        # gr_left is only consumed inside the lesser/greater forward pass of the
-        # kernel. If neither is active, the per-block list would sit on the GPU
-        # unread; ask the kernel to drop it so its slots are freed mid-sweep.
-        keep_gr_left = bool(need_lesser or need_greater)
-        ans = recursive_gf(energy, hl=self.hl, hd=self.hd, hu=self.hu,
-                            sd=self.sd, su=self.su, sl=self.sl,
-                            left_se=seL, right_se=seR, seP=None, s_in=s_in,
-                            s_out=None, eta=eta_device, E_ref=self.E_ref,
-                            need_lesser=need_lesser, need_greater=need_greater,
-                            need_gr_lc=need_gr_lc, keep_gr_left=keep_gr_left)
+        if gf_cal_mode == "transmission_only":
+            if need_lesser or need_greater or need_gr_lc:
+                raise ValueError(
+                    "transmission_only mode does not support lesser,"
+                    "greater, or last-column Green's functions."
+                )
+            green_funcs["g_trans"] = recursive_gf_transmission_only(
+                energy, hl=self.hl, hd=self.hd, hu=self.hu,
+                sd=self.sd, su=self.su, sl=self.sl,
+                left_se=seL, right_se=seR, eta=eta_device, E_ref=self.E_ref
+            )
+        elif gf_cal_mode == "full":
+            keep_gr_left = bool(need_lesser or need_greater)
+            ans = recursive_gf(energy, hl=self.hl, hd=self.hd, hu=self.hu,
+                                sd=self.sd, su=self.su, sl=self.sl,
+                                left_se=seL, right_se=seR, seP=None, s_in=s_in,
+                                s_out=None, eta=eta_device, E_ref=self.E_ref,
+                                need_lesser=need_lesser, need_greater=need_greater,
+                                need_gr_lc=need_gr_lc, keep_gr_left=keep_gr_left)
             # green shape [[g_trans, grd, grl,...],[g_trans, ...]]
-        
-        for t in range(len(tags)):
-            green_funcs[tags[t]] = ans[t]
+            for t in range(len(tags)):
+                green_funcs[tags[t]] = ans[t]
+        else:
+            raise ValueError(f"Unknown gf_cal_mode {gf_cal_mode}. Must be 'full' or 'transmission_only'.")
 
         self.greenfuncs = green_funcs
 
@@ -295,14 +312,20 @@ class DeviceProperty(object):
 
         # self.green = update_temp_file(update_fn=fn, file_path=GFpath, ee=ee, tags=tags, info="Computing Green's Function")
 
-    def release_greenfuncs(self):
+    def release_greenfuncs(self, empty_cache: bool=False):
         '''Drop the Green's-function dict so the underlying rgf_device storage
         can be freed before the next energy chunk. H/S blocks are kept resident
         (they are k,V-dependent, not energy-dependent). The runner is
         responsible for restoring scalar lead.se references before calling
-        this, so any batched [B,n,n] copies become collectable too.'''
+        this, so any batched [B,n,n] copies become collectable too.
+        
+        CUDA caching is retained during the normal energy loop for allocator reusage.
+        '''
         self.greenfuncs = 0
-        if isinstance(self.rgf_device, torch.device) and self.rgf_device.type == "cuda":
+        if ( empty_cache and
+            isinstance(self.rgf_device, torch.device) and 
+            self.rgf_device.type == "cuda"
+        ):
             torch.cuda.empty_cache()
 
     def _cal_current_(self, espacing):

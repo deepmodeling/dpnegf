@@ -351,7 +351,6 @@ class NEGFHamiltonianInit(object):
         d_start = int(np.sum(self.atom_norbs[:self.device_id[0]]))
         d_end = int(np.sum(self.atom_norbs)-np.sum(self.atom_norbs[self.device_id[1]:]))
         HD, SD = HK[:,d_start:d_end, d_start:d_end], SK[:, d_start:d_end, d_start:d_end]
-        Hall, Sall = HK, SK
 
         coupling_width = {}
         for kk in self.stru_options:
@@ -476,6 +475,8 @@ class NEGFHamiltonianInit(object):
                         else:
                             raise ValueError(f"Unsupported key {key} in HS_leads")
                     
+                del HS_leads, lead_data, HK_lead, S_lead
+                del HL, SL, HDL, SDL, hL, sL, hLL, sLL
 
                 # torch.save(HS_leads, os.path.join(self.results_path, "HS_"+kk+".pth"))
 
@@ -483,17 +484,18 @@ class NEGFHamiltonianInit(object):
         if not block_tridiagnal:
             # change HD format to ( k_index,block_index=0, orb, orb)
             subblocks = [HD.shape[1]]
-            HD = torch.unsqueeze(HD,dim=1)
-            SD = torch.unsqueeze(SD,dim=1)
-            HS_device.update({"HD":HD.cdouble()*self.h_factor, "SD":SD.cdouble()})
-            HS_device.update({"Hall":Hall.cdouble()*self.h_factor, "Sall":Sall.cdouble()})
+            HD_out = HD.to(dtype=torch.complex128, copy=True)
+            HD_out.mul_(self.h_factor)
+            SD_out = SD.to(dtype=torch.complex128, copy=True)
+            HS_device.update({"HD":HD_out.unsqueeze(1), "SD":SD_out.unsqueeze(1)})
             HS_device.update({"subblocks":subblocks, "block_tridiagonal":False})
         else:
             leftmost_size = coupling_width['lead_L']
             rightmost_size = coupling_width['lead_R']
-            hd, hu, hl, sd, su, sl, subblocks = self.get_block_tridiagonal(HD*self.h_factor,SD.cdouble(),self.structase,\
-                                                                leftmost_size,rightmost_size,
-                                                                plot_blocks=plot_blocks)
+            hd, hu, hl, sd, su, sl, subblocks = self.get_block_tridiagonal(
+                HD,SD,self.structase,leftmost_size,rightmost_size,
+                plot_blocks=plot_blocks, h_factor=self.h_factor,
+                overlap_dtype=torch.complex128)
             HS_device.update({"hd":hd, "hu":hu, "hl":hl, "sd":sd, "su":su, "sl":sl, \
                               "subblocks":subblocks, "block_tridiagonal":True})
             if self._self_energy_cache_edge_sizes is not None:
@@ -501,6 +503,17 @@ class NEGFHamiltonianInit(object):
                         .format(self._self_energy_cache_edge_sizes[0], self._self_energy_cache_edge_sizes[1], self.self_energy_cache_format))
 
         self.subblocks = subblocks
+        alldata.pop(AtomicDataDict.HAMILTONIAN_KEY, None)
+        alldata.pop(AtomicDataDict.OVERLAP_KEY, None)
+        del HK, SK, HD, SD, alldata
+        transforms = [self.h2k]
+        if self.overlap:
+            transforms.append(self.s2k)
+        for transform in transforms:
+            for attribute in ("bondwise_hopping", "onsite_block",
+                              "soc_upup_block", "soc_updn_block"):
+                if hasattr(transform, attribute):
+                    delattr(transform, attribute)
         # torch.save(HS_device, os.path.join(self.results_path, "HS_device.pth"))
 
         device_file = os.path.join(self.results_path, "HS_device.h5")
@@ -701,7 +714,10 @@ class NEGFHamiltonianInit(object):
         
         return stru_lead, stru_lead_fold, bloch_sorted_indice, bloch_R_list
 
-    def get_block_tridiagonal(self,HK,SK,structase:ase.Atoms,leftmost_size:int,rightmost_size:int,plot_blocks=False):
+    def get_block_tridiagonal(
+            self,HK,SK,structase:ase.Atoms,leftmost_size:int,
+            rightmost_size:int,plot_blocks=False, h_factor=1.0,
+            overlap_dtype=None):
         """
         Block-tridiagonalizes the Hamiltonian (HK) and overlap (SK) matrices for a given atomic structure.
         This method splits the input matrices into block tridiagonal form based on the atomic structure along the z-axis.
@@ -789,16 +805,28 @@ class NEGFHamiltonianInit(object):
             for id in range(len(subblocks)-1):
                 counted_block+=subblocks[id]
                 d_slice = slice(counted_block,counted_block+subblocks[id+1])
-                hd_k.append(HK[ik,d_slice,d_slice])
-                sd_k.append(SK[ik,d_slice,d_slice])
+                h_diag = HK[ik, d_slice, d_slice].clone()
+                h_diag.mul_(h_factor)
+                s_diag = SK[ik, d_slice, d_slice].to(
+                    dtype=overlap_dtype or SK.dtype, copy=True)
+                hd_k.append(h_diag)
+                sd_k.append(s_diag)
                 if id < len(subblocks)-2:
                     u_slice = slice(counted_block+subblocks[id+1],counted_block+subblocks[id+1]+subblocks[id+2])
-                    hu_k.append(HK[ik,d_slice,u_slice])
-                    su_k.append(SK[ik,d_slice,u_slice])
+                    h_upper = HK[ik, d_slice, u_slice].clone()
+                    h_upper.mul_(h_factor)
+                    s_upper = SK[ik, d_slice, u_slice].to(
+                        dtype=overlap_dtype or SK.dtype, copy=True)
+                    hu_k.append(h_upper)
+                    su_k.append(s_upper)
                 if id > 0:
                     l_slice = slice(counted_block-subblocks[id],counted_block)
-                    hl_k.append(HK[ik,d_slice,l_slice])
-                    sl_k.append(SK[ik,d_slice,l_slice]) 
+                    h_lower = HK[ik, d_slice, l_slice].clone()
+                    h_lower.mul_(h_factor)
+                    s_lower = SK[ik, d_slice, l_slice].to(
+                        dtype=overlap_dtype or SK.dtype, copy=True)
+                    hl_k.append(h_lower)
+                    sl_k.append(s_lower)
             hd.append(hd_k);hu.append(hu_k);hl.append(hl_k)
             sd.append(sd_k);su.append(su_k);sl.append(sl_k)
 
@@ -859,7 +887,7 @@ class NEGFHamiltonianInit(object):
                             HS_device[key] = f[key][()]
                         else:
                             assert isinstance(f[key][()], np.ndarray),f"Expected np.ndarray, but got {type(f[key][()])}"
-                            # read NumPy array: HD, SD, Hall, Sall
+                            # read NumPy array: HD, SD
                             HS_device[key] = torch.tensor(f[key][()])
                     else:  
                         group = f[key]
