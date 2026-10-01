@@ -1,6 +1,135 @@
 import torch.linalg as tLA
 import torch
 
+def recursive_gf_transmission_only(
+        energy, hl, hd, hu,
+        sd, su, sl, left_se, right_se, E_ref=0.0, eta=1e-5,):
+    """Return the end-to-end retarded Green's-function block G^r_{1N}.
+
+    This is the transmission-only counterpart of ``recursive_gf``. For
+    multi-block devices, it performs forward block elimination through
+    ``X_i = solve(D_i, U_i)``, accumulates ``P_i = X_1 ... X_i``, and obtains
+    the final block by solving ``G^r_{1N} D_N = P_{N-1}``. No backward sweep,
+    complete local inverses, or Green's-function lists are constructed
+    during the multi-block recursion.
+
+    For a single-block device, both electrode self-energies are included
+    in that block, and its complete Green's function is obtained by solving
+    against the identity matrix.
+
+    Parameters follow ``recursive_gf``. The spectral parameter is
+    ``z = energy + E_ref + 1j * eta``. Couplings in a non-orthogonal basis
+    are formed as ``U_i = hu[i] - z * su[i]`` and
+    ``L_i = hl[i] - z * sl[i]``.
+
+    ``energy + E_ref`` must be scalar or a one-dimensional array of length
+    B. Matrix inputs must be two-dimensional or have a batch dimension
+    compatible with B. Tensor inputs must have compatible devices and
+    dtypes; these conditions are assumed rather than explicitly validated.
+
+    The left self-energy is embedded in the upper-left corner of the
+    first block, and the right self-energy in the lower-right corner of
+    the last block. Oversized self-energies are clipped to the corresponding
+    block dimensions: the left uses its leading rows and columns, and the
+    right uses its trailing rows and columns.
+
+    Returns
+    -------
+    torch.Tensor
+        The Green's-function block connecting the first and last device
+        blocks, with shape ``[B, n_left, n_right]``. When the original
+        ``left_se`` is two-dimensional and B equals 1, the leading batch
+        dimension is removed, giving ``[n_left, n_right]``.
+
+    Notes
+    -----
+    Without autograd recording, the recursion retains only the current
+    Schur complement, coupling blocks, propagator, and temporary tensors.
+    When gradients are required, autograd may retain intermediate tensors
+    for backward computation. This function returns a Green's-function
+    block, not the transmission coefficient itself.
+    """
+    shift_energy = energy + E_ref
+    if not torch.is_tensor(shift_energy):
+        shift_energy = torch.as_tensor(
+            shift_energy, dtype=hd[0].dtype, device=hd[0].device
+        )
+
+    squeezed = left_se.ndim == 2
+    if shift_energy.ndim == 0:
+        shift_energy = shift_energy.reshape(1)
+    batch_size = shift_energy.shape[0]
+    energy_view = (shift_energy + 1j * eta).reshape(batch_size, 1, 1)
+
+    def to_batch(tensor):
+        if tensor.ndim == 2:
+            return tensor.unsqueeze(0).expand(batch_size, -1, -1)
+        return tensor
+
+    left_se = to_batch(left_se)
+    right_se = to_batch(right_se)
+
+    first_matrix = energy_view * to_batch(sd[0]) - to_batch(hd[0])
+    left_rows = min(first_matrix.shape[-2], left_se.shape[-2])
+    left_cols = min(first_matrix.shape[-1], left_se.shape[-1])
+    first_matrix[:, :left_rows, :left_cols] -= left_se[
+        :, :left_rows, :left_cols
+    ]
+
+    if len(hd) == 1:
+        right_rows = min(first_matrix.shape[-2], right_se.shape[-2])
+        right_cols = min(first_matrix.shape[-1], right_se.shape[-1])
+        first_matrix[:, -right_rows:, -right_cols:] -= right_se[
+            :, -right_rows:, -right_cols:
+        ]
+
+    effective_diagonal = first_matrix
+    propagator = None
+
+    for block_index in range(len(hd) - 1):
+        upper = to_batch(hu[block_index]) - energy_view * to_batch(
+            su[block_index]
+        )
+        lower = to_batch(hl[block_index]) - energy_view * to_batch(
+            sl[block_index]
+        )
+        solved_upper = tLA.solve(effective_diagonal, upper)
+        propagator = (
+            solved_upper
+            if propagator is None
+            else propagator @ solved_upper
+        )
+        next_matrix = (
+            energy_view * to_batch(sd[block_index + 1])
+            - to_batch(hd[block_index + 1])
+            - lower @ solved_upper
+        )
+
+        if block_index + 1 == len(hd) - 1:
+            right_rows = min(next_matrix.shape[-2], right_se.shape[-2])
+            right_cols = min(next_matrix.shape[-1], right_se.shape[-1])
+            next_matrix[:, -right_rows:, -right_cols:] -= right_se[
+                :, -right_rows:, -right_cols:
+            ]
+
+        effective_diagonal = next_matrix
+
+    if propagator is None:
+        identity = torch.eye(
+            effective_diagonal.shape[-1],
+            dtype=effective_diagonal.dtype,
+            device=effective_diagonal.device,
+        ).expand(batch_size, -1, -1)
+        g_trans = tLA.solve(effective_diagonal, identity)
+    else:
+        g_trans = tLA.solve(
+            effective_diagonal, propagator, left=False
+        )
+
+    if squeezed:
+        return g_trans.squeeze(0)
+    return g_trans
+
 def recursive_gf_cal(energy, mat_l_list, mat_d_list, mat_u_list,
                      sd, su, sl, s_in=0, s_out=0, eta=1e-5,
                      need_lesser=False, need_greater=False, need_gr_lc=False,

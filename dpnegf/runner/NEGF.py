@@ -393,6 +393,21 @@ class NEGF(object):
         self.out_ldos = out_opts.get("ldos", False)
         self.out_lcurrent = out_opts.get("lcurrent", False)
         assert not (self.out_lcurrent and self.block_tridiagonal)
+        transmission_only = (
+            not self.scf
+            and (self.out_tc or self.out_current_nscf or self.out_conductance)
+            and not (
+                self.out_dos
+                or self.out_ldos
+                or self.out_density
+                or self.out_potential
+                or self.out_current
+                or self.out_lcurrent
+            )
+        )
+        self.gf_cal_mode = "transmission_only" if transmission_only else "full"
+        if self.gf_cal_mode == "transmission_only":
+            log.info("using transmission-only recursive Green's function")
         self.out = {}
         if self.compute_band_edges:
             self.out["E_c"] = dict(self.E_c)
@@ -953,6 +968,7 @@ class NEGF(object):
                                     need_lesser=False,
                                     need_greater=False,
                                     need_gr_lc=False, # set to False for memory saving, can be set to True for lead spectral function G^r * \Gamma * G^a
+                                    gf_cal_mode=self.gf_cal_mode,
                                     )
 
                                 if self.out_dos:
