@@ -198,6 +198,8 @@ def negf():
         Argument("ele_T", [float, int], optional=False, doc=doc_ele_T),
         Argument("unit", str, optional=True, default="Hartree", doc=doc_unit),
         Argument("hs_cache", dict, optional=True, default={}, sub_fields=hs_cache_options(), doc=doc_hs_cache),
+        Argument("btd_initialization", str, optional=True, default="dense", doc="Whether to initialize the block-tridiagonalization with a dense or direct method. Default: 'dense'."),
+        Argument("direct_btd_max_mib", [float, int, None], optional=True, default=None, doc="Maximum memory in MiB for direct BTD initialization. If None, no limit is applied."),
         Argument("scf_options", dict, optional=True, default={}, sub_fields=[], sub_variants=[scf_options()], doc=doc_scf_options),
         Argument("stru_options", dict, optional=False, sub_fields=stru_options(), doc=doc_stru_options),
         Argument("poisson_options", dict, optional=True, default={}, sub_fields=[], sub_variants=[poisson_options()], doc=doc_poisson_options),
@@ -570,7 +572,22 @@ def normalize_run(data):
 
     if data.get("task_options", {}).get("task") == "negf":
         validate_energy_options(data["task_options"])
-
+        task = data["task_options"]
+        if task["btd_initialization"] not in ["dense", "direct"]:
+            raise ValueError(f"Invalid btd_initialization: {task['btd_initialization']}. Must be 'dense' or 'direct'.")
+        if task["btd_initialization"] == "direct":
+            if not task["block_tridiagonal"] or task["plot_blocks"]:
+                raise ValueError("btd_initialization='direct' requires block_tridiagonal=True and plot_blocks=False.")
+            if any(
+                value.get("useBloch", False)
+                for key, value in task["stru_options"].items()
+                if key.startswith("lead")
+            ):
+                raise ValueError("btd_initialization='direct' does not support Bloch expansion in leads.")
+        if (
+            task["direct_btd_max_mib"] is not None
+            and task["direct_btd_max_mib"] <= 0):
+            raise ValueError("direct_btd_max_mib must be positive.")
     return data
 
 
