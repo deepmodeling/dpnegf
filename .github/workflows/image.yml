@@ -48,7 +48,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           # 使用上面步骤生成的动态标签和元数据
           tags: ${{ steps.meta.outputs.tags }}
