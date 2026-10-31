@@ -185,7 +185,7 @@ def negf():
                                "on-disk cache, and CPU parallelism (joblib workers, "
                                "BLAS threads, ek batching).")
     doc_rgf_options = ("Recursive Green's function stage options: compute device "
-                       "('cpu' or 'cuda') and energy-loop chunk size. Independent "
+                       "('cpu' or 'cuda[:index]') and energy-loop chunk size. Independent "
                        "from the self-energy pool, which always runs on CPU.")
     doc_hs_cache = "On-disk cache of the device Hamiltonian and overlap matrix."
     doc_density_options = ""
@@ -342,9 +342,11 @@ def self_energy_options():
 
 def rgf_options_group():
     doc_device = ("Device used only for the RGF (recursive Green's function) step. "
-                  "'cpu' (default) or 'cuda'. Hamiltonian initialization always runs "
-                  "on CPU (it is the memory-heavy phase). Self-energy always runs on "
-                  "CPU because it goes through joblib + numba.")
+                  "'cpu' (default) or 'cuda[:index]'. 'cuda' uses the current CUDA "
+                  "device (normally logical cuda:0, subject to CUDA_VISIBLE_DEVICES). "
+                  "Model construction and Hamiltonian initialization use the top-level "
+                  "device option independently. Self-energy always runs on CPU "
+                  "because it goes through joblib + numba.")
     doc_e_batch = ("Number of energy points solved in one batched RGF call. None "
                    "(default) auto-picks from free CUDA memory on 'cuda'; on 'cpu' "
                    "the full grid is used.")
