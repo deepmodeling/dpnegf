@@ -214,15 +214,55 @@ def negf():
         Argument("eta_lead", [int, float], optional=True, default=1e-5, doc=doc_eta_lead),
         Argument("eta_device", [int, float], optional=True, default=0., doc=doc_eta_device),
         Argument("trans_eigs_options", dict, optional=True, default={}, sub_fields=[
-            Argument("incoming", str, optional=True, default="left"),
-            Argument("n_channels", [int, None], optional=True, default=None),
-            Argument("channel_indices", [list, None], optional=True, default=None),
-            Argument("return_format", str, optional=True, default="original"),
-            Argument("psd_atol", [float, int], optional=True, default=0.),
-            Argument("psd_rtol", [float, int, None], optional=True, default=None),
-            Argument("rank_atol", [float, int], optional=True, default=0.),
-            Argument("rank_rtol", [float, int, None], optional=True, default=None),
-        ], doc="Contact thresholds and channel selection; indices are zero based."),
+            Argument("incoming", str, optional=True, default="left",
+                     doc="Incident lead: 'left' (default) or 'right'. Sets the propagation direction for both eigenvalues and channels."),
+            Argument("n_channels", [int, None], optional=True, default=None,
+                     doc=("Number of channels whose complex LCAO coefficients are reconstructed and saved, "
+                          "selected by descending transmission eigenvalue. Must be nonnegative; 0 returns "
+                          "coefficient tensors with zero channel columns, None (default) selects all thin-SVD channels, and values exceeding "
+                          "the available count select all. Does not truncate tau_all or the total transmission; "
+                          "tau_selected contains the selected values. Mutually exclusive with channel_indices "
+                          "when both are non-null. Ignored when only trans_eigvals is enabled.")),
+            Argument("channel_indices", [list, None], optional=True, default=None,
+                     doc=("Unique nonnegative integer indices into the descending thin-SVD transmission "
+                          "spectrum, starting at zero; e.g. [0, 2] reconstructs the first and third channels "
+                          "in that order. Indices must be within the available spectrum at every energy/k point. "
+                          "None (default) selects all channels unless n_channels is set; [] selects none. "
+                          "Mutually exclusive with a non-null n_channels. Does not truncate tau_all; "
+                          "ignored when only trans_eigvals is enabled.")),
+            Argument("return_format", str, optional=True, default="original",
+                     doc=("Channel coefficient layout: 'original' (default) returns a complex tensor "
+                          "[device orbitals, selected channels] in original input device orbital order; "
+                          "'blocks' returns a list of tensors in actual H/S block order. Original order "
+                          "requires a validated orbital mapping from the loaded H/S cache; if mapping is "
+                          "unknown, use 'blocks' or regenerate the cache. Ignored for eigenvalues-only output.")),
+            Argument("psd_atol", [float, int], optional=True, default=0.,
+                     doc=("Finite nonnegative absolute tolerance for Hermitian/positive-semidefinite checks "
+                          "of each contact broadening Gamma=i(Sigma-Sigma^dagger), in Gamma's energy unit. "
+                          "Default: 0. Hermitian residual tolerance is psd_atol + psd_rtol*||Gamma||_F; "
+                          "negative eigenvalues below -max(psd_atol, psd_rtol*max(abs(eig(Gamma)))) raise an error. "
+                          "This is independent of the positive-eigenvalue rank cutoff.")),
+            Argument("psd_rtol", [float, int, None], optional=True, default=None,
+                     doc=("Finite nonnegative dimensionless relative tolerance for the contact broadening "
+                          "Hermitian/PSD checks, combined with psd_atol. None (default) uses 100*n*eps, "
+                          "where n=max(1, contact dimension) and eps is machine precision of the real dtype.")),
+            Argument("rank_atol", [float, int], optional=True, default=0.,
+                     doc=("Finite nonnegative absolute rank cutoff for the contact broadening, in Gamma's "
+                          "energy unit. Retain only eigenvalues strictly greater than "
+                          "max(rank_atol, rank_rtol*largest_nonnegative_eigenvalue). Default: 0. "
+                          "Affects both eigenvalues and channels. Discarding weak contact directions can "
+                          "change transmission at narrow resonances; discarded broadening is not a "
+                          "transmission error bound.")),
+            Argument("rank_rtol", [float, int, None], optional=True, default=None,
+                     doc=("Finite nonnegative dimensionless relative rank cutoff for the contact broadening, "
+                          "combined with rank_atol. None (default) uses n*eps, where n=max(1, contact dimension) "
+                          "and eps is machine precision of the real dtype. This contact-rank cutoff is not "
+                          "a cutoff on transmission eigenvalues.")),
+        ], doc=("Transmission eigenvalue/channel options, used when output_options.trans_eigvals or "
+                "output_options.trans_eigchannel is true; either output automatically enables full RGF. "
+                "Each energy/k point is decomposed independently. Channel selection only controls coefficient "
+                "reconstruction and tau_selected; tau_all retains the full explicit thin-SVD spectrum, "
+                "without implicit zero input directions. Degenerate channels may undergo unitary rotations.")),
         Argument("output_options", dict, optional=True, default={}, sub_fields=output_options(), doc=doc_output_options),
     ]
 
@@ -232,9 +272,15 @@ def output_options():
         Argument("dos", bool, optional=True, default=False, doc="Write density of states."),
         Argument("tc", bool, optional=True, default=False, doc="Write transmission coefficient."),
         Argument("trans_eigvals", bool, optional=True, default=False,
-                 doc="Write per-k/energy transmission eigenvalues using full RGF."),
+                 doc=("Write per-k/energy transmission eigenvalues to negf.out.pth; automatically enables "
+                      "full RGF. Does not reconstruct channel coefficients. Controlled by trans_eigs_options "
+                      "direction and contact thresholds; channel selection does not truncate the spectrum. Default: False.")),
         Argument("trans_eigchannel", bool, optional=True, default=False,
-                 doc="Write spectral-normalized complex LCAO transmission channels using full RGF."),
+                 doc=("Write spectral-normalized complex LCAO transmission channels using full RGF, "
+                      "automatically enabled for this output. Each energy's coefficients are transferred to CPU "
+                      "and saved separately under trans_eigchannel/kXXXXXX/eXXXXXXXX.pth before proceeding; "
+                      "negf.out.pth contains file indices. Each channel record also includes the full "
+                      "eigenvalue spectrum. Selection and layout follow trans_eigs_options. Default: False.")),
         Argument("conductance", bool, optional=True, default=False, 
                  doc="Write zero-bias non-SCF conductance; requires unit=eV and ele_T>0."),
         Argument("density", bool, optional=True, default=False, doc="Write electron density."),
