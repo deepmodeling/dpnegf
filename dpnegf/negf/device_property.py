@@ -142,59 +142,58 @@ class DeviceProperty(object):
         """Load k/bias-dependent H/S on the RGF device before sizing batches.
 
         Reuse resident blocks for unchanged k, potential and block layout.
+        Context changes invalidate Green/eigenchannel state before loading.
+        Commit cache labels and blocks together only after loading succeeds.
         This performs no energy-dependent Green-function allocations.
         """
         layout_changed = getattr(self, "block_tridiagonal", None) != block_tridiagonal
-        self.block_tridiagonal = block_tridiagonal
-        if self.kpoint is None or abs(self.kpoint - torch.tensor(kpoint)).sum() > 1e-5:
-            self.kpoint = torch.tensor(kpoint)
-            self.newK_flag = True
-        else:
-            self.newK_flag = False
-
-
-        # if V is not None:
-        #     HD_ = self.attachPotential(HD, SD, V)
-        # else:
-        #     HD_ = HD
-        if  hasattr(self, "V"):
-            self.oldV = self.V
-        else:
-            self.oldV = None
+        candidate_kpoint = torch.as_tensor(kpoint).clone()
+        new_k = self.kpoint is None or bool(
+            torch.abs(self.kpoint - candidate_kpoint).sum() > 1e-5)
+        old_potential = getattr(self, "V", None)
 
         if Vbias is None:
             if os.path.exists(os.path.join(self.results_path, "POTENTIAL.pth")):
-                self.V = torch.load(os.path.join(self.results_path, "POTENTIAL.pth"))
-            # elif abs([self.chemiPot[lead] - self.efermi[lead] for lead in ["lead_L","lead_R"]]).max() > 1e-7:
-            #     self.V = torch.tensor(self.efermi - self.chemiPot)
+                candidate_potential = torch.load(os.path.join(self.results_path, "POTENTIAL.pth"))
             else:
-                self.V = torch.tensor(0.)
+                candidate_potential = torch.tensor(0.)
         else:
-            self.V = Vbias
+            candidate_potential = Vbias
 
-        assert torch.is_tensor(self.V)
-        self.V = self.V.to(self.rgf_device)
-        if not self.oldV is None:
-            if torch.abs(self.V - self.oldV).sum() > 1e-5:
-                self.newV_flag = True
-            else:
-                self.newV_flag = False
-        else:
-            self.newV_flag = True  # for the first time to run cal_green_function in Poisson-NEGF SCF
+        assert torch.is_tensor(candidate_potential)
+        candidate_potential = candidate_potential.to(self.rgf_device).clone()
+        new_v = old_potential is None or bool(
+            torch.abs(candidate_potential - old_potential).sum() > 1e-5)
 
-        if (not (hasattr(self, "hd") and hasattr(self, "sd"))) or (self.newK_flag or self.newV_flag or layout_changed):
-            self.hd, self.sd, self.hl, self.su, self.sl, self.hu = self.hamiltonian.get_hs_device(
-                self.kpoint, self.V, block_tridiagonal, device=self.rgf_device
+        if (not all(hasattr(self, name) for name in ("hd", "sd", "hl", "su", "sl", "hu"))
+                or new_k or new_v or layout_changed):
+            self.release_greenfuncs()
+            prepared = self._load_hamiltonian(
+                candidate_kpoint, candidate_potential, block_tridiagonal
             )
-            self._capture_orbital_mapping()
-            # TODO: if all blocks transferred to GPU, OOM may happen for large systems.
-            # Optimization should be implemented here.
-            self.hd = [b.to(self.rgf_device) for b in self.hd]
-            self.sd = [b.to(self.rgf_device) for b in self.sd]
-            self.hl = [b.to(self.rgf_device) for b in self.hl]
-            self.su = [b.to(self.rgf_device) for b in self.su]
-            self.sl = [b.to(self.rgf_device) for b in self.sl]
-            self.hu = [b.to(self.rgf_device) for b in self.hu]
+            (self.hd, self.sd, self.hl, self.su, self.sl, self.hu,
+             self._orbital_mapping_snapshot) = prepared
+            self.kpoint = candidate_kpoint
+            self.V = candidate_potential
+            self.block_tridiagonal = block_tridiagonal
+        self.oldV = old_potential
+        self.newK_flag = new_k
+        self.newV_flag = new_v
+
+    def _load_hamiltonian(self, kpoint, potential, block_tridiagonal):
+        """Stage all blocks and their provenance without changing device state."""
+        parts = self.hamiltonian.get_hs_device(
+            kpoint, potential, block_tridiagonal, device=self.rgf_device
+        )
+        hd, sd, hl, su, sl, hu = (
+            [block.to(self.rgf_device) for block in blocks] for blocks in parts
+        )
+        from dpnegf.utils.orbital_mapping import validate_orbital_mapping
+        getter = getattr(self.hamiltonian, "get_orbital_map", None)
+        mapping = copy.deepcopy(
+            getter() if getter is not None else validate_orbital_mapping(
+                None, None, [block.shape[0] for block in hd], "unspecified"))
+        return hd, sd, hl, su, sl, hu, mapping
 
     def cal_green_function(self, energy, kpoint, eta_device=0., block_tridiagonal=True, Vbias=None,
                            HS_inmem:bool=True, need_lesser:bool=False, need_greater:bool=False,
@@ -233,8 +232,8 @@ class DeviceProperty(object):
             "full" or "transmission_only". If set to "full", all Green's functions are calculated.
             If set to "transmission_only", only the end-to-end retarded Green's function is calculated.
         '''
-        # A failed replacement solve must not leave an older eigenchannel state usable.
-        self._trans_eigs_state = None
+        # A failed replacement solve must not leave older Green/eigenchannel state usable.
+        self.release_greenfuncs()
         assert len(np.array(kpoint).reshape(-1)) == 3
         energy = torch.as_tensor(energy, dtype=torch.complex128, device=self.rgf_device)
         if energy.ndim == 0:
@@ -337,14 +336,6 @@ class DeviceProperty(object):
 
         # self.green = update_temp_file(update_fn=fn, file_path=GFpath, ee=ee, tags=tags, info="Computing Green's Function")
 
-    def _capture_orbital_mapping(self):
-        """Keep provenance with the H/S blocks owned by this device."""
-        from dpnegf.utils.orbital_mapping import validate_orbital_mapping
-        getter = getattr(self.hamiltonian, "get_orbital_map", None)
-        self._orbital_mapping_snapshot = copy.deepcopy(
-            getter() if getter is not None else validate_orbital_mapping(
-                None, None, [b.shape[0] for b in self.hd], "unspecified"))
-
     def cal_transmission_eigs(self, *, channels=False, **options):
         """Return one result per energy, reusing the current full-RGF blocks.
 
@@ -369,6 +360,8 @@ class DeviceProperty(object):
         se_l, se_r = state["left_se"], state["right_se"]
         batched = se_l.ndim == 3
         for i, energy in enumerate(energies):
+            if state is not getattr(self, "_trans_eigs_state", None):
+                raise RuntimeError("Green/H/S context changed; create a new transmission eigenchannel iterator")
             connected = [g[i] if batched else g for g in self.gr_left]
             context = TransportContext(
                 energy=energy, hd=self.hd, sd=self.sd, hu=self.hu, hl=self.hl,
@@ -565,17 +558,12 @@ class DeviceProperty(object):
         '''
         dos = 0
         #TODO: transfer cal_dos to static method for any k and energy
-        if (not(hasattr(self, "hd") and hasattr(self, "sd"))) or (self.newK_flag or self.newV_flag):
-            self.hd, self.sd, self.hl, self.su, self.sl, self.hu = \
-                self.hamiltonian.get_hs_device(self.kpoint, self.V, self.block_tridiagonal, device=self.rgf_device)
-            self._capture_orbital_mapping()
-            # defensive .to(self.device) in case the blocks came back from a cached/legacy path on CPU.
-            self.hd = [b.to(self.rgf_device) for b in self.hd]
-            self.sd = [b.to(self.rgf_device) for b in self.sd]
-            self.hl = [b.to(self.rgf_device) for b in self.hl]
-            self.su = [b.to(self.rgf_device) for b in self.su]
-            self.sl = [b.to(self.rgf_device) for b in self.sl]
-            self.hu = [b.to(self.rgf_device) for b in self.hu]
+        # prepare_hamiltonian already loaded the current context. Only restore
+        # blocks here when cal_green_function(HS_inmem=False) released them.
+        if not all(hasattr(self, name) for name in ("hd", "sd", "hl", "su", "sl", "hu")):
+            (self.hd, self.sd, self.hl, self.su, self.sl, self.hu,
+             self._orbital_mapping_snapshot) = self._load_hamiltonian(
+                self.kpoint, self.V, self.block_tridiagonal)
 
         for jj in range(len(self.grd)):
             if not self.block_tridiagonal or len(self.gru) == 0:
