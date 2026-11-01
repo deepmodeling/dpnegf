@@ -2034,13 +2034,21 @@
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">dict</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">{}</span></code></div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/rgf_options</span></code></div>
 </div>
-<p>Recursive Green’s function stage options: compute device (‘cpu’ or ‘cuda’) and energy-loop chunk size. Independent from the self-energy pool, which always runs on CPU.</p>
+<p>Recursive Green’s function stage options: compute device (‘cpu’ or ‘cuda[:index]’), optional multiple CUDA devices, and energy-loop chunk size. Independent from the self-energy pool, which always runs on CPU.</p>
 <dl id="run-op-task-options-negf-rgf-options-device">
 <dt>device:</dt><dd><div class="line-block">
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">str</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">cpu</span></code></div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/rgf_options/device</span></code></div>
 </div>
-<p>Device used only for the RGF (recursive Green’s function) step. ‘cpu’ (default) or ‘cuda’. Hamiltonian initialization always runs on CPU (it is the memory-heavy phase). Self-energy always runs on CPU because it goes through joblib + numba.</p>
+<p>Device used only for the RGF (recursive Green’s function) step. ‘cpu’ (default) or ‘cuda[:index]’. ‘cuda’ uses the current CUDA device (normally logical cuda:0, subject to CUDA_VISIBLE_DEVICES). Model construction and Hamiltonian initialization use the top-level device option independently. Overridden by devices when supplied. Self-energy always runs on CPU because it goes through joblib + numba.</p>
+</dd>
+</dl>
+<dl id="run-op-task-options-negf-rgf-options-devices">
+<dt>devices:</dt><dd><div class="line-block">
+<div class="line">type: <code class="docutils literal notranslate"><span class="pre">list</span></code> | <code class="docutils literal notranslate"><span class="pre">NoneType</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">None</span></code></div>
+<div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/rgf_options/devices</span></code></div>
+</div>
+<p>Optional list of explicit logical CUDA devices, e.g. [‘cuda:0’, ‘cuda:1’]. Overrides device. With multiple devices, non-SCF energy batches run in one independent spawn process per GPU, with a model-independent cache solver. The worker pool is reused across k points and all workers are terminated on failure. One batch runs per GPU and results retain energy-grid order. Each GPU holds its own H/S blocks. Only the energy-grid RGF sweep is distributed; density and local-current integrals use the first device. Multiple devices require scf=false. Indices follow CUDA_VISIBLE_DEVICES.</p>
 </dd>
 </dl>
 <dl id="run-op-task-options-negf-rgf-options-e-batch-size">
@@ -2048,7 +2056,7 @@
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">int</span></code> | <code class="docutils literal notranslate"><span class="pre">float</span></code> | <code class="docutils literal notranslate"><span class="pre">NoneType</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">None</span></code></div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/rgf_options/e_batch_size</span></code></div>
 </div>
-<p>Number of energy points solved in one batched RGF call. None (default) auto-picks from free CUDA memory on ‘cuda’; on ‘cpu’ the full grid is used.</p>
+<p>Number of energy points solved in one batched RGF call. None (default) auto-picks from free CUDA memory on ‘cuda’; on ‘cpu’ the full grid is used. In multi-GPU mode this is the batch size per GPU; None uses the smallest device memory budget and splits the grid into at least one batch per selected GPU when there are enough energy points.</p>
 </dd>
 </dl>
 </dd>
@@ -3908,7 +3916,7 @@
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">NoneType</span></code> | <code class="docutils literal notranslate"><span class="pre">str</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">None</span></code></div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/device</span></code></div>
 </div>
-<p>The torch device used to build the Hamiltonian and run the calculation. Choose ‘cpu’ or ‘cuda[:int]’. Default: None (use the device stored in the model ckpt).</p>
+<p>The torch device for model construction, Hamiltonian initialization and lead electronic structure. Choose ‘cpu’ or ‘cuda[:int]’. Default: None (use the device stored in the model ckpt). RGF uses rgf_options.device or rgf_options.devices.</p>
 </dd>
 </dl>
 <dl id="run-op-dtype">
