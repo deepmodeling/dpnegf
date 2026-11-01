@@ -138,53 +138,13 @@ class DeviceProperty(object):
       # self.mu = self.efermi - 0.5*(self.lead_L.voltage + self.lead_R.voltage) # temporarily for NanoTCAD
 
 
-    def cal_green_function(self, energy, kpoint, eta_device=0., block_tridiagonal=True, Vbias=None,
-                           HS_inmem:bool=True, need_lesser:bool=False, need_greater:bool=False, 
-                           need_gr_lc:bool=False, gf_cal_mode:str="full", need_trans_eigs:bool=False):
-        ''' computes the Green's function for a given energy and k-point in device.
+    def prepare_hamiltonian(self, kpoint, block_tridiagonal=True, Vbias=None):
+        """Load k/bias-dependent H/S on the RGF device before sizing batches.
 
-        the tags used here to identify different Green's functions follows the NEGF theory 
-        developed by Supriyo Datta in his book "Quantum Transport: Atom to Transistor". 
-        The detials are listed in dpnegf/negf/recursive_green_cal.py docstring.
-        
-        Parameters
-        ----------
-        energy
-            the energy at which the Green's function is evaluated.
-        kpoint
-            the k-point in the Brillouin zone.
-        eta_device
-            a float that represents the broadening factor used in the calculation of the Green's function.
-            It is used to avoid the divergence of the Green's function at the poles of the Hamiltonian.
-        block_tridiagonal
-            A boolean parameter that shows whether the Hamiltonian matrix is block tridiagonal or not. 
-            If set to True, the Hamiltonian matrix is assumed to have a block tridiagonal structure, 
-            which can lead to computational efficiency in certain cases.
-        HS_inmem
-            A boolean parameter that shows whether the Hamiltonian/overlap is stored in memory after finishing 
-            cal_green_function or not, which is important for large-scale calculations.
-        need_lesser
-            A boolean parameter that indicates whether the lesser Green's function is needed in the calculation.
-            The lesser Green's function is used to calculate the electron density and current density.
-        need_greater
-            A boolean parameter that indicates whether the greater Green's function is needed in the calculation.
-            The greater Green's function is used to calculate the hole density and phase-breaking scattering.
-        need_gr_lc
-            A boolean parameter that indicates whether the last column blocks of the retarded Green's function are needed.
-        gf_cal_mode
-            "full" or "transmission_only". If set to "full", all Green's functions are calculated.
-            If set to "transmission_only", only the end-to-end retarded Green's function is calculated.
-        '''
-        # A failed replacement solve must not leave an older eigenchannel state usable.
-        self._trans_eigs_state = None
-        assert len(np.array(kpoint).reshape(-1)) == 3
-        energy = torch.as_tensor(energy, dtype=torch.complex128, device=self.rgf_device)
-        if energy.ndim == 0:
-            energy = energy.reshape(1)
-        assert energy.ndim == 1, f"energy must be 0-d, scalar, or 1-D [B]; got shape {tuple(energy.shape)}"
-        B = energy.shape[0]
-        batched_mode = B > 1
-
+        Reuse resident blocks for unchanged k, potential and block layout.
+        This performs no energy-dependent Green-function allocations.
+        """
+        layout_changed = getattr(self, "block_tridiagonal", None) != block_tridiagonal
         self.block_tridiagonal = block_tridiagonal
         if self.kpoint is None or abs(self.kpoint - torch.tensor(kpoint)).sum() > 1e-5:
             self.kpoint = torch.tensor(kpoint)
@@ -222,12 +182,12 @@ class DeviceProperty(object):
         else:
             self.newV_flag = True  # for the first time to run cal_green_function in Poisson-NEGF SCF
 
-        if (not (hasattr(self, "hd") and hasattr(self, "sd"))) or (self.newK_flag or self.newV_flag):
+        if (not (hasattr(self, "hd") and hasattr(self, "sd"))) or (self.newK_flag or self.newV_flag or layout_changed):
             self.hd, self.sd, self.hl, self.su, self.sl, self.hu = self.hamiltonian.get_hs_device(
                 self.kpoint, self.V, block_tridiagonal, device=self.rgf_device
             )
             self._capture_orbital_mapping()
-            # TODO: if all blocks transferred to GPU, OOM may happen for large systems. 
+            # TODO: if all blocks transferred to GPU, OOM may happen for large systems.
             # Optimization should be implemented here.
             self.hd = [b.to(self.rgf_device) for b in self.hd]
             self.sd = [b.to(self.rgf_device) for b in self.sd]
@@ -236,6 +196,54 @@ class DeviceProperty(object):
             self.sl = [b.to(self.rgf_device) for b in self.sl]
             self.hu = [b.to(self.rgf_device) for b in self.hu]
 
+    def cal_green_function(self, energy, kpoint, eta_device=0., block_tridiagonal=True, Vbias=None,
+                           HS_inmem:bool=True, need_lesser:bool=False, need_greater:bool=False,
+                           need_gr_lc:bool=False, gf_cal_mode:str="full", need_trans_eigs:bool=False):
+        ''' computes the Green's function for a given energy and k-point in device.
+
+        the tags used here to identify different Green's functions follows the NEGF theory
+        developed by Supriyo Datta in his book "Quantum Transport: Atom to Transistor".
+        The detials are listed in dpnegf/negf/recursive_green_cal.py docstring.
+
+        Parameters
+        ----------
+        energy
+            the energy at which the Green's function is evaluated.
+        kpoint
+            the k-point in the Brillouin zone.
+        eta_device
+            a float that represents the broadening factor used in the calculation of the Green's function.
+            It is used to avoid the divergence of the Green's function at the poles of the Hamiltonian.
+        block_tridiagonal
+            A boolean parameter that shows whether the Hamiltonian matrix is block tridiagonal or not.
+            If set to True, the Hamiltonian matrix is assumed to have a block tridiagonal structure,
+            which can lead to computational efficiency in certain cases.
+        HS_inmem
+            A boolean parameter that shows whether the Hamiltonian/overlap is stored in memory after finishing
+            cal_green_function or not, which is important for large-scale calculations.
+        need_lesser
+            A boolean parameter that indicates whether the lesser Green's function is needed in the calculation.
+            The lesser Green's function is used to calculate the electron density and current density.
+        need_greater
+            A boolean parameter that indicates whether the greater Green's function is needed in the calculation.
+            The greater Green's function is used to calculate the hole density and phase-breaking scattering.
+        need_gr_lc
+            A boolean parameter that indicates whether the last column blocks of the retarded Green's function are needed.
+        gf_cal_mode
+            "full" or "transmission_only". If set to "full", all Green's functions are calculated.
+            If set to "transmission_only", only the end-to-end retarded Green's function is calculated.
+        '''
+        # A failed replacement solve must not leave an older eigenchannel state usable.
+        self._trans_eigs_state = None
+        assert len(np.array(kpoint).reshape(-1)) == 3
+        energy = torch.as_tensor(energy, dtype=torch.complex128, device=self.rgf_device)
+        if energy.ndim == 0:
+            energy = energy.reshape(1)
+        assert energy.ndim == 1, f"energy must be 0-d, scalar, or 1-D [B]; got shape {tuple(energy.shape)}"
+        B = energy.shape[0]
+        batched_mode = B > 1
+
+        self.prepare_hamiltonian(kpoint, block_tridiagonal, Vbias)
 
         tags = ["g_trans","gr_lc", \
                "grd", "grl", "gru", "gr_left", \
