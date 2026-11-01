@@ -351,8 +351,10 @@ def rgf_options_group():
                   "because it goes through joblib + numba.")
     doc_devices = ("Optional list of explicit logical CUDA devices, e.g. "
                    "['cuda:0', 'cuda:1']. Overrides device. With multiple devices, "
-                   "non-SCF energy batches run concurrently, one batch per GPU, "
-                   "and results retain energy-grid order. Each GPU holds its own "
+                   "non-SCF energy batches run in one independent spawn process per GPU, "
+                   "with a model-independent cache solver. The worker pool is reused "
+                   "across k points and all workers are terminated on failure. "
+                   "One batch runs per GPU and results retain energy-grid order. Each GPU holds its own "
                    "H/S blocks. Only the energy-grid RGF sweep is distributed; "
                    "density and local-current integrals use the first device. "
                    "Multiple devices require scf=false. Indices follow CUDA_VISIBLE_DEVICES.")
