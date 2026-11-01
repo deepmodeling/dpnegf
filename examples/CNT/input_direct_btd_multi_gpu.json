@@ -1,0 +1,121 @@
+{
+    "device": "cpu",
+    "task_options": {
+        "task": "negf",
+        "scf": false,
+        "block_tridiagonal": true,
+        "btd_initialization": "direct",
+        "ele_T": 300,
+        "unit": "eV",
+        "espacing": 0.05,
+        "emin": -3,
+        "emax": 3,
+        "eta_lead": 1e-05,
+        "eta_device": 1e-05,
+        "self_energy_options": {
+            "solver": "Sancho-Rubio",
+            "parallel": {
+                "cpu_budget": 8
+            }
+        },
+        "rgf_options": {
+            "devices": ["cuda:0", "cuda:1"],
+            "e_batch_size": null
+        },
+        "scf_options": {
+            "mode": "PDIIS",
+            "mixing_period": 3,
+            "step_size": 0.05,
+            "n_history": 6,
+            "abs_err": 1e-06,
+            "rel_err": 0.0001,
+            "max_iter": 100
+        },
+        "stru_options": {
+            "gamma_center": true,
+            "time_reversal_symmetry": true,
+            "nel_atom": {
+                "C": 4.0
+            },
+            "kmesh": [
+                1,
+                1,
+                1
+            ],
+            "pbc": [
+                true,
+                true,
+                false
+            ],
+            "device": {
+                "id": "56-574",
+                "sort": true
+            },
+            "lead_L": {
+                "id": "0-56",
+                "voltage": 0,
+                "useBloch": false,
+                "kmesh_lead_Ef": [
+                    1,
+                    1,
+                    10
+                ]
+            },
+            "lead_R": {
+                "id": "574-630",
+                "voltage": 0,
+                "useBloch": false,
+                "kmesh_lead_Ef": [
+                    1,
+                    1,
+                    10
+                ]
+            }
+        },
+        "poisson_options": {
+            "solver": "scipy",
+            "err": 0.01,
+            "tolerance": 1e-05,
+            "max_iter": 1000,
+            "mix_rate": 0.2,
+            "grid": {
+                "x_range": "-20:20:9",
+                "y_range": "-20:20:9",
+                "z_range": "8.6:88:2"
+            },
+            "gate_top": {
+                "x_range": "-20:-20",
+                "y_range": "-20:20",
+                "z_range": "38.64:58.64",
+                "voltage": 0
+            },
+            "gate_bottom": {
+                "x_range": "20:20",
+                "y_range": "-20:20",
+                "z_range": "38.64:58.64",
+                "voltage": 0
+            },
+            "dielectric_region": {
+                "x_range": "-20:20",
+                "y_range": "-20:20",
+                "z_range": "8.6:88",
+                "relative permittivity": 20
+            }
+        },
+        "density_options": {
+            "method": "Fiori",
+            "integrate_way": "direct"
+        },
+        "output_options": {
+            "dos": true,
+            "tc": true,
+            "ldos": false,
+            "current_nscf": true,
+            "density": true
+        }
+    },
+    "structure": "./cnt7_0.xyz",
+    "AtomicData_options": {
+        "r_max": 4.6
+    }
+}
