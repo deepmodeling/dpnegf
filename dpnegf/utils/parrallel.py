@@ -47,47 +47,79 @@ def _rgf_devices(options):
 
 def _auto_chunk_size(runner, n_grid):
     """Pick a chunk size from free CUDA memory when the user didn't set
-    ``e_batch_size``. Returns the full grid length on CPU / when the
-    device geometry isn't probable yet.
+    ``e_batch_size``. Returns the full grid length on CPU. If the CUDA
+    memory query or geometry estimate fails, logs the cause and returns 1.
 
-    Per-energy peak (post per-slot-release, complex128) approximated as
+    Call only after prepare_hamiltonian() has made the current k/bias H/S
+    resident. The free-memory query then excludes those persistent tensors.
+    Per-energy RGF peak (post per-slot-release, complex128) approximated as
         bytes_per_E ~= C * K * n_max**2 * 16
     with C bundling the live tensors in the worst backward-sweep slot
     (grd full + grl + gru full + decaying gr_left tail + gU + transients
-    + the K-resident H/S diagonal & off-diagonal lists that survive across
-    chunks). C=14 with a 0.5x free-memory budget; deliberately conservative
+    and allocator headroom). C=14 with a 0.5x free-memory budget; conservative
     because without expandable_segments the allocator can't defragment on
     demand, and on real workloads (CNT10/long6) the previous 10x / 0.7
     combination still picked a chunk that OOM'd on a 15.77 GiB V100.
+
+    Eigen outputs additionally retain batched gr_left/self-energy snapshots.
+    Reserve a separate, batch-independent workspace for contact eigh/SVD and
+    thin RHS/channel coefficients: eigen outputs are streamed one energy at
+    a time while the entire RGF batch remains resident. Contact block sizes
+    bound the unknown broadening ranks conservatively.
     """
     rgf_dev = runner.rgf_device
     if not (isinstance(rgf_dev, torch.device) and rgf_dev.type == "cuda"):
         return n_grid
     try:
-        free_bytes, _total = torch.cuda.mem_get_info(rgf_dev)
-        if hasattr(runner.deviceprop, "hd"):
-            sizes = [int(b.shape[-1]) for b in runner.deviceprop.hd]
-        else:
-            # Read geometry without allocating H/S on a GPU before the first batch.
-            sizes = runner.deviceprop.hamiltonian.get_hs_device(only_subblocks=True)
-            if not runner.block_tridiagonal:
-                sizes = [sum(sizes)]
+        sizes = [int(b.shape[-1]) for b in runner.deviceprop.hd]
         n_max = max(sizes)
         K = len(sizes)
-    except Exception:
-        return n_grid
-    per_e = 14 * K * (n_max ** 2) * 16
-    if per_e <= 0:
-        return n_grid
-    b = max(1, min(n_grid, int(0.5 * free_bytes) // per_e))
+        per_e = 14 * K * (n_max ** 2) * 16
+        if min(sizes) <= 0 or per_e <= 0:
+            raise ValueError(f"Non-positive per-energy memory estimate: {per_e}")
+        eig_workspace = 0
+        if getattr(runner, "need_trans_eigs", False):
+            left, right = sizes[0], sizes[-1]
+            boundary_sq = left**2 + right**2
+            # Retained gr_left and copied self-energy state scale with B.
+            per_e += 16 * (sum(n**2 for n in sizes) + 2 * boundary_sq)
+            options = runner.trans_eigs_options
+            incoming = right if options.get("incoming", "left") == "right" else left
+            # Gamma factors, contact Green/K matrices, eigh/SVD scratch and
+            # streaming contact solves; include orbital permutation buffers.
+            eig_workspace = 16 * (8 * (boundary_sq + left * right) + 4 * n_max * incoming)
+            eig_workspace += 3 * sum(sizes) * 8
+            if runner.out_trans_eigchannel:
+                selected = min(left, right)
+                if options.get("n_channels") is not None:
+                    selected = min(selected, options["n_channels"])
+                elif options.get("channel_indices") is not None:
+                    selected = min(selected, len(options["channel_indices"]))
+                # Forward/back substitution responses, coefficients, residuals;
+                # original order also materializes concatenated/reordered copies.
+                copies = 6 if options.get("return_format", "blocks") == "original" else 4
+                eig_workspace += 16 * copies * sum(sizes) * selected
+        free_bytes, _total = torch.cuda.mem_get_info(rgf_dev)
+        budget = int(0.5 * free_bytes)
+        b = max(1, min(n_grid, max(0, budget - eig_workspace) // per_e))
+    except Exception as exc:
+        log.error(
+            "Failed to determine CUDA auto e_batch_size on %s; "
+            "falling back to e_batch_size=1 (%s: %s)",
+            rgf_dev, type(exc).__name__, exc, exc_info=True,
+        )
+        return 1
     log.info(
         f"auto e_batch_size={b} (free={free_bytes/2**30:.2f} GiB, "
-        f"per_E~={per_e/2**20:.1f} MiB, K={K}, n_max={n_max})"
+        f"per_E~={per_e/2**20:.1f} MiB, "
+        f"eig_workspace~={eig_workspace/2**20:.1f} MiB, K={K}, n_max={n_max})"
     )
     return b
 
 
-def _rgf_chunk_size(runner, n_grid):
+@torch.no_grad()
+def _rgf_chunk_size(runner, n_grid, k, Vbias=None):
+    runner.deviceprop.prepare_hamiltonian(k, runner.block_tridiagonal, Vbias)
     cap = _auto_chunk_size(runner, n_grid)
     chunk = runner.e_batch_size if runner.e_batch_size is not None else cap
     if runner.e_batch_size is not None and runner.rgf_device.type == "cuda" and chunk > cap:
@@ -249,7 +281,8 @@ class RGFProcessPool:
         try:
             per_device = max(1, len(grid) // len(self.processes))
             for connection in self.connections:
-                _send_packet(connection, ("chunk_size", (per_device,)))
+                _send_packet(connection, ("chunk_size", (
+                    per_device, _cpu_payload(k), _cpu_payload(bias))))
             caps = {}
             while len(caps) < len(self.processes):
                 slot, packet = self._receive()
