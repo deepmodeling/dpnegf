@@ -38,11 +38,40 @@ the smallest free-memory budget across the chosen GPUs, capped to distribute
 work over all GPUs when there are enough energy points. An explicit batch size
 large enough to contain the whole grid creates only one batch.
 
-Each GPU caches its own H/S blocks. Self-energy preparation runs before the
+Each selected GPU has one independent process, created with Python's `spawn`
+start method. The process constructs a model-independent RGF solver from cache
+paths and numerical settings; the neural model and `NEGF` runner stay in the
+parent process. CUDA contexts and runtime state belong to each worker process.
+Each worker caches its own H/S blocks. Self-energy preparation runs before the
 parallel sweep, and workers read the resulting CPU caches. Transmission, DOS,
 LDOS and transmission eigenvalues/channels are merged in the original energy
 order. Eigenchannel files retain their global energy indices. Conductance and
 current derived from the transmission use the merged spectrum.
+
+Here, the H/S cache means the saved `HS_device.h5` (or legacy `HS_device.pth`)
+files on disk. Each worker opens these files itself when it first needs a k
+point's H/S. The parent passes the cache path and metadata; it does not send
+its in-memory H/S tensors to workers. After reading the files, a worker keeps
+its own H/S blocks for subsequent energy batches at that k point.
+
+The same worker pool serves all k points in a calculation, retaining each
+worker's PID and CUDA context. H/S blocks are refreshed when the k point changes.
+Workers shut down after the sweep. If a worker reports an exception or exits
+unexpectedly, the parent terminates and joins every worker, including workers
+still blocked in a solver, and raises an error with the available worker
+traceback.
+
+When calling the Python API from a script, put the entry call inside a main
+guard so spawned processes can import the script safely:
+
+```python
+from dpnegf.entrypoints.run import run
+
+if __name__ == "__main__":
+    run(INPUT, MODEL, STRUCTURE, OUTPUT, LOG_PATH)
+```
+
+The `dpnegf` command-line entry point already provides this guard.
 
 This mode currently requires `scf: false`. Density and local-current integrals
 continue to use the first selected GPU. It distributes energies within each k
