@@ -13,6 +13,7 @@ import h5py
 import glob
 import psutil
 import time
+from numbers import Integral
 
 
 log = logging.getLogger(__name__)
@@ -563,6 +564,19 @@ def _estimate_worker_memory(lead_L, lead_R, kpoint=None, temp_allocation_factor=
     return total_estimate
 
 
+def _resolve_cpu_budget(cpu_budget):
+    """Use one valid CPU budget for both process and BLAS thread limits."""
+    if cpu_budget is not None:
+        if isinstance(cpu_budget, bool) or not isinstance(cpu_budget, Integral) or cpu_budget < 1:
+            raise ValueError("self_energy_options.parallel.cpu_budget must be a positive integer or None.")
+        return int(cpu_budget)
+    cpu_count = os.cpu_count()
+    if cpu_count is None or cpu_count < 1:
+        log.warning("os.cpu_count() returned None or invalid value. Defaulting to 1 CPU core.")
+        return 1
+    return cpu_count
+
+
 def _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-1, max_memory_fraction=0.9,
                         min_workers=1, kpoint=None, cpu_budget=None):
     """
@@ -589,10 +603,9 @@ def _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-1, max_memory_fract
     int
         Safe number of parallel workers.
     """
-    cpu_count = cpu_budget if cpu_budget is not None else os.cpu_count()
-    if cpu_count is None or cpu_count < 1:
-        cpu_count = 1
-        log.warning("os.cpu_count() returned None or invalid value. Defaulting to 1 CPU core.")
+    cpu_count = _resolve_cpu_budget(cpu_budget)
+    if requested_n_workers is None:
+        requested_n_workers = -1
 
     available_memory = psutil.virtual_memory().available
     memory_per_worker = _estimate_worker_memory(lead_L, lead_R, kpoint=kpoint)
@@ -604,7 +617,6 @@ def _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-1, max_memory_fract
 
     # Calculate max workers that fit in available memory
     max_workers_by_memory = int((available_memory * max_memory_fraction) / memory_per_worker)
-    max_workers_by_memory = int((available_memory * max_memory_fraction) / memory_per_worker)
     max_workers_by_memory = max(max_workers_by_memory, min_workers)
 
     # Cap by CPU count
@@ -612,12 +624,11 @@ def _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-1, max_memory_fract
 
     safe_n_worker = 0
     # check requested_n_workers is a number
-    if not isinstance(requested_n_workers, int):
+    if isinstance(requested_n_workers, bool) or not isinstance(requested_n_workers, Integral):
         log.warning(f"Requested n_workers={requested_n_workers} is not an integer. \n"
                     f"Using min_workers={min_workers}.")
         safe_n_worker = min_workers
-
-    if requested_n_workers == -1:
+    elif requested_n_workers == -1:
         safe_n_worker = max_workers
     elif requested_n_workers == 0:
         log.warning(f"Requested n_workers=0 is invalid. Using min_workers={min_workers}.")
@@ -649,10 +660,12 @@ def _autotune_blas_threads(leadL_pack, sample_kpoint, sample_energy, eta_lead,
     and several ``(N, N)`` matmuls per iteration. The payoff from BLAS threading
     is hardware-dependent (OpenBLAS vs MKL, cache size, N), so instead of a
     static table we probe the actual `_compute_self_energy_from_pack` at a few
-    candidate thread counts and keep the fastest. Runs once per
-    ``compute_all_self_energy`` call, in the parent process, before workers fan
-    out. Cost is bounded to ``2 * len(candidates)`` surface-green calls at the
-    sample ``(k, E)``.
+    candidate thread counts and keep the fastest. The caller caches this choice
+    per active worker count within one sweep, and bypasses probes for short
+    batches. Probes run in the parent before workers fan out, with at most
+    ``2 * len(candidates)`` surface-green calls at the sample ``(k, E)``.
+    The 90-second stopping condition is checked between candidates; it cannot
+    interrupt a running surface-green call and is not a hard timeout.
 
     Parameters
     ----------
@@ -685,7 +698,7 @@ def _autotune_blas_threads(leadL_pack, sample_kpoint, sample_energy, eta_lead,
     per_worker_budget = max(int(cpu_count) // n_workers, 1)
 
     if requested is not None:
-        if not isinstance(requested, int) or requested < 1:
+        if isinstance(requested, bool) or not isinstance(requested, Integral) or requested < 1:
             log.warning(f"Requested blas_threads={requested} is not a positive int. "
                         "Falling back to autotune.")
         else:
@@ -713,15 +726,14 @@ def _autotune_blas_threads(leadL_pack, sample_kpoint, sample_energy, eta_lead,
     candidates = sorted({1, 2, 4, 8, per_worker_budget})
     candidates = [c for c in candidates if c <= per_worker_budget]
 
-    # Wall-clock cap for the whole probe. stop between
-    # candidates (not mid-call) and pick the best-so-far.
+    # Soft stopping condition between candidates, not an interruptible timeout.
     max_autotune_seconds = 90.0
     bench_start = time.perf_counter()
 
     timings = {}
     for t in candidates:
         if time.perf_counter() - bench_start > max_autotune_seconds:
-            log.warning(f"BLAS autotune exceeded {max_autotune_seconds:.0f}s wall-clock cap; "
+            log.warning(f"BLAS autotune exceeded {max_autotune_seconds:.0f}s between-candidate stopping threshold; "
                         f"stopping after {len(timings)}/{len(candidates)} candidates.")
             break
         try:
@@ -798,27 +810,47 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
     self_energy_save_path : str or None, optional
         Directory to save self-energy files. If None, uses lead_L's results_path.
     ek_batch_size : int, optional
-        Number of (k, e) tasks per parallel batch. Default is 200.
+        Positive number of (k, e) tasks per parallel batch. Default is 200.
     cpu_budget : int or None, optional
         Total CPU cores the self-energy pool is allowed to size against.
-        If None, uses os.cpu_count().
+        Must be positive. If None, uses os.cpu_count(), falling back to 1.
     n_workers : int, optional
         Number of parallel joblib workers to use. Default is -1 (auto-select
-        based on `cpu_budget` and available memory).
+        based on `cpu_budget` and available memory); None also selects automatically.
+        Each batch uses at most its task count. Zero is invalid; other negative
+        integers follow joblib's CPU-relative convention.
     se_numba_jit : bool or None, optional
         Boolean flag controlling whether to use the Numba-accelerated surface Green's function core.
         If None, Numba will be used when available. Default is None.
     blas_threads : int or None, optional
-        BLAS threads to give each worker. None (default) autotunes by timing
-        `_compute_self_energy_from_pack` across a few candidate thread counts and picking the fastest.
-        Pass an int to force that value; it is still clamped to `cpu_budget // n_workers` to avoid
-        oversubscription.
+        Positive BLAS thread count per worker, clamped to CPU budget divided by
+        the current batch's active workers, without probing. None (default)
+        skips probes for batches with at most two tasks per active worker:
+        use up to 4 budgeted threads if either principal layer has at least
+        256 orbitals, otherwise 1. Longer batches retain sample-based tuning.
+        Choices are reused per active worker count within this call.
 
     Returns
     -------
     None
         Results are saved to disk as HDF5 files.
     """
+    cpu_count = _resolve_cpu_budget(cpu_budget)
+    if n_workers is None:
+        n_workers = -1
+    if isinstance(n_workers, bool) or not isinstance(n_workers, Integral) or n_workers == 0:
+        raise ValueError("self_energy_options.parallel.n_workers must be a nonzero integer or None.")
+    for name, value in (("blas_threads", blas_threads), ("ek_batch_size", ek_batch_size)):
+        if name == "blas_threads" and value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
+            raise ValueError(f"self_energy_options.parallel.{name} must be a positive integer"
+                             + (" or None." if name == "blas_threads" else "."))
+
+    if len(kpoints_grid) == 0 or len(energy_grid) == 0:
+        log.info("No self-energy tasks; skipping scheduling and BLAS autotune.")
+        return
+
     if self_energy_save_path is None:
         if lead_L.results_path != lead_R.results_path:
             log.warning("The results_path of lead_L and lead_R are different. "
@@ -827,11 +859,11 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
 
     # Calculate safe number of workers based on available memory
     # Use first k-point for memory estimation
-    sample_kpoint = kpoints_grid[0] if len(kpoints_grid) > 0 else None
+    sample_kpoint = kpoints_grid[0]
     safe_n_workers = _get_safe_n_workers(lead_L, lead_R,
                                          requested_n_workers=n_workers,
                                          kpoint=sample_kpoint,
-                                         cpu_budget=cpu_budget)
+                                         cpu_budget=cpu_count)
     if n_workers == -1:
         log.info(f"Auto-detected safe n_workers={safe_n_workers} based on available memory")
     elif safe_n_workers < n_workers:
@@ -843,36 +875,55 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
     leadL_pack = _precompute_lead_kdata(lead_L, kpoints_grid)
     leadR_pack = _precompute_lead_kdata(lead_R, kpoints_grid)
 
-    # Choose BLAS threads-per-worker by autotuning on the real code path at the
-    # sample (k, E). Cheaper than a hardware-agnostic table and always correct
-    # for the actual N / BLAS backend the workers will run under.
-    cpu_count = cpu_budget if cpu_budget is not None else os.cpu_count()
-    sample_energy = energy_grid[0] if len(energy_grid) > 0 else 0.0
-    blas_threads_per_worker = _autotune_blas_threads(
-        leadL_pack, sample_kpoint, sample_energy, eta,
-        safe_n_workers, cpu_count, se_numba_jit, requested=blas_threads,
-    )
-
     total_tasks = [(k, e) for k in kpoints_grid for e in energy_grid]
     # Capture the parent's log level so loky workers (which start with a clean
     # logging state and the WARNING default) can match it when they reinit.
     parent_log_level = logging.getLogger().getEffectiveLevel()
-    if len(total_tasks) <= ek_batch_size:
-        Parallel(n_jobs=min(safe_n_workers, len(total_tasks)), backend="loky")(
+    # Cache scheduling choices only for this sweep. Tail batches may expose
+    # more CPU budget per worker, so key by actual rather than safe workers.
+    threads_by_workers = {}
+    for i in range(0, len(total_tasks), ek_batch_size):
+        batch = total_tasks[i:i+ek_batch_size]
+        active_workers = min(safe_n_workers, len(batch))
+        per_worker_budget = max(cpu_count // active_workers, 1)
+        sample_kpoint, sample_energy = batch[0]
+        if active_workers in threads_by_workers:
+            blas_threads_per_worker = threads_by_workers[active_workers]
+            autotune_status = "skipped (cached choice)"
+        elif blas_threads is not None:
+            blas_threads_per_worker = _autotune_blas_threads(
+                leadL_pack, sample_kpoint, sample_energy, eta,
+                active_workers, cpu_count, se_numba_jit, requested=blas_threads,
+            )
+            autotune_status = "skipped (user-requested)"
+        elif per_worker_budget == 1:
+            blas_threads_per_worker = 1
+            autotune_status = "skipped (single-thread CPU budget)"
+        elif len(batch) <= 2 * active_workers:
+            sample_dim = max(_sample_principal_layer_dim(pack, sample_kpoint)
+                             for pack in (leadL_pack, leadR_pack))
+            blas_threads_per_worker = min(4, per_worker_budget) if sample_dim >= 256 else 1
+            autotune_status = f"skipped (short batch, max principal-layer N={sample_dim})"
+        elif _sample_principal_layer_dim(leadL_pack, sample_kpoint) < 64:
+            blas_threads_per_worker = 1
+            autotune_status = "skipped (small or empty sample)"
+        else:
+            blas_threads_per_worker = _autotune_blas_threads(
+                leadL_pack, sample_kpoint, sample_energy, eta,
+                active_workers, cpu_count, se_numba_jit,
+            )
+            autotune_status = "enabled (parent-process sample)"
+        threads_by_workers[active_workers] = blas_threads_per_worker
+        log.info("Self-energy batch %d: tasks=%d, active_workers=%d, "
+                 "blas_threads=%d per worker, cpu_budget=%d, autotune=%s",
+                 i // ek_batch_size + 1, len(batch), active_workers,
+                 blas_threads_per_worker, cpu_count, autotune_status)
+        Parallel(n_jobs=active_workers, backend="loky")(
             delayed(_self_energy_worker_blas)(k, e, eta, leadL_pack, leadR_pack,
                                                self_energy_save_path, se_numba_jit,
                                                parent_log_level, blas_threads_per_worker)
-            for k, e in total_tasks
+            for k, e in batch
         )
-    else:
-        for i in range(0, len(total_tasks), ek_batch_size):
-            batch = total_tasks[i:i+ek_batch_size]
-            Parallel(n_jobs=min(safe_n_workers, len(batch)), backend="loky")(
-                delayed(_self_energy_worker_blas)(k, e, eta, leadL_pack, leadR_pack,
-                                                   self_energy_save_path, se_numba_jit,
-                                                   parent_log_level, blas_threads_per_worker)
-                for k, e in batch
-            )
 
 
     save_path_L = os.path.join(self_energy_save_path, "self_energy_leadL.h5")
@@ -1133,9 +1184,9 @@ def _self_energy_worker_blas(k, e, eta, leadL_pack, leadR_pack, self_energy_save
     but multi-threaded solve/GEMM helps for larger N when the CPU budget left
     over from the memory-driven `n_workers` cap is not zero.
 
-    `blas_threads` is chosen by `_autotune_blas_threads` in the parent and
-    passed in per call; default 1 preserves the historical behavior for any
-    external caller.
+    `blas_threads` is chosen in the parent for each batch's actual concurrency
+    and passed in per call; default 1 preserves the historical behavior for
+    any external caller.
     """
     with threadpool_limits(limits=blas_threads, user_api='blas'):
         return _self_energy_worker_pure(

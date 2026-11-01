@@ -305,16 +305,31 @@ def self_energy_cache_options():
 
 def self_energy_parallel_options():
     doc_n_workers = ("Number of joblib workers used to parallelize the self-energy "
-                     "sweep over (k, E). -1 (default) auto-selects based on the CPU "
-                     "and memory budget (see `_get_safe_n_workers`).")
+                     "sweep over (k, E). -1 (default) or None auto-selects an upper "
+                     "limit based on CPU and available memory. Each batch uses "
+                     "active_workers=min(limit, batch task count). Must be a nonzero "
+                     "integer or None; other negative integers follow joblib's "
+                     "CPU-relative convention.")
     doc_cpu_budget = ("Total CPU cores the self-energy pool is allowed to size against. "
-                      "None (default) uses os.cpu_count(). This bounds both `n_workers` "
-                      "and `blas_threads` so BLAS-thread * worker <= cpu_budget.")
+                      "Must be a positive integer or None. None (default) uses "
+                      "os.cpu_count(), falling back to 1 if unavailable or invalid. "
+                      "Per-batch BLAS threads are bounded by "
+                      "max(1, cpu_budget // active_workers), including tail batches.")
     doc_blas_threads = ("BLAS/LAPACK threads per worker inside the Lopez-Sancho loop. "
-                       "None (default) auto-tunes by timing a sample (k, E) at 1, 2, 4, "
-                       "8, and cpu_budget/n_workers threads and keeping the fastest.")
+                       "A positive integer skips probing and is clamped to the current "
+                       "batch's per-worker CPU budget. None (default) skips SGF probes "
+                       "when tasks <= 2 * active_workers: use up to 4 budgeted threads "
+                       "if either principal layer has >=256 orbitals, otherwise 1. "
+                       "These are conservative starting values, not hardware optima. "
+                       "Longer batches time a parent-process sample at candidates "
+                       "1, 2, 4, 8 and the per-worker budget, keeping only candidates "
+                       "within budget. The 90s stopping check is between candidates, "
+                       "not a hard timeout. Choices are cached by active worker count "
+                       "only within this sweep; this is not a concurrent throughput benchmark.")
     doc_ek_batch = ("Batch size for (k, E) tasks handed to joblib. Larger = fewer "
-                    "batches, more memory. Default 200.")
+                    "batches, more memory. Must be a positive integer, default 200. "
+                    "Limits actual concurrency; smaller tail batches receive a "
+                    "new BLAS budget when their active worker count changes.")
     return [
         Argument("n_workers", [int, None], optional=True, default=-1, doc=doc_n_workers),
         Argument("cpu_budget", [int, None], optional=True, default=None, doc=doc_cpu_budget),
