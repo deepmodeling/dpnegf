@@ -1974,7 +1974,7 @@
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">int</span></code> | <code class="docutils literal notranslate"><span class="pre">NoneType</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">-1</span></code></div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/self_energy_options/parallel/n_workers</span></code></div>
 </div>
-<p>Number of joblib workers used to parallelize the self-energy sweep over (k, E). -1 (default) auto-selects based on the CPU and memory budget (see <cite>_get_safe_n_jobs</cite>).</p>
+<p>Number of joblib workers used to parallelize the self-energy sweep over (k, E). -1 (default) or None auto-selects an upper limit based on CPU and available memory. Each batch uses <code class="docutils literal notranslate"><span class="pre">active_workers</span> <span class="pre">=</span> <span class="pre">min(limit,</span> <span class="pre">batch</span> <span class="pre">task</span> <span class="pre">count)</span></code>. Must be a nonzero integer or None; other negative integers follow joblib’s CPU-relative convention. The memory safety limit is retained.</p>
 </dd>
 </dl>
 <dl id="run-op-task-options-negf-self-energy-options-parallel-cpu-budget">
@@ -1982,7 +1982,7 @@
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">int</span></code> | <code class="docutils literal notranslate"><span class="pre">NoneType</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">None</span></code></div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/self_energy_options/parallel/cpu_budget</span></code></div>
 </div>
-<p>Total CPU cores the self-energy pool is allowed to size against. None (default) uses os.cpu_count(). This bounds both <cite>n_workers</cite> and <cite>blas_threads</cite> so BLAS-thread * worker &lt;= cpu_budget.</p>
+<p>Total CPU cores the self-energy pool is allowed to size against. Must be a positive integer or None. None (default) uses <code class="docutils literal notranslate"><span class="pre">os.cpu_count()</span></code>, falling back to 1 if unavailable or invalid. Each batch bounds BLAS threads per worker by <code class="docutils literal notranslate"><span class="pre">max(1,</span> <span class="pre">cpu_budget</span> <span class="pre">//</span> <span class="pre">active_workers)</span></code>, using the same actual worker count that is passed to joblib. Thus <code class="docutils literal notranslate"><span class="pre">active_workers</span> <span class="pre">*</span> <span class="pre">blas_threads</span> <span class="pre">&lt;=</span> <span class="pre">cpu_budget</span></code>, including tail batches.</p>
 </dd>
 </dl>
 <dl id="run-op-task-options-negf-self-energy-options-parallel-blas-threads">
@@ -1990,7 +1990,10 @@
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">int</span></code> | <code class="docutils literal notranslate"><span class="pre">NoneType</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">None</span></code></div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/self_energy_options/parallel/blas_threads</span></code></div>
 </div>
-<p>BLAS/LAPACK threads per worker inside the Lopez-Sancho loop. None (default) auto-tunes by timing a sample (k, E) at 1, 2, 4, 8, and cpu_budget/n_workers threads and keeping the fastest.</p>
+<p>BLAS/LAPACK threads per worker inside the Lopez-Sancho loop. A positive integer skips probing and is clamped to the current batch’s per-worker CPU budget. For example, 20 budgeted CPUs and 5 active workers allow a request of 4 threads per worker.</p>
+<p>None (default) skips full SGF probes for short batches with <code class="docutils literal notranslate"><span class="pre">tasks</span> <span class="pre">&lt;=</span> <span class="pre">2</span> <span class="pre">*</span> <span class="pre">active_workers</span></code>. If either electrode principal layer has at least 256 orbitals, use up to 4 threads within budget; otherwise use 1. The threshold and thread cap are conservative starting values, not optimal values for every machine; explicit <code class="docutils literal notranslate"><span class="pre">blas_threads</span></code> overrides this strategy within budget.</p>
+<p>Longer batches retain automatic tuning: time a parent-process sample (k, E) at candidates 1, 2, 4, 8, and the per-worker budget, retaining only candidates within budget. Each candidate performs a warm-up and a timed full self-energy calculation on the left lead. Small samples (fewer than 64 orbitals) or a per-worker budget of 1 use 1 thread without probing. The 90-second stopping condition is checked between candidates and cannot interrupt a running calculation; it is not a hard timeout. This sample measurement does not optimize the throughput of concurrently running workers.</p>
+<p>Choices are cached by actual worker count only within the current sweep. Repeated batches reuse the choice; a tail batch with fewer active workers gets a new budget and follows the short-batch strategy when applicable. Each batch logs its task count, active workers, BLAS threads per worker, CPU budget, and whether tuning was skipped.</p>
 </dd>
 </dl>
 <dl id="run-op-task-options-negf-self-energy-options-parallel-ek-batch-size">
@@ -1998,7 +2001,7 @@
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">int</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">200</span></code></div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/self_energy_options/parallel/ek_batch_size</span></code></div>
 </div>
-<p>Batch size for (k, E) tasks handed to joblib. Larger = fewer batches, more memory. Default 200.</p>
+<p>Batch size for (k, E) tasks handed to joblib. Must be a positive integer, default 200. Larger values mean fewer batches and more memory. This also caps actual concurrency and therefore affects each worker’s BLAS budget, including the last partial batch.</p>
 </dd>
 </dl>
 </dd>

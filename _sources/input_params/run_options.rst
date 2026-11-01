@@ -1672,7 +1672,7 @@ run_op:
                     | type: ``int`` | ``NoneType``, optional, default: ``-1``
                     | argument path: ``run_op/task_options[negf]/self_energy_options/parallel/n_workers``
 
-                    Number of joblib workers used to parallelize the self-energy sweep over (k, E). -1 (default) auto-selects based on the CPU and memory budget (see `_get_safe_n_jobs`).
+                    Number of joblib workers used to parallelize the self-energy sweep over (k, E). -1 (default) or None auto-selects an upper limit based on CPU and available memory. Each batch uses ``active_workers = min(limit, batch task count)``. Must be a nonzero integer or None; other negative integers follow joblib's CPU-relative convention. The memory safety limit is retained.
 
                 .. _`run_op/task_options[negf]/self_energy_options/parallel/cpu_budget`: 
 
@@ -1680,7 +1680,7 @@ run_op:
                     | type: ``int`` | ``NoneType``, optional, default: ``None``
                     | argument path: ``run_op/task_options[negf]/self_energy_options/parallel/cpu_budget``
 
-                    Total CPU cores the self-energy pool is allowed to size against. None (default) uses os.cpu_count(). This bounds both `n_workers` and `blas_threads` so BLAS-thread * worker <= cpu_budget.
+                    Total CPU cores the self-energy pool is allowed to size against. Must be a positive integer or None. None (default) uses ``os.cpu_count()``, falling back to 1 if unavailable or invalid. Each batch bounds BLAS threads per worker by ``max(1, cpu_budget // active_workers)``, using the same actual worker count that is passed to joblib. Thus ``active_workers * blas_threads <= cpu_budget``, including tail batches.
 
                 .. _`run_op/task_options[negf]/self_energy_options/parallel/blas_threads`: 
 
@@ -1688,7 +1688,13 @@ run_op:
                     | type: ``int`` | ``NoneType``, optional, default: ``None``
                     | argument path: ``run_op/task_options[negf]/self_energy_options/parallel/blas_threads``
 
-                    BLAS/LAPACK threads per worker inside the Lopez-Sancho loop. None (default) auto-tunes by timing a sample (k, E) at 1, 2, 4, 8, and cpu_budget/n_workers threads and keeping the fastest.
+                    BLAS/LAPACK threads per worker inside the Lopez-Sancho loop. A positive integer skips probing and is clamped to the current batch's per-worker CPU budget. For example, 20 budgeted CPUs and 5 active workers allow a request of 4 threads per worker.
+
+                    None (default) skips full SGF probes for short batches with ``tasks <= 2 * active_workers``. If either electrode principal layer has at least 256 orbitals, use up to 4 threads within budget; otherwise use 1. The threshold and thread cap are conservative starting values, not optimal values for every machine; explicit ``blas_threads`` overrides this strategy within budget.
+
+                    Longer batches retain automatic tuning: time a parent-process sample (k, E) at candidates 1, 2, 4, 8, and the per-worker budget, retaining only candidates within budget. Each candidate performs a warm-up and a timed full self-energy calculation on the left lead. Small samples (fewer than 64 orbitals) or a per-worker budget of 1 use 1 thread without probing. The 90-second stopping condition is checked between candidates and cannot interrupt a running calculation; it is not a hard timeout. This sample measurement does not optimize the throughput of concurrently running workers.
+
+                    Choices are cached by actual worker count only within the current sweep. Repeated batches reuse the choice; a tail batch with fewer active workers gets a new budget and follows the short-batch strategy when applicable. Each batch logs its task count, active workers, BLAS threads per worker, CPU budget, and whether tuning was skipped.
 
                 .. _`run_op/task_options[negf]/self_energy_options/parallel/ek_batch_size`: 
 
@@ -1696,7 +1702,7 @@ run_op:
                     | type: ``int``, optional, default: ``200``
                     | argument path: ``run_op/task_options[negf]/self_energy_options/parallel/ek_batch_size``
 
-                    Batch size for (k, E) tasks handed to joblib. Larger = fewer batches, more memory. Default 200.
+                    Batch size for (k, E) tasks handed to joblib. Must be a positive integer, default 200. Larger values mean fewer batches and more memory. This also caps actual concurrency and therefore affects each worker's BLAS budget, including the last partial batch.
 
         .. _`run_op/task_options[negf]/espacing`: 
 
