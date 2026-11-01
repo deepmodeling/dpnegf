@@ -2,10 +2,10 @@
 
 import os
 import logging
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
-from copy import copy
+import multiprocessing as mp
+from multiprocessing.connection import wait
+import pickle
+import traceback
 from typing import Tuple, List, Any
 import datetime
 
@@ -98,79 +98,235 @@ def _rgf_chunk_size(runner, n_grid):
     return chunk
 
 
-def _make_rgf_worker(runner, device):
-    """Own mutable H/S, lead and Green's-function state on one device.
+def _cpu_payload(value):
+    """Keep CUDA tensors and storage handles out of process messages."""
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _cpu_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_cpu_payload(item) for item in value)
+    return value
 
-    The initialized model and other read-only inputs remain shared. Workers
-    only read H/S and self-energy caches; model inference runs in the parent.
+
+def _send_packet(connection, packet):
+    # Explicit bytes use ordinary pickle, avoiding torch's multiprocessing
+    # reducers and their shared-storage/file-descriptor lifetime requirements.
+    connection.send_bytes(pickle.dumps(packet, protocol=pickle.HIGHEST_PROTOCOL))
+
+
+def _recv_packet(connection):
+    return pickle.loads(connection.recv_bytes())
+
+
+def _rgf_worker_main(connection, device, spec):
+    """Spawn entry point: build an independent solver, then serve all k points."""
+    try:
+        from dpnegf.negf.rgf_solver import RGFSolver
+        torch.set_default_dtype(spec["default_dtype"])
+        torch.set_num_threads(1)
+        device = torch.device(device)
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        solver = RGFSolver.from_cache(spec, device)
+        _send_packet(connection, ("ready", os.getpid()))
+        while True:
+            command, args = _recv_packet(connection)
+            if command == "close":
+                break
+            if command == "chunk_size":
+                _send_packet(connection, ("chunk_size", _rgf_chunk_size(solver, *args)))
+            elif command == "solve":
+                index, energies, k, ik, bias, offset = args
+                outputs = solver.compute_rgf_chunk(energies, k, ik, bias, offset)
+                _send_packet(connection, ("result", index, _cpu_payload(outputs)))
+            else:
+                raise ValueError(f"Unknown RGF worker command: {command}")
+    except (EOFError, BrokenPipeError):
+        pass  # Parent closed or terminated the pool.
+    except BaseException as exc:
+        try:
+            _send_packet(connection, ("error", type(exc).__name__, str(exc), traceback.format_exc()))
+        except (OSError, EOFError):
+            pass
+    finally:
+        connection.close()
+
+
+class RGFWorkerError(RuntimeError):
+    """A spawned solver failed or exited before returning its result."""
+
+
+class RGFProcessPool:
+    """One persistent spawn process per device, with bounded in-flight batches.
+
+    Inputs contain only cache paths and numerical metadata. Replies may arrive
+    in any order; failures are observed immediately, even if an earlier batch
+    is still running. Results are merged and new work assigned in grid order.
     """
-    worker = copy(runner)
-    worker.out = {}
-    worker.rgf_device = device
-    worker.deviceprop = prop = copy(runner.deviceprop)
-    prop.rgf_device = device
-    prop.hamiltonian = copy(prop.hamiltonian)
-    if hasattr(prop.hamiltonian, "contact_metadata"):
-        prop.hamiltonian.contact_metadata = dict(prop.hamiltonian.contact_metadata)
-    for name in ("lead_L", "lead_R"):
-        lead = copy(getattr(prop, name))
-        lead.hamiltonian = prop.hamiltonian
-        setattr(prop, name, lead)
-    for name in ("hd", "sd", "hl", "su", "sl", "hu", "V", "oldV",
-                 "_orbital_mapping_snapshot"):
-        prop.__dict__.pop(name, None)
-    prop.kpoint = None
-    prop.release_greenfuncs()
-    return worker
 
+    def __init__(self, devices, spec):
+        if not devices:
+            raise ValueError("An RGF process pool requires at least one device.")
+        self.devices = [torch.device(device) for device in devices]
+        self.processes = []
+        self.connections = []
+        self.worker_pids = []
+        self.closed = False
+        context = mp.get_context("spawn")
+        try:
+            for device in self.devices:
+                parent, child = context.Pipe()
+                process = context.Process(target=_rgf_worker_main,
+                                          args=(child, str(device), spec))
+                try:
+                    process.start()
+                except BaseException:
+                    parent.close()
+                    raise
+                finally:
+                    child.close()
+                self.connections.append(parent)
+                self.processes.append(process)
+            ready = {}
+            while len(ready) < len(self.processes):
+                slot, packet = self._receive()
+                if packet[0] != "ready" or slot in ready:
+                    raise RGFWorkerError(f"Unexpected RGF startup reply: {packet[0]}")
+                ready[slot] = packet[1]
+            self.worker_pids = [ready[slot] for slot in range(len(self.processes))]
+        except BaseException:
+            self.terminate()
+            raise
 
-@torch.no_grad()
-def _run_rgf_worker_chunk(runner, e_chunk, k, ik, Vbias, energy_offset):
-    # CUDA current-device and autograd state are local to each thread.
-    context = (torch.cuda.device(runner.rgf_device)
-               if runner.rgf_device.type == "cuda" else nullcontext())
-    with context:
-        runner.out = {}
-        runner._compute_rgf_chunk(e_chunk, k, ik, Vbias, energy_offset)
-        return runner.out
+    @classmethod
+    def from_runner(cls, runner):
+        """Pass saved H/S paths and metadata; workers read the files themselves."""
+        from dpnegf.negf.rgf_solver import rgf_solver_options
+        prop = runner.deviceprop
+        ham = prop.hamiltonian
+        spec = _cpu_payload({
+            "default_dtype": torch.get_default_dtype(),
+            "options": rgf_solver_options(runner),
+            "hamiltonian": {
+                "cache_path": ham.saved_HS_path or ham.results_path,
+                "device_norbs": ham.device_norbs,
+                "input_orbital_mapping": getattr(ham, "_input_orbital_mapping", None),
+            },
+            "device": {name: getattr(prop, name) for name in (
+                "results_path", "e_T", "chemiPot", "E_ref")},
+            "leads": {
+                name: {key: getattr(getattr(prop, name), key) for key in (
+                    "voltage", "e_T", "efermi", "E_ref")}
+                for name in ("lead_L", "lead_R")
+            },
+        })
+        return cls(runner.rgf_devices, spec)
 
+    def _receive(self):
+        handles = self.connections + [process.sentinel for process in self.processes]
+        readable = wait(handles)
+        for slot, connection in enumerate(self.connections):
+            if connection in readable:
+                try:
+                    packet = _recv_packet(connection)
+                except (OSError, EOFError) as exc:
+                    raise RGFWorkerError(f"RGF worker on {self.devices[slot]} disconnected") from exc
+                if packet[0] == "error":
+                    _, kind, message, trace = packet
+                    raise RGFWorkerError(
+                        f"RGF worker on {self.devices[slot]} failed ({kind}): {message}\n{trace}")
+                return slot, packet
+        for slot, process in enumerate(self.processes):
+            if process.sentinel in readable:
+                raise RGFWorkerError(
+                    f"RGF worker on {self.devices[slot]} exited with code {process.exitcode}")
+        raise RGFWorkerError("No RGF worker reply was received")
 
-def _parallel_rgf_energy_loop(runner, k, ik, Vbias):
-    """Round-robin energy batches, with at most one live batch per GPU.
+    def run_energy_loop(self, grid, k, ik, bias, out):
+        if self.closed:
+            raise RuntimeError("RGF process pool is closed")
+        try:
+            per_device = max(1, len(grid) // len(self.processes))
+            for connection in self.connections:
+                _send_packet(connection, ("chunk_size", (per_device,)))
+            caps = {}
+            while len(caps) < len(self.processes):
+                slot, packet = self._receive()
+                if packet[0] != "chunk_size" or slot in caps:
+                    raise RGFWorkerError(f"Unexpected RGF batch-size reply: {packet[0]}")
+                caps[slot] = packet[1]
+            chunk = min(caps.values())
+            log.info("Multi-GPU RGF spawn workers %s on %s; e_batch_size=%s per GPU",
+                     self.worker_pids, [str(device) for device in self.devices], chunk)
+            batches = iter(enumerate(torch.split(grid.detach().cpu(), chunk)))
+            active, completed = {}, {}
 
-    Consume futures in submission order so all outputs, including channel
-    file indices, retain the original energy-grid order. Only reduced CPU
-    results cross thread boundaries; Green's functions stay on their GPU.
-    """
-    workers = [_make_rgf_worker(runner, device) for device in runner.rgf_devices]
-    n_grid = len(runner.uni_grid)
-    # Automatic batches leave enough work for every selected GPU.
-    per_device = max(1, n_grid // len(workers))
-    chunk = min(_rgf_chunk_size(worker, per_device) for worker in workers)
-    log.info("Multi-GPU RGF on %s; e_batch_size=%s per GPU",
-             [str(device) for device in runner.rgf_devices], chunk)
-    batches = iter(enumerate(torch.split(runner.uni_grid, chunk)))
+            def submit(slot):
+                item = next(batches, None)
+                if item is None:
+                    return
+                index, energies = item
+                _send_packet(self.connections[slot], ("solve", (
+                    index, energies, _cpu_payload(k), ik, _cpu_payload(bias), index * chunk)))
+                active[slot] = index
 
-    with ThreadPoolExecutor(max_workers=len(workers)) as pool:
-        pending = deque()
+            for slot in range(len(self.processes)):
+                submit(slot)
+            next_index = 0
+            while active:
+                slot, packet = self._receive()
+                if packet[0] != "result" or active.get(slot) != packet[1]:
+                    raise RGFWorkerError(f"Unexpected RGF result: {packet[0]}")
+                completed[packet[1]] = (slot, packet[2])
+                while next_index in completed:
+                    slot, outputs = completed.pop(next_index)
+                    for name, by_k in outputs.items():
+                        out.setdefault(name, {}).setdefault(str(k), []).extend(by_k[str(k)])
+                    del active[slot]
+                    submit(slot)
+                    next_index += 1
+        except BaseException:
+            self.terminate()
+            raise
 
-        def submit(worker):
-            item = next(batches, None)
-            if item is None:
-                return
-            index, energies = item
-            future = pool.submit(_run_rgf_worker_chunk, worker,
-                                 energies, k, ik, Vbias, index * chunk)
-            pending.append((worker, future))
+    def terminate(self):
+        """Stop all workers, including peers blocked in a solver or IPC send."""
+        if self.closed:
+            return
+        self.closed = True
+        for process in self.processes:
+            if process.is_alive():
+                process.terminate()
+        for process in self.processes:
+            process.join(timeout=2)
+        for process in self.processes:
+            if process.is_alive():
+                process.kill()
+        for process in self.processes:
+            process.join(timeout=2)
+        for connection in self.connections:
+            connection.close()
 
-        for worker in workers:
-            submit(worker)
-        while pending:
-            worker, future = pending.popleft()
-            outputs = future.result()
-            for name, by_k in outputs.items():
-                runner.out.setdefault(name, {}).setdefault(str(k), []).extend(by_k[str(k)])
-            submit(worker)
+    def close(self):
+        if self.closed:
+            return
+        try:
+            for connection in self.connections:
+                _send_packet(connection, ("close", ()))
+            for process in self.processes:
+                process.join(timeout=2)
+        finally:
+            self.terminate()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.close()
+        else:
+            self.terminate()
 
 
 class MPIMultiLevel:
