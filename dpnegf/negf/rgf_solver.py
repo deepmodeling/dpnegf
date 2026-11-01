@@ -42,6 +42,9 @@ class RGFSolver:
         self.rgf_device = torch.device(deviceprop.rgf_device)
         self.e_batch_size = options["e_batch_size"]
         self.block_tridiagonal = options["block_tridiagonal"]
+        self.need_trans_eigs = options.get("need_trans_eigs", False)
+        self.out_trans_eigchannel = options.get("out_trans_eigchannel", False)
+        self.trans_eigs_options = options.get("trans_eigs_options", {})
 
     @classmethod
     def from_cache(cls, spec, device):

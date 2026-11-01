@@ -9,6 +9,8 @@ It also pins the runner-style chunking behavior (split [E] into chunks of size
 e_batch_size, cat the per-chunk outputs back together).
 """
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -77,6 +79,34 @@ def _block_sizes_match_se(left_se_2d, right_se_2d, block_sizes):
     # builder, block_sizes[0] == left_se size and block_sizes[-1] == right_se size.
     assert left_se_2d.shape == (block_sizes[0], block_sizes[0])
     assert right_se_2d.shape == (block_sizes[-1], block_sizes[-1])
+
+
+@pytest.mark.parametrize("change", ["kpoint", "bias", "layout"])
+def test_prepared_hamiltonian_is_reused_until_context_changes(tmp_path, change):
+    sizes = [3, 4, 2]
+    hd, sd, hl, hu, sl, su, se_l, se_r, energies = _make_btd_inputs(1, sizes, seed=11)
+    dev = _make_deviceprop(sizes, hd, sd, hl, hu, sl, su)
+    dev.results_path = str(tmp_path)
+    load = Mock(wraps=dev.hamiltonian.get_hs_device)
+    dev.hamiltonian.get_hs_device = load
+    k, bias = [0., 0., 0.], torch.tensor(0.1)
+
+    dev.prepare_hamiltonian(k, True, bias)
+    resident = dev.hd
+    dev.lead_L.se, dev.lead_R.se = se_l[0], se_r[0]
+    dev.cal_green_function(energies[0], k, Vbias=bias)
+    dev.prepare_hamiltonian(k, True, bias)
+    assert load.call_count == 1
+    assert dev.hd is resident
+    dev.release_greenfuncs()
+
+    if change == "kpoint":
+        k = [0.5, 0., 0.]
+    elif change == "bias":
+        bias = torch.tensor(0.2)
+    dev.prepare_hamiltonian(k, change != "layout", bias)
+    assert load.call_count == 2
+    assert dev.hd is not resident
 
 
 def _run_scalar(dev, energies_1d, left_se_batched, right_se_batched, need_lesser):

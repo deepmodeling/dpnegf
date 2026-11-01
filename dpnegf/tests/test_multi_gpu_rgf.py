@@ -57,9 +57,15 @@ def _protocol_worker(connection, device, spec):
             if command == "close":
                 return
             if command == "chunk_size":
+                _, prepared_k, prepared_bias = args
                 send(connection, ("chunk_size", spec.get("batch", args[0])))
                 continue
             index, energies, k, ik, bias, offset = args
+            assert k == prepared_k
+            if bias is None:
+                assert prepared_bias is None
+            else:
+                torch.testing.assert_close(bias, prepared_bias)
             if mode in ("error", "exit"):
                 if offset == 0:
                     # The earlier worker never returns; its peer must still be observed.
@@ -147,7 +153,7 @@ def test_real_cache_solver_reports_missing_cache_and_reaps_workers(tmp_path):
                   for name in ("lead_L", "lead_R")},
     }
     pool = RGFProcessPool(["cpu", "cpu"], spec)
-    with pytest.raises(RGFWorkerError, match="FileNotFoundError.*prepared self-energy cache"):
+    with pytest.raises(RGFWorkerError, match="FileNotFoundError.*HS_device"):
         pool.run_energy_loop(torch.arange(3), [0, 0, 0], 0, None, {})
     assert pool.closed
     assert all(not process.is_alive() for process in pool.processes)

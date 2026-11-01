@@ -997,7 +997,7 @@ class NEGF(object):
                         if rgf_pool is not None:
                             rgf_pool.run_energy_loop(self.uni_grid, k, ik, Vbias, self.out)
                         else:
-                            chunk = _rgf_chunk_size(self, len(self.uni_grid))
+                            chunk = _rgf_chunk_size(self, len(self.uni_grid), k, Vbias)
                             for e_chunk in torch.split(self.uni_grid, chunk):
                                 self.compute_rgf_chunk(e_chunk, k, ik, Vbias)
 
