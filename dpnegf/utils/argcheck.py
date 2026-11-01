@@ -104,6 +104,12 @@ def energy_grid_options():
             Argument("half_width", [int, float], optional=True, default=0.4,
                      doc="Half window in eV about each mu. Tails are not extrapolated or renormalized."),
         ]),
+        Argument("direct", dict, [
+            Argument("energies", list, optional=False, alias=["enerigies"],
+                     doc="Nonempty list of finite energies relative to E_ref in unit. "
+                         "Values and order are preserved, including a single point. "
+                         "Conductance requires at least two strictly increasing points."),
+        ]),
     ], optional=True, default_tag="uniform")
 
 
@@ -121,13 +127,17 @@ def conductance_options():
 def validate_energy_options(task):
     """Cross-field validation shared by normalized JSON and the Python API."""
     import numpy as np
-    from dpnegf.utils.energy_grid import uniform_nodes, clenshaw_curtis_nodes
+    from dpnegf.utils.energy_grid import uniform_nodes, clenshaw_curtis_nodes, direct_nodes, trapezoid_weights
 
     grid = task["energy_grid"]
     method = grid.get("method", "uniform")
     conductance = task.get("output_options", {}).get("conductance", False)
     if method == "uniform":
         uniform_nodes(grid)
+    elif method == "direct":
+        energies = direct_nodes(grid)
+        if conductance:
+            trapezoid_weights(energies)
     elif method == "clenshaw_curtis":
         clenshaw_curtis_nodes(grid.get("num_points", 33), task["ele_T"], grid.get("half_width", 0.4))
     else:
@@ -206,7 +216,8 @@ def negf():
         Argument("poisson_options", dict, optional=True, default={}, sub_fields=[], sub_variants=[poisson_options()], doc=doc_poisson_options),
         Argument("self_energy_options", dict, optional=True, default={}, sub_fields=self_energy_options(), doc=doc_self_energy_options),
         Argument("energy_grid", dict, optional=True, default={}, sub_fields=[], sub_variants=[energy_grid_options()], 
-                 doc="Fixed transmission grad. Legacy emin/emax/espacing migrate to uniform. CC uses eV relative to E_ref."),
+                 doc="Fixed transmission grid. Legacy emin/emax/espacing migrate to uniform. "
+                     "Direct uses explicit energies in unit relative to E_ref. CC uses eV relative to E_ref."),
         Argument("conductance_options", dict, optional=True, default={}, 
                  sub_fields=conductance_options(), doc="Finite-temperature Landauer integration targets"),
         Argument("rgf_options", dict, optional=True, default={}, sub_fields=rgf_options_group(), doc=doc_rgf_options),
