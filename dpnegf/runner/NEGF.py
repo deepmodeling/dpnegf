@@ -23,6 +23,11 @@ from dpnegf.utils.band_edge import validate_fermi_in_band_gap
 from dpnegf.utils.energy_grid import build_energy_grid, uniform_nodes
 from dpnegf.utils.conductance import integrate_conductance
 from dpnegf.utils.argcheck import validate_energy_options
+from dpnegf.utils.parrallel import (
+    _rgf_devices,
+    _rgf_chunk_size,
+    _parallel_rgf_energy_loop,
+)
 from dpnegf.negf.poisson_init import Grid,Interface3D,Dirichlet,Dielectric
 from dpnegf.negf.scf_method import PDIISMixer,DIISMixer,BroydenFirstMixer,BroydenSecondMixer,AndersonMixer
 
@@ -151,11 +156,17 @@ class NEGF(object):
         # --- unpack the three nested option groups added in the schema refactor ---
         # rgf_options: device placement and energy-loop chunking for the RGF sweep
         rgf_options = dict(rgf_options or {})
-        rgf_device = rgf_options.get("device", "cpu")
-        if isinstance(rgf_device, str):
-            rgf_device = torch.device(rgf_device)
-        self.rgf_device = rgf_device
+        self.rgf_devices = _rgf_devices(rgf_options)
+        self.rgf_device = self.rgf_devices[0]
+        if len(self.rgf_devices) > 1 and scf:
+            raise ValueError("Multi-GPU RGF currently requires scf=false.")
         self.e_batch_size = rgf_options.get("e_batch_size", None)
+        if self.e_batch_size is not None:
+            batch = self.e_batch_size
+            if (isinstance(batch, bool) or not isinstance(batch, (int, float))
+                    or not np.isfinite(batch) or batch < 1 or int(batch) != batch):
+                raise ValueError("rgf_options.e_batch_size must be a positive integer or None.")
+            self.e_batch_size = int(batch)
 
         # self_energy_options: solver, cache, and CPU parallelism for the SE sweep
         se_opts = dict(self_energy_options or {})
@@ -821,83 +832,66 @@ class NEGF(object):
 
 
 
-    def _auto_chunk_size(self, n_grid):
-        """Pick a chunk size from free CUDA memory when the user didn't set
-        ``e_batch_size``. Returns the full grid length on CPU / when the
-        device geometry isn't probable yet.
-
-        Per-energy peak (post per-slot-release, complex128) approximated as
-            bytes_per_E ~= C * K * n_max**2 * 16
-        with C bundling the live tensors in the worst backward-sweep slot
-        (grd full + grl + gru full + decaying gr_left tail + gU + transients
-        + the K-resident H/S diagonal & off-diagonal lists that survive across
-        chunks). C=14 with a 0.5x free-memory budget; deliberately conservative
-        because without expandable_segments the allocator can't defragment on
-        demand, and on real workloads (CNT10/long6) the previous 10x / 0.7
-        combination still picked a chunk that OOM'd on a 15.77 GiB V100.
-        """
-        rgf_dev = self.rgf_device
-        if not (isinstance(rgf_dev, torch.device) and rgf_dev.type == "cuda"):
-            return n_grid
-        try:
-            free_bytes, _total = torch.cuda.mem_get_info(rgf_dev)
-            n_max = max(int(b.shape[-1]) for b in self.deviceprop.hd)
-            K = len(self.deviceprop.hd)
-        except Exception:
-            return n_grid
-        per_e = 14 * K * (n_max ** 2) * 16
-        if per_e <= 0:
-            return n_grid
-        b = max(1, min(n_grid, int(0.5 * free_bytes) // per_e))
+    def compute_rgf_chunk(self, e_chunk, k, ik, Vbias, energy_offset=0):
+        """Solve one energy batch and append CPU outputs in energy order."""
+        e_batch_size = len(e_chunk)
         log.info(
-            f"auto e_batch_size={b} (free={free_bytes/2**30:.2f} GiB, "
-            f"per_E~={per_e/2**20:.1f} MiB, K={K}, n_max={n_max})"
+            f"computing green's functions on {self.rgf_device} for chunk "
+            f"e=[{float(e_chunk[0]):>6.3f}..{float(e_chunk[-1]):>6.3f}], B={e_batch_size}"
         )
-        return b
+        seL_list, seR_list = [], []
+        try:
+            for e in e_chunk:
+                for ll in self.stru_options.keys():
+                    if ll.startswith("lead"):
+                        getattr(self.deviceprop, ll).self_energy(
+                            energy=e,
+                            kpoint=k,
+                            eta_lead=self.eta_lead,
+                            method=self.sgf_solver,
+                            save_path=self.self_energy_save_path,
+                            save_format=self.se_cache_format,
+                            se_info_display=self.se_info_display
+                            )
+                seL_list.append(self.deviceprop.lead_L.se)
+                seR_list.append(self.deviceprop.lead_R.se)
 
-    def _store_trans_eigs(self, k, ik):
-        """Save each channel energy immediately; keep only a file index in out."""
-        options = dict(self.trans_eigs_options)
-        if not self.out_trans_eigchannel:
-            for key in ("n_channels", "channel_indices", "return_format"):
-                options.pop(key, None)
-        self.deviceprop._trans_eigs_eta_lead = self.eta_lead
-        results = self.deviceprop.iter_transmission_eigs(
-            channels=self.out_trans_eigchannel, **options)
-        def cpu(value):
-            if torch.is_tensor(value):
-                # Own the storage, including scalar views into an energy batch.
-                return value.detach().to(device="cpu", copy=True)
-            if isinstance(value, dict):
-                return {key: cpu(item) for key, item in value.items()}
-            if isinstance(value, list):
-                return [cpu(item) for item in value]
-            return value
-        for result in results:
-            result = cpu(result)
-            if self.out_trans_eigvals:
-                values = {key: value for key, value in result.items()
-                          if key not in ("coefficients", "selected_indices", "tau_selected")}
-                self.out.setdefault("trans_eigvals", {}).setdefault(str(k), []).append(values)
-            if self.out_trans_eigchannel:
-                mapping = result.get("orbital_mapping", {"status": "unknown"})
-                known = mapping["status"] == "known"
-                result["orbital_atoms"] = (torch.repeat_interleave(
-                    torch.arange(len(mapping["atom_norbs"])),
-                    torch.tensor(mapping["atom_norbs"])) if known else None)
-                result["orbital_atoms_order"] = "original" if known else None
-                result["device_atom_start"] = mapping["device_id"][0] if known else None
-                result["block_atom_map"] = torch.tensor(mapping["atom_map"]) if known else None
-                records = self.out.setdefault("trans_eigchannel", {}).setdefault(str(k), [])
-                relative = os.path.join("trans_eigchannel", f"k{ik:06d}", f"e{len(records):08d}.pth")
-                target = os.path.join(self.results_path, relative)
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                torch.save(result, target + ".tmp")
-                os.replace(target + ".tmp", target)
-                records.append({"energy": result["energy"], "kpoint": result["kpoint"],
-                                "path": relative})
-            # Release coefficients before requesting the next energy from the iterator.
-            del result
+            if e_batch_size > 1:
+                self.deviceprop.lead_L.se = torch.stack(seL_list, dim=0)
+                self.deviceprop.lead_R.se = torch.stack(seR_list, dim=0)
+            # else: leave the per-E [n,n] in place — preserves scalar contract exactly.
+
+            self.deviceprop.cal_green_function(
+                energy=e_chunk, kpoint=k,
+                eta_device=self.eta_device,
+                block_tridiagonal=self.block_tridiagonal,
+                Vbias=Vbias,
+                need_lesser=False,
+                need_greater=False,
+                need_gr_lc=False, # set to False for memory saving, can be set to True for lead spectral function G^r * \Gamma * G^a
+                gf_cal_mode=self.gf_cal_mode,
+                need_trans_eigs=self.need_trans_eigs,
+                )
+
+            if self.need_trans_eigs:
+                self.store_trans_eigs(k, ik, energy_offset=energy_offset)
+            if self.out_dos:
+                self.out.setdefault('DOS', {}).setdefault(str(k), []).append(self.compute_DOS(k).reshape(-1).cpu())
+            if self.out_tc or self.out_current_nscf:
+                self.out.setdefault('T_k', {}).setdefault(str(k), []).append(self.compute_TC(k).reshape(-1).cpu())
+            if self.out_ldos:
+                ldos_chunk = self.compute_LDOS(k)
+                if ldos_chunk.ndim == 1:  # scalar-E chunk → [na]
+                    ldos_chunk = ldos_chunk.unsqueeze(0)
+                self.out.setdefault('LDOS', {}).setdefault(str(k), []).append(ldos_chunk.cpu())
+
+        finally:
+            self.deviceprop.release_greenfuncs()
+            if seL_list:
+                self.deviceprop.lead_L.se = seL_list[-1]
+            if seR_list:
+                self.deviceprop.lead_R.se = seR_list[-1]
+            del seL_list, seR_list
 
     def negf_compute(self,scf_require=False,Vbias=None):
         
@@ -1019,7 +1013,7 @@ class NEGF(object):
                                 )
 
                             if self.need_trans_eigs:
-                                self._store_trans_eigs(k, ik)
+                                self.store_trans_eigs(k, ik)
                             if self.out_dos:
                                 self.out.setdefault('DOS', {}).setdefault(str(k), []).append(self.compute_DOS(k))
                             if self.out_tc or self.out_current_nscf:
@@ -1027,83 +1021,13 @@ class NEGF(object):
                             if self.out_ldos:
                                 self.out.setdefault('LDOS', {}).setdefault(str(k), []).append(self.compute_LDOS(k))
                     else:
-                        # Non-SCF: solve a whole chunk of energies in one batched recursive_gf call.
-                        if self.e_batch_size is not None:
-                            chunk = self.e_batch_size
-                            # The user-supplied value bypasses the auto-budget.
-                            rgf_dev = self.rgf_device
-                            if isinstance(rgf_dev, torch.device) and rgf_dev.type == "cuda":
-                                cap = self._auto_chunk_size(len(self.uni_grid))
-                                if chunk > cap:
-                                    log.warning(
-                                        f"user e_batch_size={chunk} exceeds the "
-                                        f"CUDA auto-cap={cap} on {rgf_dev}; "
-                                    )
+                        if len(self.rgf_devices) > 1:
+                            _parallel_rgf_energy_loop(self, k, ik, Vbias)
                         else:
-                            chunk = self._auto_chunk_size(len(self.uni_grid))
-                        log.info(f"Using e_batch_size={chunk} for energy loop with {len(self.uni_grid)} points")
+                            chunk = _rgf_chunk_size(self, len(self.uni_grid))
+                            for e_chunk in torch.split(self.uni_grid, chunk):
+                                self.compute_rgf_chunk(e_chunk, k, ik, Vbias)
 
-                        for e_chunk in torch.split(self.uni_grid, chunk):
-                            e_batch_size = len(e_chunk)
-                            log.info(
-                                f"computing green's functions for chunk e=[{float(e_chunk[0]):>6.3f}..{float(e_chunk[-1]):>6.3f}], B={e_batch_size}"
-                            )
-                            seL_list, seR_list = [], []
-                            try:
-                                for e in e_chunk:
-                                    for ll in self.stru_options.keys():
-                                        if ll.startswith("lead"):
-                                            getattr(self.deviceprop, ll).self_energy(
-                                                energy=e,
-                                                kpoint=k,
-                                                eta_lead=self.eta_lead,
-                                                method=self.sgf_solver,
-                                                save_path=self.self_energy_save_path,
-                                                save_format=self.se_cache_format,
-                                                se_info_display=self.se_info_display
-                                                )
-                                    seL_list.append(self.deviceprop.lead_L.se)
-                                    seR_list.append(self.deviceprop.lead_R.se)
-
-                                if e_batch_size > 1:
-                                    self.deviceprop.lead_L.se = torch.stack(seL_list, dim=0)
-                                    self.deviceprop.lead_R.se = torch.stack(seR_list, dim=0)
-                                # else: leave the per-E [n,n] in place — preserves scalar contract exactly.
-
-                                self.deviceprop.cal_green_function(
-                                    energy=e_chunk, kpoint=k,
-                                    eta_device=self.eta_device,
-                                    block_tridiagonal=self.block_tridiagonal,
-                                    Vbias=Vbias,
-                                    need_lesser=False,
-                                    need_greater=False,
-                                    need_gr_lc=False, # set to False for memory saving, can be set to True for lead spectral function G^r * \Gamma * G^a
-                                    gf_cal_mode=self.gf_cal_mode,
-                                    need_trans_eigs=self.need_trans_eigs,
-                                    )
-
-                                if self.need_trans_eigs:
-                                    self._store_trans_eigs(k, ik)
-                                if self.out_dos:
-                                    self.out.setdefault('DOS', {}).setdefault(str(k), []).append(self.compute_DOS(k).reshape(-1).cpu())
-                                if self.out_tc or self.out_current_nscf:
-                                    self.out.setdefault('T_k', {}).setdefault(str(k), []).append(self.compute_TC(k).reshape(-1).cpu())
-                                if self.out_ldos:
-                                    ldos_chunk = self.compute_LDOS(k)
-                                    if ldos_chunk.ndim == 1:  # scalar-E chunk → [na]
-                                        ldos_chunk = ldos_chunk.unsqueeze(0)
-                                    self.out.setdefault('LDOS', {}).setdefault(str(k), []).append(ldos_chunk.cpu())
-
-                            finally:
-                                self.deviceprop.release_greenfuncs()
-                                if seL_list:
-                                    self.deviceprop.lead_L.se = seL_list[-1]
-                                if seR_list:
-                                    self.deviceprop.lead_R.se = seR_list[-1]
-                                del seL_list, seR_list
-                                
-                        
-                            
                     # over energy loop in uni_gird
                     # The following code is for output properties before NEGF ends
                     # TODO: check following code for multiple k points calculation
@@ -1317,6 +1241,16 @@ class NEGF(object):
     def compute_TC(self, kpoint):
         return self.deviceprop.tc
     
+    def store_trans_eigs(self, kpoint, ik, energy_offset=0):
+        return self.deviceprop.store_trans_eigs(
+            kpoint, ik, self.out,
+            trans_eigs_options=self.trans_eigs_options,
+            out_trans_eigvals=self.out_trans_eigvals,
+            out_trans_eigchannel=self.out_trans_eigchannel,
+            eta_lead=self.eta_lead,
+            energy_offset=energy_offset,
+        )
+
     def compute_LDOS(self, kpoint):
         return self.deviceprop.ldos
     

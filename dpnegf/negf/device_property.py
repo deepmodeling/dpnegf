@@ -380,6 +380,57 @@ class DeviceProperty(object):
             yield result
             del result
 
+    def store_trans_eigs(self, kpoint, ik, out, *, trans_eigs_options=None,
+                         out_trans_eigvals=False, out_trans_eigchannel=False,
+                         eta_lead=None, energy_offset=0):
+        """Save channels one energy at a time and append CPU records to ``out``.
+
+        Channel files use this device's results_path. The caller supplies the
+        output dictionary and energy offset so serial batches and parallel
+        workers preserve the same file numbering without retaining channels.
+        """
+        options = dict(trans_eigs_options or {})
+        if not out_trans_eigchannel:
+            for key in ("n_channels", "channel_indices", "return_format"):
+                options.pop(key, None)
+        self._trans_eigs_eta_lead = eta_lead
+        results = self.iter_transmission_eigs(
+            channels=out_trans_eigchannel, **options)
+        def cpu(value):
+            if torch.is_tensor(value):
+                # Own the storage, including scalar views into an energy batch.
+                return value.detach().to(device="cpu", copy=True)
+            if isinstance(value, dict):
+                return {key: cpu(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [cpu(item) for item in value]
+            return value
+        for result in results:
+            result = cpu(result)
+            if out_trans_eigvals:
+                values = {key: value for key, value in result.items()
+                          if key not in ("coefficients", "selected_indices", "tau_selected")}
+                out.setdefault("trans_eigvals", {}).setdefault(str(kpoint), []).append(values)
+            if out_trans_eigchannel:
+                mapping = result.get("orbital_mapping", {"status": "unknown"})
+                known = mapping["status"] == "known"
+                result["orbital_atoms"] = (torch.repeat_interleave(
+                    torch.arange(len(mapping["atom_norbs"])),
+                    torch.tensor(mapping["atom_norbs"])) if known else None)
+                result["orbital_atoms_order"] = "original" if known else None
+                result["device_atom_start"] = mapping["device_id"][0] if known else None
+                result["block_atom_map"] = torch.tensor(mapping["atom_map"]) if known else None
+                records = out.setdefault("trans_eigchannel", {}).setdefault(str(kpoint), [])
+                relative = os.path.join("trans_eigchannel", f"k{ik:06d}", f"e{energy_offset + len(records):08d}.pth")
+                target = os.path.join(self.results_path, relative)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                torch.save(result, target + ".tmp")
+                os.replace(target + ".tmp", target)
+                records.append({"energy": result["energy"], "kpoint": result["kpoint"],
+                                "path": relative})
+            # Release coefficients before requesting the next energy from the iterator.
+            del result
+
     def release_greenfuncs(self, empty_cache: bool=False):
         '''Drop the Green's-function dict so the underlying rgf_device storage
         can be freed before the next energy chunk. H/S blocks are kept resident

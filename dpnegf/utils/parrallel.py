@@ -1,10 +1,17 @@
 """Functions and classes for the parallel environment."""
 
 import os
+import logging
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from copy import copy
 from typing import Tuple, List, Any
 import datetime
 
 import numpy as np
+import torch
+
 try:
     from mpi4py import MPI
 except ImportError:
@@ -12,6 +19,158 @@ except ImportError:
 
 
 __all__ = ["MPIEnv"]
+
+log = logging.getLogger(__name__)
+
+
+def _rgf_devices(options):
+    """Resolve an optional explicit list of logical CUDA devices."""
+    devices = options.get("devices")
+    if devices is None:
+        return [torch.device(options.get("device", "cpu"))]
+    if not isinstance(devices, list) or not devices:
+        raise ValueError("rgf_options.devices must be a non-empty list of CUDA devices.")
+    resolved = []
+    for value in devices:
+        if not isinstance(value, str):
+            raise ValueError("rgf_options.devices entries must be strings such as 'cuda:0'.")
+        device = torch.device(value)
+        if device.type != "cuda" or device.index is None:
+            raise ValueError("rgf_options.devices requires explicit CUDA indices, e.g. 'cuda:0'.")
+        if device in resolved:
+            raise ValueError(f"Duplicate RGF device: {device}.")
+        if device.index >= torch.cuda.device_count():
+            raise ValueError(f"RGF CUDA device is unavailable: {device}.")
+        resolved.append(device)
+    return resolved
+
+
+def _auto_chunk_size(runner, n_grid):
+    """Pick a chunk size from free CUDA memory when the user didn't set
+    ``e_batch_size``. Returns the full grid length on CPU / when the
+    device geometry isn't probable yet.
+
+    Per-energy peak (post per-slot-release, complex128) approximated as
+        bytes_per_E ~= C * K * n_max**2 * 16
+    with C bundling the live tensors in the worst backward-sweep slot
+    (grd full + grl + gru full + decaying gr_left tail + gU + transients
+    + the K-resident H/S diagonal & off-diagonal lists that survive across
+    chunks). C=14 with a 0.5x free-memory budget; deliberately conservative
+    because without expandable_segments the allocator can't defragment on
+    demand, and on real workloads (CNT10/long6) the previous 10x / 0.7
+    combination still picked a chunk that OOM'd on a 15.77 GiB V100.
+    """
+    rgf_dev = runner.rgf_device
+    if not (isinstance(rgf_dev, torch.device) and rgf_dev.type == "cuda"):
+        return n_grid
+    try:
+        free_bytes, _total = torch.cuda.mem_get_info(rgf_dev)
+        if hasattr(runner.deviceprop, "hd"):
+            sizes = [int(b.shape[-1]) for b in runner.deviceprop.hd]
+        else:
+            # Read geometry without allocating H/S on a GPU before the first batch.
+            sizes = runner.deviceprop.hamiltonian.get_hs_device(only_subblocks=True)
+            if not runner.block_tridiagonal:
+                sizes = [sum(sizes)]
+        n_max = max(sizes)
+        K = len(sizes)
+    except Exception:
+        return n_grid
+    per_e = 14 * K * (n_max ** 2) * 16
+    if per_e <= 0:
+        return n_grid
+    b = max(1, min(n_grid, int(0.5 * free_bytes) // per_e))
+    log.info(
+        f"auto e_batch_size={b} (free={free_bytes/2**30:.2f} GiB, "
+        f"per_E~={per_e/2**20:.1f} MiB, K={K}, n_max={n_max})"
+    )
+    return b
+
+
+def _rgf_chunk_size(runner, n_grid):
+    cap = _auto_chunk_size(runner, n_grid)
+    chunk = runner.e_batch_size if runner.e_batch_size is not None else cap
+    if runner.e_batch_size is not None and runner.rgf_device.type == "cuda" and chunk > cap:
+        log.warning("user e_batch_size=%s exceeds CUDA auto-cap=%s on %s",
+                    chunk, cap, runner.rgf_device)
+    log.info("Using e_batch_size=%s on %s for %s energy points",
+             chunk, runner.rgf_device, n_grid)
+    return chunk
+
+
+def _make_rgf_worker(runner, device):
+    """Own mutable H/S, lead and Green's-function state on one device.
+
+    The initialized model and other read-only inputs remain shared. Workers
+    only read H/S and self-energy caches; model inference runs in the parent.
+    """
+    worker = copy(runner)
+    worker.out = {}
+    worker.rgf_device = device
+    worker.deviceprop = prop = copy(runner.deviceprop)
+    prop.rgf_device = device
+    prop.hamiltonian = copy(prop.hamiltonian)
+    if hasattr(prop.hamiltonian, "contact_metadata"):
+        prop.hamiltonian.contact_metadata = dict(prop.hamiltonian.contact_metadata)
+    for name in ("lead_L", "lead_R"):
+        lead = copy(getattr(prop, name))
+        lead.hamiltonian = prop.hamiltonian
+        setattr(prop, name, lead)
+    for name in ("hd", "sd", "hl", "su", "sl", "hu", "V", "oldV",
+                 "_orbital_mapping_snapshot"):
+        prop.__dict__.pop(name, None)
+    prop.kpoint = None
+    prop.release_greenfuncs()
+    return worker
+
+
+@torch.no_grad()
+def _run_rgf_worker_chunk(runner, e_chunk, k, ik, Vbias, energy_offset):
+    # CUDA current-device and autograd state are local to each thread.
+    context = (torch.cuda.device(runner.rgf_device)
+               if runner.rgf_device.type == "cuda" else nullcontext())
+    with context:
+        runner.out = {}
+        runner._compute_rgf_chunk(e_chunk, k, ik, Vbias, energy_offset)
+        return runner.out
+
+
+def _parallel_rgf_energy_loop(runner, k, ik, Vbias):
+    """Round-robin energy batches, with at most one live batch per GPU.
+
+    Consume futures in submission order so all outputs, including channel
+    file indices, retain the original energy-grid order. Only reduced CPU
+    results cross thread boundaries; Green's functions stay on their GPU.
+    """
+    workers = [_make_rgf_worker(runner, device) for device in runner.rgf_devices]
+    n_grid = len(runner.uni_grid)
+    # Automatic batches leave enough work for every selected GPU.
+    per_device = max(1, n_grid // len(workers))
+    chunk = min(_rgf_chunk_size(worker, per_device) for worker in workers)
+    log.info("Multi-GPU RGF on %s; e_batch_size=%s per GPU",
+             [str(device) for device in runner.rgf_devices], chunk)
+    batches = iter(enumerate(torch.split(runner.uni_grid, chunk)))
+
+    with ThreadPoolExecutor(max_workers=len(workers)) as pool:
+        pending = deque()
+
+        def submit(worker):
+            item = next(batches, None)
+            if item is None:
+                return
+            index, energies = item
+            future = pool.submit(_run_rgf_worker_chunk, worker,
+                                 energies, k, ik, Vbias, index * chunk)
+            pending.append((worker, future))
+
+        for worker in workers:
+            submit(worker)
+        while pending:
+            worker, future = pending.popleft()
+            outputs = future.result()
+            for name, by_k in outputs.items():
+                runner.out.setdefault(name, {}).setdefault(str(k), []).extend(by_k[str(k)])
+            submit(worker)
 
 
 class MPIMultiLevel:

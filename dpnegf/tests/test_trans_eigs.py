@@ -368,7 +368,7 @@ def test_input_json_runner(tmp_path, outputs, btd, chunk):
 
 def test_runner_streams_saves_and_releases_each_energy(tmp_path, monkeypatch):
     import weakref
-    from types import SimpleNamespace
+    from dpnegf.negf.device_property import DeviceProperty
     from dpnegf.runner.NEGF import NEGF
     raw_refs, saved_refs = [], []
     def make_record(i):
@@ -397,10 +397,10 @@ def test_runner_streams_saves_and_releases_each_energy(tmp_path, monkeypatch):
     runner.eta_lead = 1e-5
     runner.results_path = str(tmp_path)
     runner.out = {}
-    runner.deviceprop = SimpleNamespace(iter_transmission_eigs=iterator)
-    runner.negf_hamiltonian = SimpleNamespace(device_original_norbs=[2, 2],
-                                             device_id=[4, 6], device_atom_map=[0, 1])
-    runner._store_trans_eigs('k', 0)
+    runner.deviceprop = DeviceProperty.__new__(DeviceProperty)
+    runner.deviceprop.results_path = str(tmp_path)
+    runner.deviceprop.iter_transmission_eigs = iterator
+    runner.store_trans_eigs('k', 0)
     assert all(ref() is None for ref in raw_refs + saved_refs)
     assert len(runner.out['trans_eigchannel']['k']) == 3
     assert all('coefficients' not in r for r in runner.out['trans_eigvals']['k'])

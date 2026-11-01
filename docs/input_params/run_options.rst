@@ -1728,7 +1728,7 @@ run_op:
             | type: ``dict``, optional, default: ``{}``
             | argument path: ``run_op/task_options[negf]/rgf_options``
 
-            Recursive Green's function stage options: compute device ('cpu' or 'cuda') and energy-loop chunk size. Independent from the self-energy pool, which always runs on CPU.
+            Recursive Green's function stage options: compute device ('cpu' or 'cuda[:index]'), optional multiple CUDA devices, and energy-loop chunk size. Independent from the self-energy pool, which always runs on CPU.
 
             .. _`run_op/task_options[negf]/rgf_options/device`: 
 
@@ -1736,7 +1736,15 @@ run_op:
                 | type: ``str``, optional, default: ``cpu``
                 | argument path: ``run_op/task_options[negf]/rgf_options/device``
 
-                Device used only for the RGF (recursive Green's function) step. 'cpu' (default) or 'cuda'. Hamiltonian initialization always runs on CPU (it is the memory-heavy phase). Self-energy always runs on CPU because it goes through joblib + numba.
+                Device used only for the RGF (recursive Green's function) step. 'cpu' (default) or 'cuda[:index]'. 'cuda' uses the current CUDA device (normally logical cuda:0, subject to CUDA_VISIBLE_DEVICES). Model construction and Hamiltonian initialization use the top-level device option independently. Overridden by devices when supplied. Self-energy always runs on CPU because it goes through joblib + numba.
+
+            .. _`run_op/task_options[negf]/rgf_options/devices`:
+
+            devices:
+                | type: ``list`` | ``NoneType``, optional, default: ``None``
+                | argument path: ``run_op/task_options[negf]/rgf_options/devices``
+
+                Optional list of explicit logical CUDA devices, e.g. ['cuda:0', 'cuda:1']. Overrides device. With multiple devices, non-SCF energy batches run concurrently, one batch per GPU, and results retain energy-grid order. Each GPU holds its own H/S blocks. Only the energy-grid RGF sweep is distributed; density and local-current integrals use the first device. Multiple devices require scf=false. Indices follow CUDA_VISIBLE_DEVICES.
 
             .. _`run_op/task_options[negf]/rgf_options/e_batch_size`: 
 
@@ -1744,7 +1752,7 @@ run_op:
                 | type: ``int`` | ``float`` | ``NoneType``, optional, default: ``None``
                 | argument path: ``run_op/task_options[negf]/rgf_options/e_batch_size``
 
-                Number of energy points solved in one batched RGF call. None (default) auto-picks from free CUDA memory on 'cuda'; on 'cpu' the full grid is used.
+                Number of energy points solved in one batched RGF call. None (default) auto-picks from free CUDA memory on 'cuda'; on 'cpu' the full grid is used. In multi-GPU mode this is the batch size per GPU; None uses the smallest device memory budget and splits the grid into at least one batch per selected GPU when there are enough energy points.
 
         .. _`run_op/task_options[negf]/e_fermi`: 
 
@@ -3683,7 +3691,7 @@ run_op:
         | type: ``NoneType`` | ``str``, optional, default: ``None``
         | argument path: ``run_op/device``
 
-        The torch device used to build the Hamiltonian and run the calculation. Choose 'cpu' or 'cuda[:int]'. Default: None (use the device stored in the model ckpt).
+        The torch device for model construction, Hamiltonian initialization and lead electronic structure. Choose 'cpu' or 'cuda[:int]'. Default: None (use the device stored in the model ckpt). RGF uses rgf_options.device or rgf_options.devices.
 
     .. _`run_op/dtype`: 
 
