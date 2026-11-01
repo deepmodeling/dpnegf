@@ -3,7 +3,7 @@ import ase
 import numpy as np
 import logging
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Optional, Union
 from pyinstrument import Profiler
 import os
@@ -16,6 +16,7 @@ from dpnegf.negf.negf_hamiltonian_init import NEGFHamiltonianInit
 from dpnegf.utils.elec_struc_cal import ElecStruCal
 from dpnegf.negf.density import Ozaki,Fiori
 from dpnegf.negf.device_property import DeviceProperty
+from dpnegf.negf.rgf_solver import RGFSolver, rgf_solver_options
 from dpnegf.negf.lead_property import LeadProperty, compute_all_self_energy, _has_saved_self_energy
 from dpnegf.utils.constants import Boltzmann, eV2J
 from dpnegf.utils.make_kpoints import kmesh_sampling_negf
@@ -26,7 +27,7 @@ from dpnegf.utils.argcheck import validate_energy_options
 from dpnegf.utils.parrallel import (
     _rgf_devices,
     _rgf_chunk_size,
-    _parallel_rgf_energy_loop,
+    RGFProcessPool,
 )
 from dpnegf.negf.poisson_init import Grid,Interface3D,Dirichlet,Dielectric
 from dpnegf.negf.scf_method import PDIISMixer,DIISMixer,BroydenFirstMixer,BroydenSecondMixer,AndersonMixer
@@ -833,68 +834,11 @@ class NEGF(object):
 
 
     def compute_rgf_chunk(self, e_chunk, k, ik, Vbias, energy_offset=0):
-        """Solve one energy batch and append CPU outputs in energy order."""
-        e_batch_size = len(e_chunk)
-        log.info(
-            f"computing green's functions on {self.rgf_device} for chunk "
-            f"e=[{float(e_chunk[0]):>6.3f}..{float(e_chunk[-1]):>6.3f}], B={e_batch_size}"
-        )
-        seL_list, seR_list = [], []
-        try:
-            for e in e_chunk:
-                for ll in self.stru_options.keys():
-                    if ll.startswith("lead"):
-                        getattr(self.deviceprop, ll).self_energy(
-                            energy=e,
-                            kpoint=k,
-                            eta_lead=self.eta_lead,
-                            method=self.sgf_solver,
-                            save_path=self.self_energy_save_path,
-                            save_format=self.se_cache_format,
-                            se_info_display=self.se_info_display
-                            )
-                seL_list.append(self.deviceprop.lead_L.se)
-                seR_list.append(self.deviceprop.lead_R.se)
+        return RGFSolver(self.deviceprop, rgf_solver_options(self)).compute_rgf_chunk(
+            e_chunk, k, ik, Vbias, energy_offset, out=self.out)
 
-            if e_batch_size > 1:
-                self.deviceprop.lead_L.se = torch.stack(seL_list, dim=0)
-                self.deviceprop.lead_R.se = torch.stack(seR_list, dim=0)
-            # else: leave the per-E [n,n] in place — preserves scalar contract exactly.
-
-            self.deviceprop.cal_green_function(
-                energy=e_chunk, kpoint=k,
-                eta_device=self.eta_device,
-                block_tridiagonal=self.block_tridiagonal,
-                Vbias=Vbias,
-                need_lesser=False,
-                need_greater=False,
-                need_gr_lc=False, # set to False for memory saving, can be set to True for lead spectral function G^r * \Gamma * G^a
-                gf_cal_mode=self.gf_cal_mode,
-                need_trans_eigs=self.need_trans_eigs,
-                )
-
-            if self.need_trans_eigs:
-                self.store_trans_eigs(k, ik, energy_offset=energy_offset)
-            if self.out_dos:
-                self.out.setdefault('DOS', {}).setdefault(str(k), []).append(self.compute_DOS(k).reshape(-1).cpu())
-            if self.out_tc or self.out_current_nscf:
-                self.out.setdefault('T_k', {}).setdefault(str(k), []).append(self.compute_TC(k).reshape(-1).cpu())
-            if self.out_ldos:
-                ldos_chunk = self.compute_LDOS(k)
-                if ldos_chunk.ndim == 1:  # scalar-E chunk → [na]
-                    ldos_chunk = ldos_chunk.unsqueeze(0)
-                self.out.setdefault('LDOS', {}).setdefault(str(k), []).append(ldos_chunk.cpu())
-
-        finally:
-            self.deviceprop.release_greenfuncs()
-            if seL_list:
-                self.deviceprop.lead_L.se = seL_list[-1]
-            if seR_list:
-                self.deviceprop.lead_R.se = seR_list[-1]
-            del seL_list, seR_list
-
-    def negf_compute(self,scf_require=False,Vbias=None):
-        
+    def negf_compute(self, scf_require=False, Vbias=None):
+        """Prepare inputs and workers, run the sweep, and save combined outputs."""
         assert scf_require is not None, "scf_require should be set to True or False"
         self.out['k']=[];self.out['wk']=[]
         if hasattr(self, "uni_grid"): 
@@ -908,6 +852,35 @@ class NEGF(object):
         # Self-Energy Calculaiton or Loading
         self.prepare_self_energy(scf_require)
 
+        pool_context = (RGFProcessPool.from_runner(self)
+                        if len(self.rgf_devices) > 1 else nullcontext())
+        with pool_context as rgf_pool:
+            self._negf_compute(scf_require, Vbias, rgf_pool=rgf_pool)
+
+        if scf_require==False:
+            self.out["k"] = np.array(self.out["k"])
+            if "T_k" in self.out:
+                self.out['T_avg'] = torch.tensor(self.out['wk']) @ torch.stack(list(self.out["T_k"].values())).cpu()
+            if self.out_conductance:
+                records = integrate_conductance(self.out["T_avg"], self.quadrature_grid, self.spin_degeneracy)
+                for record in records:
+                    record["E_ref_eV"] = float(self.deviceprop.E_ref)
+                    record["mu_absolute_eV"] = record["mu_eV"] + record["E_ref_eV"]
+                self.out["conductance"] = records
+                with open(os.path.join(self.results_path, "conductance.json"), 'w') as f:
+                    json.dump(records, f, indent=2)
+                log.info("Landauer conductance (G/G0): %s", [r["G_over_G0"] for r in records])
+            # TODO:check the following code for multiple k points calculation
+            if self.out_current_nscf:
+                self.out["BIAS_POTENTIAL_NSCF"], self.out["CURRENT_NSCF"] = self.compute_current_nscf(self.uni_grid, self.out["T_avg"])
+            torch.save(self.out, self.results_path+"/negf.out.pth")
+
+    def _negf_compute(self, scf_require=False, Vbias=None, *, rgf_pool=None):
+        """Run k/energy sweeps using prepared inputs and the optional worker pool.
+
+        The caller owns self-energy preparation, pool lifetime, and final
+        output. Parallel batches run in the pool's independent RGF solvers.
+        """
         for ik, k in enumerate(self.kpoints):
 
             self.out['k'].append(k)
@@ -917,7 +890,7 @@ class NEGF(object):
             log.info(f"Properties computation at k = ({', '.join([f'{kk:>6.4f}' for kk in k])})")
 
             if scf_require:
-                if self.density_options["method"] == "Fiori":                    
+                if self.density_options["method"] == "Fiori":
                     if not self.poisson_options["with_Dirichlet_leads"]:
                         # Follow the NanoTCAD convention for NEGF-Poisson SCF
                         # without Dirichlet leads, the voltage is set as the average of the potential at the most left and right parts
@@ -930,7 +903,7 @@ class NEGF(object):
                                         # getattr(self.deviceprop, ll).voltage = Vbias[0]
                                     else:
                                         getattr(self.deviceprop, ll).voltage = Vbias[self.right_connected_orb_mask].mean()
-                                        # getattr(self.deviceprop, ll).voltage = Vbias[-1]                                     
+                                        # getattr(self.deviceprop, ll).voltage = Vbias[-1]
                     else:
                         # TODO: consider the case with heterogeneous Dirichlet leads
                         # In this case, the Dirichlet conditions in leads and gate are set as electrochemical potential(Fermi level + voltage)
@@ -939,7 +912,7 @@ class NEGF(object):
 
                     if self.negf_hamiltonian.subblocks is None:
                             self.negf_hamiltonian.subblocks = self.negf_hamiltonian.get_hs_device(only_subblocks=True)
-                    
+
                     self.density.density_integrate_Fiori(
                         e_grid = self.uni_grid,
                         kpoint=k,
@@ -960,7 +933,7 @@ class NEGF(object):
                 else:
                     # TODO: add Ozaki support for NanoTCAD-style SCF
                     raise ValueError("Ozaki method does not support Poisson-NEGF SCF in this version.")
-                
+
 
             # in non-scf case, computing properties in uni_gird
             else:
@@ -1021,8 +994,8 @@ class NEGF(object):
                             if self.out_ldos:
                                 self.out.setdefault('LDOS', {}).setdefault(str(k), []).append(self.compute_LDOS(k))
                     else:
-                        if len(self.rgf_devices) > 1:
-                            _parallel_rgf_energy_loop(self, k, ik, Vbias)
+                        if rgf_pool is not None:
+                            rgf_pool.run_energy_loop(self.uni_grid, k, ik, Vbias, self.out)
                         else:
                             chunk = _rgf_chunk_size(self, len(self.uni_grid))
                             for e_chunk in torch.split(self.uni_grid, chunk):
@@ -1031,7 +1004,7 @@ class NEGF(object):
                     # over energy loop in uni_gird
                     # The following code is for output properties before NEGF ends
                     # TODO: check following code for multiple k points calculation
-                
+
                     if self.out_density or self.out_potential:
                         if self.density_options["method"] == "Ozaki":
                             prop_DM_eq = self.out.setdefault('DM_eq', {})
@@ -1045,12 +1018,12 @@ class NEGF(object):
                                         self.negf_hamiltonian.get_hs_device(only_subblocks=True)
 
                                 self.density.density_integrate_Fiori(
-                                    e_grid = self.uni_grid, 
+                                    e_grid = self.uni_grid,
                                     kpoint=k,
                                     Vbias=Vbias,
                                     block_tridiagonal=self.block_tridiagonal,
                                     subblocks=self.negf_hamiltonian.subblocks,
-                                    integrate_way = self.density_options["integrate_way"],  
+                                    integrate_way = self.density_options["integrate_way"],
                                     deviceprop=self.deviceprop,
                                     device_atom_norbs=self.device_atom_norbs,
                                     potential_at_atom = self.potential_at_atom,
@@ -1076,11 +1049,11 @@ class NEGF(object):
                         # Non-SCF: list of [b, na] → [E, na]. SCF: list of [na] → [E, na].
                         self.out["LDOS"][str(k)] = reduce_fn(self.out["LDOS"][str(k)])
                     # if self.out_current_nscf:
-                    #     self.out["BIAS_POTENTIAL_NSCF"], self.out["CURRENT_NSCF"] = self.compute_current_nscf(k, self.uni_grid, self.out["TC"]) 
+                    #     self.out["BIAS_POTENTIAL_NSCF"], self.out["CURRENT_NSCF"] = self.compute_current_nscf(k, self.uni_grid, self.out["TC"])
                     # computing properties that are not functions of E (improvement can be made here in properties related to integration of energy window of fermi functions)
                     if self.out_current:
                         pass
-            
+
                     # TODO: check the following code for multiple k points calculation
                     if self.out_lcurrent:
                         lcurrent = 0
@@ -1090,15 +1063,15 @@ class NEGF(object):
                             for ll in self.stru_options.keys():
                                 if ll.startswith("lead"):
                                     getattr(self.deviceprop, ll).self_energy(
-                                        energy=e, 
-                                        kpoint=k, 
+                                        energy=e,
+                                        kpoint=k,
                                         eta_lead=self.eta_lead,
                                         method=self.sgf_solver,
                                         save_path=self.self_energy_save_path,
                                         save_format=self.se_cache_format,
                                         se_info_display=self.se_info_display
                                         )
-                                    
+
                             self.deviceprop.cal_green_function(
                                 energy=e,
                                 kpoint=k,
@@ -1113,28 +1086,6 @@ class NEGF(object):
 
                         prop_local_current = self.out.setdefault('LOCAL_CURRENT', {})
                         prop_local_current[str(k)] = lcurrent
-
-
-        if scf_require==False:
-            self.out["k"] = np.array(self.out["k"])
-            if "T_k" in self.out:
-                self.out['T_avg'] = torch.tensor(self.out['wk']) @ torch.stack(list(self.out["T_k"].values())).cpu()
-            if self.out_conductance:
-                records = integrate_conductance(self.out["T_avg"], self.quadrature_grid, self.spin_degeneracy)
-                for record in records:
-                    record["E_ref_eV"] = float(self.deviceprop.E_ref)
-                    record["mu_absolute_eV"] = record["mu_eV"] + record["E_ref_eV"]
-                self.out["conductance"] = records
-                with open(os.path.join(self.results_path, "conductance.json"), 'w') as f:
-                    json.dump(records, f, indent=2)
-                log.info("Landauer conductance (G/G0): %s", [r["G_over_G0"] for r in records])
-            # TODO:check the following code for multiple k points calculation
-            if self.out_current_nscf:
-                self.out["BIAS_POTENTIAL_NSCF"], self.out["CURRENT_NSCF"] = self.compute_current_nscf(self.uni_grid, self.out["T_avg"])
-            torch.save(self.out, self.results_path+"/negf.out.pth")
-
-                
-            
 
     def get_grid(self,grid_info,structase):
         x_start,x_end,x_num = grid_info.get("x_range",None).split(':')
