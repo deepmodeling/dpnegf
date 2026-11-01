@@ -185,7 +185,8 @@ def negf():
                                "on-disk cache, and CPU parallelism (joblib workers, "
                                "BLAS threads, ek batching).")
     doc_rgf_options = ("Recursive Green's function stage options: compute device "
-                       "('cpu' or 'cuda[:index]') and energy-loop chunk size. Independent "
+                       "('cpu' or 'cuda[:index]'), optional multiple CUDA devices, "
+                       "and energy-loop chunk size. Independent "
                        "from the self-energy pool, which always runs on CPU.")
     doc_hs_cache = "On-disk cache of the device Hamiltonian and overlap matrix."
     doc_density_options = ""
@@ -345,13 +346,25 @@ def rgf_options_group():
                   "'cpu' (default) or 'cuda[:index]'. 'cuda' uses the current CUDA "
                   "device (normally logical cuda:0, subject to CUDA_VISIBLE_DEVICES). "
                   "Model construction and Hamiltonian initialization use the top-level "
-                  "device option independently. Self-energy always runs on CPU "
+                  "device option independently. Overridden by devices when supplied. "
+                  "Self-energy always runs on CPU "
                   "because it goes through joblib + numba.")
+    doc_devices = ("Optional list of explicit logical CUDA devices, e.g. "
+                   "['cuda:0', 'cuda:1']. Overrides device. With multiple devices, "
+                   "non-SCF energy batches run concurrently, one batch per GPU, "
+                   "and results retain energy-grid order. Each GPU holds its own "
+                   "H/S blocks. Only the energy-grid RGF sweep is distributed; "
+                   "density and local-current integrals use the first device. "
+                   "Multiple devices require scf=false. Indices follow CUDA_VISIBLE_DEVICES.")
     doc_e_batch = ("Number of energy points solved in one batched RGF call. None "
                    "(default) auto-picks from free CUDA memory on 'cuda'; on 'cpu' "
-                   "the full grid is used.")
+                   "the full grid is used. In multi-GPU mode this is the batch size "
+                   "per GPU; None uses the smallest device memory budget and "
+                   "splits the grid into at least one batch per selected GPU "
+                   "when there are enough energy points.")
     return [
         Argument("device", str, optional=True, default="cpu", doc=doc_device),
+        Argument("devices", [list, None], optional=True, default=None, doc=doc_devices),
         Argument("e_batch_size", [int, float, None], optional=True, default=None, doc=doc_e_batch),
     ]
 
@@ -604,9 +617,10 @@ def run_options():
     doc_task = "Which transport task to run and its detailed options. See `task_options` below."
     doc_structure = "Path to the structure file (xyz/vasp/etc.). Overrides the CLI `--structure` flag when set."
     doc_gui = "Whether to launch the GUI. Default: False."
-    doc_device = ("The torch device for model construction, Hamiltonian initialization and"
-                  "lead electronic structure. Choose 'cpu' or 'cuda[:int]'."
-                  "Default: None (use the device stored in the model ckpt). RGF uses rgf_options.device.")
+    doc_device = ("The torch device for model construction, Hamiltonian initialization and "
+                  "lead electronic structure. Choose 'cpu' or 'cuda[:int]'. "
+                  "Default: None (use the device stored in the model ckpt). "
+                  "RGF uses rgf_options.device or rgf_options.devices.")
     doc_dtype = ("Floating precision used at build time. 'float32' or 'float64'. "
                   "Default: None (use the dtype stored in the model ckpt).")
     doc_pbc = ("Overall periodic boundary condition of the input structure. "
