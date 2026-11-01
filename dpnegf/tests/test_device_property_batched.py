@@ -87,18 +87,29 @@ def test_prepared_hamiltonian_is_reused_until_context_changes(tmp_path, change):
     hd, sd, hl, hu, sl, su, se_l, se_r, energies = _make_btd_inputs(1, sizes, seed=11)
     dev = _make_deviceprop(sizes, hd, sd, hl, hu, sl, su)
     dev.results_path = str(tmp_path)
-    load = Mock(wraps=dev.hamiltonian.get_hs_device)
+    original_load = dev.hamiltonian.get_hs_device
+    load = Mock(wraps=original_load)
     dev.hamiltonian.get_hs_device = load
     k, bias = [0., 0., 0.], torch.tensor(0.1)
 
     dev.prepare_hamiltonian(k, True, bias)
     resident = dev.hd
     dev.lead_L.se, dev.lead_R.se = se_l[0], se_r[0]
-    dev.cal_green_function(energies[0], k, Vbias=bias)
+    dev.cal_green_function(energies[0], k, Vbias=bias, need_trans_eigs=True)
+    green, eigenstate = dev.greenfuncs, dev._trans_eigs_state
+    assert green and eigenstate is not None
     dev.prepare_hamiltonian(k, True, bias)
     assert load.call_count == 1
     assert dev.hd is resident
-    dev.release_greenfuncs()
+    assert dev.greenfuncs is green
+    assert dev._trans_eigs_state is eigenstate
+
+    def load_changed(*args, **kwargs):
+        assert dev.greenfuncs == 0
+        assert dev._trans_eigs_state is None
+        return original_load(*args, **kwargs)
+
+    load.side_effect = load_changed
 
     if change == "kpoint":
         k = [0.5, 0., 0.]
@@ -107,6 +118,143 @@ def test_prepared_hamiltonian_is_reused_until_context_changes(tmp_path, change):
     dev.prepare_hamiltonian(k, change != "layout", bias)
     assert load.call_count == 2
     assert dev.hd is not resident
+    assert dev.greenfuncs == 0
+    assert dev._trans_eigs_state is None
+    with pytest.raises(RuntimeError, match="Compute full RGF"):
+        dev.cal_transmission_eigs()
+
+
+@pytest.fixture
+def solved_device(tmp_path):
+    sizes = [3, 4, 2]
+    hd, sd, hl, hu, sl, su, se_l, se_r, energies = _make_btd_inputs(1, sizes, seed=11)
+    dev = _make_deviceprop(sizes, hd, sd, hl, hu, sl, su)
+    dev.results_path = str(tmp_path)
+    dev.lead_L.se, dev.lead_R.se = se_l[0], se_r[0]
+    dev.cal_green_function(energies[0], [0., 0., 0.], Vbias=torch.tensor(0.1),
+                           need_trans_eigs=True)
+    return dev, energies[0]
+
+
+def _inject_hs_failure(dev, stage, error):
+    original_load = dev.hamiltonian.get_hs_device
+
+    def load(*args, **kwargs):
+        # Derived state must already be invalid when a replacement load starts.
+        assert dev.greenfuncs == 0
+        assert dev._trans_eigs_state is None
+        if stage == "load":
+            raise error
+        parts = tuple([block.clone() for block in blocks]
+                      for blocks in original_load(*args, **kwargs))
+        if stage == "transfer":
+            parts[-1][0] = Mock()
+            parts[-1][0].to.side_effect = error
+        return parts
+
+    if stage == "mapping":
+        dev.hamiltonian.get_orbital_map = Mock(side_effect=error)
+    dev.hamiltonian.get_hs_device = Mock(side_effect=load)
+    return original_load
+
+
+@pytest.mark.parametrize("change", ["kpoint", "bias", "layout"])
+@pytest.mark.parametrize("stage", ["load", "transfer", "mapping"])
+def test_failed_hamiltonian_switch_preserves_committed_context(solved_device, change, stage):
+    dev, _ = solved_device
+    names = ("hd", "sd", "hl", "su", "sl", "hu", "_orbital_mapping_snapshot",
+             "kpoint", "V", "oldV", "block_tridiagonal", "newK_flag", "newV_flag")
+    previous = {name: getattr(dev, name) for name in names}
+    k = [0.5, 0., 0.] if change == "kpoint" else [0., 0., 0.]
+    bias = torch.tensor(0.2 if change == "bias" else 0.1)
+    layout = change != "layout"
+    error = RuntimeError(f"H/S {stage} failed")
+    original_load = _inject_hs_failure(dev, stage, error)
+
+    with pytest.raises(RuntimeError, match=f"H/S {stage} failed") as caught:
+        dev.prepare_hamiltonian(k, layout, bias)
+    assert caught.value is error
+    for name, value in previous.items():
+        assert getattr(dev, name) is value, name
+    assert dev.greenfuncs == 0
+    assert dev._trans_eigs_state is None
+    with pytest.raises(RuntimeError, match="Compute full RGF"):
+        dev.cal_transmission_eigs()
+
+    # The failed request must not be mistaken for a resident cache hit on retry.
+    load = dev.hamiltonian.get_hs_device
+    load.side_effect = original_load
+    if stage == "mapping":
+        del dev.hamiltonian.get_orbital_map
+    dev.prepare_hamiltonian(k, layout, bias)
+    assert load.call_count == 2
+    assert dev.hd is not previous["hd"]
+    torch.testing.assert_close(dev.kpoint, torch.tensor(k))
+    torch.testing.assert_close(dev.V, bias)
+    assert dev.block_tridiagonal == layout
+    dev.prepare_hamiltonian(k, layout, bias)
+    assert load.call_count == 2
+
+
+@pytest.mark.parametrize("stage", ["load", "transfer", "mapping"])
+def test_initial_hamiltonian_failure_does_not_publish_context(tmp_path, stage):
+    sizes = [3, 4, 2]
+    hd, sd, hl, hu, sl, su, *_ = _make_btd_inputs(1, sizes, seed=11)
+    dev = _make_deviceprop(sizes, hd, sd, hl, hu, sl, su)
+    dev.results_path = str(tmp_path)
+    error = RuntimeError(f"H/S {stage} failed")
+    _inject_hs_failure(dev, stage, error)
+
+    with pytest.raises(RuntimeError, match=f"H/S {stage} failed") as caught:
+        dev.prepare_hamiltonian([0.5, 0., 0.], False, torch.tensor(0.2))
+    assert caught.value is error
+    assert dev.kpoint is None
+    assert dev.newK_flag is None
+    assert dev.newV_flag is None
+    for name in ("hd", "sd", "hl", "su", "sl", "hu", "V", "oldV",
+                 "block_tridiagonal", "_orbital_mapping_snapshot"):
+        assert not hasattr(dev, name), name
+    assert dev.greenfuncs == 0
+    assert dev._trans_eigs_state is None
+
+
+def test_failed_green_replacement_clears_both_derived_states(solved_device):
+    dev, energy = solved_device
+    resident = dev.hd
+    with pytest.raises(ValueError, match="Unknown gf_cal_mode"):
+        dev.cal_green_function(energy + 0.1, [0., 0., 0.], Vbias=torch.tensor(0.1),
+                               gf_cal_mode="invalid")
+    assert dev.hd is resident
+    assert dev.greenfuncs == 0
+    assert dev._trans_eigs_state is None
+
+
+@pytest.mark.parametrize("keep_hs", [True, False])
+def test_dos_reuses_prepared_context_and_restores_only_released_blocks(solved_device, keep_hs):
+    dev, energy = solved_device
+    expected = dev._cal_dos_()
+    dev.cal_green_function(energy, [0., 0., 0.], Vbias=torch.tensor(0.1),
+                           HS_inmem=keep_hs, need_trans_eigs=True)
+    green, eigenstate = dev.greenfuncs, dev._trans_eigs_state
+    load = Mock(wraps=dev.hamiltonian.get_hs_device)
+    dev.hamiltonian.get_hs_device = load
+    torch.testing.assert_close(dev._cal_dos_(), expected)
+    assert load.call_count == (0 if keep_hs else 1)
+    assert dev.greenfuncs is green
+    assert dev._trans_eigs_state is eigenstate
+
+
+def test_context_tags_do_not_alias_mutable_inputs(solved_device):
+    dev, _ = solved_device
+    k, bias = torch.tensor([0.5, 0., 0.]), torch.tensor(0.2)
+    load = Mock(wraps=dev.hamiltonian.get_hs_device)
+    dev.hamiltonian.get_hs_device = load
+    dev.prepare_hamiltonian(k, True, bias)
+    k[0], bias[...] = 0.25, 0.3
+    torch.testing.assert_close(dev.kpoint, torch.tensor([0.5, 0., 0.]))
+    torch.testing.assert_close(dev.V, torch.tensor(0.2))
+    dev.prepare_hamiltonian(k, True, bias)
+    assert load.call_count == 2
 
 
 def _run_scalar(dev, energies_1d, left_se_batched, right_se_batched, need_lesser):

@@ -131,6 +131,15 @@ def test_reuse_full_rgf_and_batch(tmp_path, incoming):
         # A full zero-padded contact has the same physical coefficient projectors.
         a, b = torch.cat(actual['coefficients']), torch.cat(reference['coefficients'])
         torch.testing.assert_close(a @ a.mH, b @ b.mH)
+    # An already-started iterator must not combine an old energy/SE snapshot
+    # with Green functions and H/S from a later context.
+    pending = dev.iter_transmission_eigs(incoming=incoming)
+    next(pending)
+    dev.prepare_hamiltonian([0.5, 0, 0])
+    dev.cal_green_function(energies, [0.5, 0, 0], eta_device=c.eta_device,
+                           need_trans_eigs=True)
+    with pytest.raises(RuntimeError, match='Green/H/S context changed'):
+        next(pending)
     dev.release_greenfuncs()
     with pytest.raises(RuntimeError):
         dev.cal_transmission_eigs()
