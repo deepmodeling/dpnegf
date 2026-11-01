@@ -131,6 +131,15 @@ def test_reuse_full_rgf_and_batch(tmp_path, incoming):
         # A full zero-padded contact has the same physical coefficient projectors.
         a, b = torch.cat(actual['coefficients']), torch.cat(reference['coefficients'])
         torch.testing.assert_close(a @ a.mH, b @ b.mH)
+    # An already-started iterator must not combine an old energy/SE snapshot
+    # with Green functions and H/S from a later context.
+    pending = dev.iter_transmission_eigs(incoming=incoming)
+    next(pending)
+    dev.prepare_hamiltonian([0.5, 0, 0])
+    dev.cal_green_function(energies, [0.5, 0, 0], eta_device=c.eta_device,
+                           need_trans_eigs=True)
+    with pytest.raises(RuntimeError, match='Green/H/S context changed'):
+        next(pending)
     dev.release_greenfuncs()
     with pytest.raises(RuntimeError):
         dev.cal_transmission_eigs()
@@ -368,7 +377,7 @@ def test_input_json_runner(tmp_path, outputs, btd, chunk):
 
 def test_runner_streams_saves_and_releases_each_energy(tmp_path, monkeypatch):
     import weakref
-    from types import SimpleNamespace
+    from dpnegf.negf.device_property import DeviceProperty
     from dpnegf.runner.NEGF import NEGF
     raw_refs, saved_refs = [], []
     def make_record(i):
@@ -397,10 +406,10 @@ def test_runner_streams_saves_and_releases_each_energy(tmp_path, monkeypatch):
     runner.eta_lead = 1e-5
     runner.results_path = str(tmp_path)
     runner.out = {}
-    runner.deviceprop = SimpleNamespace(iter_transmission_eigs=iterator)
-    runner.negf_hamiltonian = SimpleNamespace(device_original_norbs=[2, 2],
-                                             device_id=[4, 6], device_atom_map=[0, 1])
-    runner._store_trans_eigs('k', 0)
+    runner.deviceprop = DeviceProperty.__new__(DeviceProperty)
+    runner.deviceprop.results_path = str(tmp_path)
+    runner.deviceprop.iter_transmission_eigs = iterator
+    runner.store_trans_eigs('k', 0)
     assert all(ref() is None for ref in raw_refs + saved_refs)
     assert len(runner.out['trans_eigchannel']['k']) == 3
     assert all('coefficients' not in r for r in runner.out['trans_eigvals']['k'])

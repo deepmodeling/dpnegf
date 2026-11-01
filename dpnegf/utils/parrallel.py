@@ -1,10 +1,17 @@
 """Functions and classes for the parallel environment."""
 
 import os
+import logging
+import multiprocessing as mp
+from multiprocessing.connection import wait
+import pickle
+import traceback
 from typing import Tuple, List, Any
 import datetime
 
 import numpy as np
+import torch
+
 try:
     from mpi4py import MPI
 except ImportError:
@@ -12,6 +19,347 @@ except ImportError:
 
 
 __all__ = ["MPIEnv"]
+
+log = logging.getLogger(__name__)
+
+
+def _rgf_devices(options):
+    """Resolve an optional explicit list of logical CUDA devices."""
+    devices = options.get("devices")
+    if devices is None:
+        return [torch.device(options.get("device", "cpu"))]
+    if not isinstance(devices, list) or not devices:
+        raise ValueError("rgf_options.devices must be a non-empty list of CUDA devices.")
+    resolved = []
+    for value in devices:
+        if not isinstance(value, str):
+            raise ValueError("rgf_options.devices entries must be strings such as 'cuda:0'.")
+        device = torch.device(value)
+        if device.type != "cuda" or device.index is None:
+            raise ValueError("rgf_options.devices requires explicit CUDA indices, e.g. 'cuda:0'.")
+        if device in resolved:
+            raise ValueError(f"Duplicate RGF device: {device}.")
+        if device.index >= torch.cuda.device_count():
+            raise ValueError(f"RGF CUDA device is unavailable: {device}.")
+        resolved.append(device)
+    return resolved
+
+
+def _auto_chunk_size(runner, n_grid):
+    """Pick a chunk size from free CUDA memory when the user didn't set
+    ``e_batch_size``. Returns the full grid length on CPU. If the CUDA
+    memory query or geometry estimate fails, logs the cause and returns 1.
+
+    Call only after prepare_hamiltonian() has made the current k/bias H/S
+    resident. The free-memory query then excludes those persistent tensors.
+    Per-energy RGF peak (post per-slot-release, complex128) approximated as
+        bytes_per_E ~= C * K * n_max**2 * 16
+    with C bundling the live tensors in the worst backward-sweep slot
+    (grd full + grl + gru full + decaying gr_left tail + gU + transients
+    and allocator headroom). C=14 with a 0.5x free-memory budget; conservative
+    because without expandable_segments the allocator can't defragment on
+    demand, and on real workloads (CNT10/long6) the previous 10x / 0.7
+    combination still picked a chunk that OOM'd on a 15.77 GiB V100.
+
+    Eigen outputs additionally retain batched gr_left/self-energy snapshots.
+    Reserve a separate, batch-independent workspace for contact eigh/SVD and
+    thin RHS/channel coefficients: eigen outputs are streamed one energy at
+    a time while the entire RGF batch remains resident. Contact block sizes
+    bound the unknown broadening ranks conservatively.
+    """
+    rgf_dev = runner.rgf_device
+    if not (isinstance(rgf_dev, torch.device) and rgf_dev.type == "cuda"):
+        return n_grid
+    try:
+        sizes = [int(b.shape[-1]) for b in runner.deviceprop.hd]
+        n_max = max(sizes)
+        K = len(sizes)
+        per_e = 14 * K * (n_max ** 2) * 16
+        if min(sizes) <= 0 or per_e <= 0:
+            raise ValueError(f"Non-positive per-energy memory estimate: {per_e}")
+        eig_workspace = 0
+        if getattr(runner, "need_trans_eigs", False):
+            left, right = sizes[0], sizes[-1]
+            boundary_sq = left**2 + right**2
+            # Retained gr_left and copied self-energy state scale with B.
+            per_e += 16 * (sum(n**2 for n in sizes) + 2 * boundary_sq)
+            options = runner.trans_eigs_options
+            incoming = right if options.get("incoming", "left") == "right" else left
+            # Gamma factors, contact Green/K matrices, eigh/SVD scratch and
+            # streaming contact solves; include orbital permutation buffers.
+            eig_workspace = 16 * (8 * (boundary_sq + left * right) + 4 * n_max * incoming)
+            eig_workspace += 3 * sum(sizes) * 8
+            if runner.out_trans_eigchannel:
+                selected = min(left, right)
+                if options.get("n_channels") is not None:
+                    selected = min(selected, options["n_channels"])
+                elif options.get("channel_indices") is not None:
+                    selected = min(selected, len(options["channel_indices"]))
+                # Forward/back substitution responses, coefficients, residuals;
+                # original order also materializes concatenated/reordered copies.
+                copies = 6 if options.get("return_format", "blocks") == "original" else 4
+                eig_workspace += 16 * copies * sum(sizes) * selected
+        free_bytes, _total = torch.cuda.mem_get_info(rgf_dev)
+        budget = int(0.5 * free_bytes)
+        b = max(1, min(n_grid, max(0, budget - eig_workspace) // per_e))
+    except Exception as exc:
+        log.error(
+            "Failed to determine CUDA auto e_batch_size on %s; "
+            "falling back to e_batch_size=1 (%s: %s)",
+            rgf_dev, type(exc).__name__, exc, exc_info=True,
+        )
+        return 1
+    log.info(
+        f"auto e_batch_size={b} (free={free_bytes/2**30:.2f} GiB, "
+        f"per_E~={per_e/2**20:.1f} MiB, "
+        f"eig_workspace~={eig_workspace/2**20:.1f} MiB, K={K}, n_max={n_max})"
+    )
+    return b
+
+
+@torch.no_grad()
+def _rgf_chunk_size(runner, n_grid, k, Vbias=None):
+    runner.deviceprop.prepare_hamiltonian(k, runner.block_tridiagonal, Vbias)
+    cap = _auto_chunk_size(runner, n_grid)
+    chunk = runner.e_batch_size if runner.e_batch_size is not None else cap
+    if runner.e_batch_size is not None and runner.rgf_device.type == "cuda" and chunk > cap:
+        log.warning("user e_batch_size=%s exceeds CUDA auto-cap=%s on %s",
+                    chunk, cap, runner.rgf_device)
+    log.info("Using e_batch_size=%s on %s for %s energy points",
+             chunk, runner.rgf_device, n_grid)
+    return chunk
+
+
+def _cpu_payload(value):
+    """Keep CUDA tensors and storage handles out of process messages."""
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _cpu_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_cpu_payload(item) for item in value)
+    return value
+
+
+def _send_packet(connection, packet):
+    # Explicit bytes use ordinary pickle, avoiding torch's multiprocessing
+    # reducers and their shared-storage/file-descriptor lifetime requirements.
+    connection.send_bytes(pickle.dumps(packet, protocol=pickle.HIGHEST_PROTOCOL))
+
+
+def _recv_packet(connection):
+    return pickle.loads(connection.recv_bytes())
+
+
+def _rgf_worker_main(connection, device, spec):
+    """Spawn entry point: build an independent solver, then serve all k points."""
+    try:
+        from dpnegf.negf.rgf_solver import RGFSolver
+        torch.set_default_dtype(spec["default_dtype"])
+        torch.set_num_threads(1)
+        device = torch.device(device)
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        solver = RGFSolver.from_cache(spec, device)
+        _send_packet(connection, ("ready", os.getpid()))
+        while True:
+            command, args = _recv_packet(connection)
+            if command == "close":
+                break
+            if command == "chunk_size":
+                _send_packet(connection, ("chunk_size", _rgf_chunk_size(solver, *args)))
+            elif command == "solve":
+                index, energies, k, ik, bias, offset = args
+                outputs = solver.compute_rgf_chunk(energies, k, ik, bias, offset)
+                _send_packet(connection, ("result", index, _cpu_payload(outputs)))
+            else:
+                raise ValueError(f"Unknown RGF worker command: {command}")
+    except (EOFError, BrokenPipeError):
+        pass  # Parent closed or terminated the pool.
+    except BaseException as exc:
+        try:
+            _send_packet(connection, ("error", type(exc).__name__, str(exc), traceback.format_exc()))
+        except (OSError, EOFError):
+            pass
+    finally:
+        connection.close()
+
+
+class RGFWorkerError(RuntimeError):
+    """A spawned solver failed or exited before returning its result."""
+
+
+class RGFProcessPool:
+    """One persistent spawn process per device, with bounded in-flight batches.
+
+    Inputs contain only cache paths and numerical metadata. Replies may arrive
+    in any order; failures are observed immediately, even if an earlier batch
+    is still running. Results are merged and new work assigned in grid order.
+    """
+
+    def __init__(self, devices, spec):
+        if not devices:
+            raise ValueError("An RGF process pool requires at least one device.")
+        self.devices = [torch.device(device) for device in devices]
+        self.processes = []
+        self.connections = []
+        self.worker_pids = []
+        self.closed = False
+        context = mp.get_context("spawn")
+        try:
+            for device in self.devices:
+                parent, child = context.Pipe()
+                process = context.Process(target=_rgf_worker_main,
+                                          args=(child, str(device), spec))
+                try:
+                    process.start()
+                except BaseException:
+                    parent.close()
+                    raise
+                finally:
+                    child.close()
+                self.connections.append(parent)
+                self.processes.append(process)
+            ready = {}
+            while len(ready) < len(self.processes):
+                slot, packet = self._receive()
+                if packet[0] != "ready" or slot in ready:
+                    raise RGFWorkerError(f"Unexpected RGF startup reply: {packet[0]}")
+                ready[slot] = packet[1]
+            self.worker_pids = [ready[slot] for slot in range(len(self.processes))]
+        except BaseException:
+            self.terminate()
+            raise
+
+    @classmethod
+    def from_runner(cls, runner):
+        """Pass saved H/S paths and metadata; workers read the files themselves."""
+        from dpnegf.negf.rgf_solver import rgf_solver_options
+        prop = runner.deviceprop
+        ham = prop.hamiltonian
+        spec = _cpu_payload({
+            "default_dtype": torch.get_default_dtype(),
+            "options": rgf_solver_options(runner),
+            "hamiltonian": {
+                "cache_path": ham.saved_HS_path or ham.results_path,
+                "device_norbs": ham.device_norbs,
+                "input_orbital_mapping": getattr(ham, "_input_orbital_mapping", None),
+            },
+            "device": {name: getattr(prop, name) for name in (
+                "results_path", "e_T", "chemiPot", "E_ref")},
+            "leads": {
+                name: {key: getattr(getattr(prop, name), key) for key in (
+                    "voltage", "e_T", "efermi", "E_ref")}
+                for name in ("lead_L", "lead_R")
+            },
+        })
+        return cls(runner.rgf_devices, spec)
+
+    def _receive(self):
+        handles = self.connections + [process.sentinel for process in self.processes]
+        readable = wait(handles)
+        for slot, connection in enumerate(self.connections):
+            if connection in readable:
+                try:
+                    packet = _recv_packet(connection)
+                except (OSError, EOFError) as exc:
+                    raise RGFWorkerError(f"RGF worker on {self.devices[slot]} disconnected") from exc
+                if packet[0] == "error":
+                    _, kind, message, trace = packet
+                    raise RGFWorkerError(
+                        f"RGF worker on {self.devices[slot]} failed ({kind}): {message}\n{trace}")
+                return slot, packet
+        for slot, process in enumerate(self.processes):
+            if process.sentinel in readable:
+                raise RGFWorkerError(
+                    f"RGF worker on {self.devices[slot]} exited with code {process.exitcode}")
+        raise RGFWorkerError("No RGF worker reply was received")
+
+    def run_energy_loop(self, grid, k, ik, bias, out):
+        if self.closed:
+            raise RuntimeError("RGF process pool is closed")
+        try:
+            per_device = max(1, len(grid) // len(self.processes))
+            for connection in self.connections:
+                _send_packet(connection, ("chunk_size", (
+                    per_device, _cpu_payload(k), _cpu_payload(bias))))
+            caps = {}
+            while len(caps) < len(self.processes):
+                slot, packet = self._receive()
+                if packet[0] != "chunk_size" or slot in caps:
+                    raise RGFWorkerError(f"Unexpected RGF batch-size reply: {packet[0]}")
+                caps[slot] = packet[1]
+            chunk = min(caps.values())
+            log.info("Multi-GPU RGF spawn workers %s on %s; e_batch_size=%s per GPU",
+                     self.worker_pids, [str(device) for device in self.devices], chunk)
+            batches = iter(enumerate(torch.split(grid.detach().cpu(), chunk)))
+            active, completed = {}, {}
+
+            def submit(slot):
+                item = next(batches, None)
+                if item is None:
+                    return
+                index, energies = item
+                _send_packet(self.connections[slot], ("solve", (
+                    index, energies, _cpu_payload(k), ik, _cpu_payload(bias), index * chunk)))
+                active[slot] = index
+
+            for slot in range(len(self.processes)):
+                submit(slot)
+            next_index = 0
+            while active:
+                slot, packet = self._receive()
+                if packet[0] != "result" or active.get(slot) != packet[1]:
+                    raise RGFWorkerError(f"Unexpected RGF result: {packet[0]}")
+                completed[packet[1]] = (slot, packet[2])
+                while next_index in completed:
+                    slot, outputs = completed.pop(next_index)
+                    for name, by_k in outputs.items():
+                        out.setdefault(name, {}).setdefault(str(k), []).extend(by_k[str(k)])
+                    del active[slot]
+                    submit(slot)
+                    next_index += 1
+        except BaseException:
+            self.terminate()
+            raise
+
+    def terminate(self):
+        """Stop all workers, including peers blocked in a solver or IPC send."""
+        if self.closed:
+            return
+        self.closed = True
+        for process in self.processes:
+            if process.is_alive():
+                process.terminate()
+        for process in self.processes:
+            process.join(timeout=2)
+        for process in self.processes:
+            if process.is_alive():
+                process.kill()
+        for process in self.processes:
+            process.join(timeout=2)
+        for connection in self.connections:
+            connection.close()
+
+    def close(self):
+        if self.closed:
+            return
+        try:
+            for connection in self.connections:
+                _send_packet(connection, ("close", ()))
+            for process in self.processes:
+                process.join(timeout=2)
+        finally:
+            self.terminate()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.close()
+        else:
+            self.terminate()
 
 
 class MPIMultiLevel:

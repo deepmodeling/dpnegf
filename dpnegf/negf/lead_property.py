@@ -240,7 +240,7 @@ class LeadProperty(object):
         """
         if save_format == "pth":
             try:
-                se = torch.load(save_path, weights_only=False)
+                se = torch.load(save_path, map_location="cpu", weights_only=False)
             except Exception as e:
                 raise IOError(f"Failed to load self-energy from {save_path} (pth format).") from e
 

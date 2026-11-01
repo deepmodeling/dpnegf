@@ -185,7 +185,8 @@ def negf():
                                "on-disk cache, and CPU parallelism (joblib workers, "
                                "BLAS threads, ek batching).")
     doc_rgf_options = ("Recursive Green's function stage options: compute device "
-                       "('cpu' or 'cuda') and energy-loop chunk size. Independent "
+                       "('cpu' or 'cuda[:index]'), optional multiple CUDA devices, "
+                       "and energy-loop chunk size. Independent "
                        "from the self-energy pool, which always runs on CPU.")
     doc_hs_cache = "On-disk cache of the device Hamiltonian and overlap matrix."
     doc_density_options = ""
@@ -214,15 +215,55 @@ def negf():
         Argument("eta_lead", [int, float], optional=True, default=1e-5, doc=doc_eta_lead),
         Argument("eta_device", [int, float], optional=True, default=0., doc=doc_eta_device),
         Argument("trans_eigs_options", dict, optional=True, default={}, sub_fields=[
-            Argument("incoming", str, optional=True, default="left"),
-            Argument("n_channels", [int, None], optional=True, default=None),
-            Argument("channel_indices", [list, None], optional=True, default=None),
-            Argument("return_format", str, optional=True, default="original"),
-            Argument("psd_atol", [float, int], optional=True, default=0.),
-            Argument("psd_rtol", [float, int, None], optional=True, default=None),
-            Argument("rank_atol", [float, int], optional=True, default=0.),
-            Argument("rank_rtol", [float, int, None], optional=True, default=None),
-        ], doc="Contact thresholds and channel selection; indices are zero based."),
+            Argument("incoming", str, optional=True, default="left",
+                     doc="Incident lead: 'left' (default) or 'right'. Sets the propagation direction for both eigenvalues and channels."),
+            Argument("n_channels", [int, None], optional=True, default=None,
+                     doc=("Number of channels whose complex LCAO coefficients are reconstructed and saved, "
+                          "selected by descending transmission eigenvalue. Must be nonnegative; 0 returns "
+                          "coefficient tensors with zero channel columns, None (default) selects all thin-SVD channels, and values exceeding "
+                          "the available count select all. Does not truncate tau_all or the total transmission; "
+                          "tau_selected contains the selected values. Mutually exclusive with channel_indices "
+                          "when both are non-null. Ignored when only trans_eigvals is enabled.")),
+            Argument("channel_indices", [list, None], optional=True, default=None,
+                     doc=("Unique nonnegative integer indices into the descending thin-SVD transmission "
+                          "spectrum, starting at zero; e.g. [0, 2] reconstructs the first and third channels "
+                          "in that order. Indices must be within the available spectrum at every energy/k point. "
+                          "None (default) selects all channels unless n_channels is set; [] selects none. "
+                          "Mutually exclusive with a non-null n_channels. Does not truncate tau_all; "
+                          "ignored when only trans_eigvals is enabled.")),
+            Argument("return_format", str, optional=True, default="original",
+                     doc=("Channel coefficient layout: 'original' (default) returns a complex tensor "
+                          "[device orbitals, selected channels] in original input device orbital order; "
+                          "'blocks' returns a list of tensors in actual H/S block order. Original order "
+                          "requires a validated orbital mapping from the loaded H/S cache; if mapping is "
+                          "unknown, use 'blocks' or regenerate the cache. Ignored for eigenvalues-only output.")),
+            Argument("psd_atol", [float, int], optional=True, default=0.,
+                     doc=("Finite nonnegative absolute tolerance for Hermitian/positive-semidefinite checks "
+                          "of each contact broadening Gamma=i(Sigma-Sigma^dagger), in Gamma's energy unit. "
+                          "Default: 0. Hermitian residual tolerance is psd_atol + psd_rtol*||Gamma||_F; "
+                          "negative eigenvalues below -max(psd_atol, psd_rtol*max(abs(eig(Gamma)))) raise an error. "
+                          "This is independent of the positive-eigenvalue rank cutoff.")),
+            Argument("psd_rtol", [float, int, None], optional=True, default=None,
+                     doc=("Finite nonnegative dimensionless relative tolerance for the contact broadening "
+                          "Hermitian/PSD checks, combined with psd_atol. None (default) uses 100*n*eps, "
+                          "where n=max(1, contact dimension) and eps is machine precision of the real dtype.")),
+            Argument("rank_atol", [float, int], optional=True, default=0.,
+                     doc=("Finite nonnegative absolute rank cutoff for the contact broadening, in Gamma's "
+                          "energy unit. Retain only eigenvalues strictly greater than "
+                          "max(rank_atol, rank_rtol*largest_nonnegative_eigenvalue). Default: 0. "
+                          "Affects both eigenvalues and channels. Discarding weak contact directions can "
+                          "change transmission at narrow resonances; discarded broadening is not a "
+                          "transmission error bound.")),
+            Argument("rank_rtol", [float, int, None], optional=True, default=None,
+                     doc=("Finite nonnegative dimensionless relative rank cutoff for the contact broadening, "
+                          "combined with rank_atol. None (default) uses n*eps, where n=max(1, contact dimension) "
+                          "and eps is machine precision of the real dtype. This contact-rank cutoff is not "
+                          "a cutoff on transmission eigenvalues.")),
+        ], doc=("Transmission eigenvalue/channel options, used when output_options.trans_eigvals or "
+                "output_options.trans_eigchannel is true; either output automatically enables full RGF. "
+                "Each energy/k point is decomposed independently. Channel selection only controls coefficient "
+                "reconstruction and tau_selected; tau_all retains the full explicit thin-SVD spectrum, "
+                "without implicit zero input directions. Degenerate channels may undergo unitary rotations.")),
         Argument("output_options", dict, optional=True, default={}, sub_fields=output_options(), doc=doc_output_options),
     ]
 
@@ -232,9 +273,15 @@ def output_options():
         Argument("dos", bool, optional=True, default=False, doc="Write density of states."),
         Argument("tc", bool, optional=True, default=False, doc="Write transmission coefficient."),
         Argument("trans_eigvals", bool, optional=True, default=False,
-                 doc="Write per-k/energy transmission eigenvalues using full RGF."),
+                 doc=("Write per-k/energy transmission eigenvalues to negf.out.pth; automatically enables "
+                      "full RGF. Does not reconstruct channel coefficients. Controlled by trans_eigs_options "
+                      "direction and contact thresholds; channel selection does not truncate the spectrum. Default: False.")),
         Argument("trans_eigchannel", bool, optional=True, default=False,
-                 doc="Write spectral-normalized complex LCAO transmission channels using full RGF."),
+                 doc=("Write spectral-normalized complex LCAO transmission channels using full RGF, "
+                      "automatically enabled for this output. Each energy's coefficients are transferred to CPU "
+                      "and saved separately under trans_eigchannel/kXXXXXX/eXXXXXXXX.pth before proceeding; "
+                      "negf.out.pth contains file indices. Each channel record also includes the full "
+                      "eigenvalue spectrum. Selection and layout follow trans_eigs_options. Default: False.")),
         Argument("conductance", bool, optional=True, default=False, 
                  doc="Write zero-bias non-SCF conductance; requires unit=eV and ele_T>0."),
         Argument("density", bool, optional=True, default=False, doc="Write electron density."),
@@ -296,14 +343,30 @@ def self_energy_options():
 
 def rgf_options_group():
     doc_device = ("Device used only for the RGF (recursive Green's function) step. "
-                  "'cpu' (default) or 'cuda'. Hamiltonian initialization always runs "
-                  "on CPU (it is the memory-heavy phase). Self-energy always runs on "
-                  "CPU because it goes through joblib + numba.")
+                  "'cpu' (default) or 'cuda[:index]'. 'cuda' uses the current CUDA "
+                  "device (normally logical cuda:0, subject to CUDA_VISIBLE_DEVICES). "
+                  "Model construction and Hamiltonian initialization use the top-level "
+                  "device option independently. Overridden by devices when supplied. "
+                  "Self-energy always runs on CPU "
+                  "because it goes through joblib + numba.")
+    doc_devices = ("Optional list of explicit logical CUDA devices, e.g. "
+                   "['cuda:0', 'cuda:1']. Overrides device. With multiple devices, "
+                   "non-SCF energy batches run in one independent spawn process per GPU, "
+                   "with a model-independent cache solver. The worker pool is reused "
+                   "across k points and all workers are terminated on failure. "
+                   "One batch runs per GPU and results retain energy-grid order. Each GPU holds its own "
+                   "H/S blocks. Only the energy-grid RGF sweep is distributed; "
+                   "density and local-current integrals use the first device. "
+                   "Multiple devices require scf=false. Indices follow CUDA_VISIBLE_DEVICES.")
     doc_e_batch = ("Number of energy points solved in one batched RGF call. None "
                    "(default) auto-picks from free CUDA memory on 'cuda'; on 'cpu' "
-                   "the full grid is used.")
+                   "the full grid is used. In multi-GPU mode this is the batch size "
+                   "per GPU; None uses the smallest device memory budget and "
+                   "splits the grid into at least one batch per selected GPU "
+                   "when there are enough energy points.")
     return [
         Argument("device", str, optional=True, default="cpu", doc=doc_device),
+        Argument("devices", [list, None], optional=True, default=None, doc=doc_devices),
         Argument("e_batch_size", [int, float, None], optional=True, default=None, doc=doc_e_batch),
     ]
 
@@ -556,9 +619,10 @@ def run_options():
     doc_task = "Which transport task to run and its detailed options. See `task_options` below."
     doc_structure = "Path to the structure file (xyz/vasp/etc.). Overrides the CLI `--structure` flag when set."
     doc_gui = "Whether to launch the GUI. Default: False."
-    doc_device = ("The torch device for model construction, Hamiltonian initialization and"
-                  "lead electronic structure. Choose 'cpu' or 'cuda[:int]'."
-                  "Default: None (use the device stored in the model ckpt). RGF uses rgf_options.device.")
+    doc_device = ("The torch device for model construction, Hamiltonian initialization and "
+                  "lead electronic structure. Choose 'cpu' or 'cuda[:int]'. "
+                  "Default: None (use the device stored in the model ckpt). "
+                  "RGF uses rgf_options.device or rgf_options.devices.")
     doc_dtype = ("Floating precision used at build time. 'float32' or 'float64'. "
                   "Default: None (use the dtype stored in the model ckpt).")
     doc_pbc = ("Overall periodic boundary condition of the input structure. "
