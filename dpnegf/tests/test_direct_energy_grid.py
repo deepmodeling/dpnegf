@@ -24,12 +24,12 @@ def config(key, energies):
 
 
 @pytest.mark.parametrize("key", ["energies", "enerigies"])
-@pytest.mark.parametrize("energies", [[0.125], [-0.4, -0.03, 0, 0.27], [0.2, -0.1, 0.2]])
-def test_direct_input_generates_exact_runner_grid(key, energies):
+@pytest.mark.parametrize("energies,expected", [([0.125], [0.125]), ([-0.4, -0.03, 0, 0.27], [-0.4, -0.03, 0, 0.27]), ([0.2, -0.1, 0.2], [0.2, -0.1])])
+def test_direct_input_generates_exact_runner_grid(key, energies, expected):
     from dpnegf.runner.NEGF import NEGF
 
     task = normalize_run(config(key, energies))["task_options"]
-    assert task["energy_grid"] == {"method": "direct", "energies": energies}
+    assert task["energy_grid"] == {"method": "direct", "energies": expected}
     negf = NEGF.__new__(NEGF)
     negf.scf = False
     for name in ("density", "potential", "current", "lcurrent", "dos", "current_nscf", "ldos", "conductance"):
@@ -37,10 +37,17 @@ def test_direct_input_generates_exact_runner_grid(key, energies):
     negf.out_tc = True
     negf.energy_grid_options = task["energy_grid"]
     negf.generate_energy_grid()
-    assert torch.equal(negf.uni_grid, torch.tensor(energies, dtype=torch.float64))
+    assert torch.equal(negf.uni_grid, torch.tensor(expected, dtype=torch.float64))
     assert negf.energy_grid is negf.uni_grid
     # The Python API also accepts either spelling without JSON normalization.
-    np.testing.assert_array_equal(direct_nodes({key: energies}), energies)
+    np.testing.assert_array_equal(direct_nodes({key: energies}), expected)
+
+
+def test_direct_cache_precision_collision_rejected_before_run():
+    with pytest.raises(ValueError, match="cache precision"):
+        normalize_run(config("energies", [0.1, 0.100000001]))
+    with pytest.raises(ValueError, match="cache precision"):
+        direct_nodes({"energies": [0.1, 0.100000001]})
 
 
 @pytest.mark.parametrize("energies", [[], [float("nan")], [float("inf")], [True], ["0.1"], [[0.1]], [None]])
@@ -56,12 +63,19 @@ def test_missing_direct_energies():
         normalize_run(raw)
 
 
-@pytest.mark.parametrize("energies", [[0.1], [0.2, -0.1], [-0.1, -0.1, 0.2]])
+@pytest.mark.parametrize("energies", [[0.1], [0.2, -0.1], [-0.1, -0.1]])
 def test_direct_conductance_requires_increasing_grid(energies):
     task = config("energies", energies)["task_options"]
     task["output_options"]["conductance"] = True
     with pytest.raises(ValueError, match="strictly increasing"):
         validate_energy_options(task)
+
+
+def test_direct_conductance_deduplicates_before_validation():
+    task = config("energies", [-0.1, -0.1, 0.2])["task_options"]
+    task["output_options"]["conductance"] = True
+    validate_energy_options(task)
+    assert task["energy_grid"]["energies"] == [-0.1, 0.2]
 
 
 def test_direct_conductance_on_nonuniform_nodes():

@@ -75,7 +75,7 @@ def uniform_nodes(options):
 
 
 def direct_nodes(options):
-    """Return explicitly supplied energies without sorting or resampling."""
+    """Return unique explicit energies in their original order."""
     values = options.get("energies", options.get("enerigies"))
     if (
         not isinstance(values, list)
@@ -88,7 +88,10 @@ def direct_nodes(options):
     energies = np.asarray(values, dtype=np.float64)
     if not np.isfinite(energies).all():
         raise ValueError("direct grid requires energies to be a nonempty list of finite numbers")
-    return energies
+    unique = list(dict.fromkeys(energies))
+    if len({f"{e:.8f}" for e in unique}) != len(unique):
+        raise ValueError("Distinct energy nodes collide at the self-energy cache precision (8 decimals)")
+    return np.asarray(unique, dtype=np.float64)
 
 
 def clenshaw_curtis_nodes(

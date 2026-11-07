@@ -107,7 +107,8 @@ def energy_grid_options():
         Argument("direct", dict, [
             Argument("energies", list, optional=False, alias=["enerigies"],
                      doc="Nonempty list of finite energies relative to E_ref in unit. "
-                         "Values and order are preserved, including a single point. "
+                         "Duplicate values are removed, preserving first occurrence order. "
+                         "Distinct values must not collide at 8 decimal places. "
                          "Conductance requires at least two strictly increasing points."),
         ]),
     ], optional=True, default_tag="uniform")
@@ -138,6 +139,8 @@ def validate_energy_options(task):
         energies = direct_nodes(grid)
         if conductance:
             trapezoid_weights(energies)
+        grid["energies"] = energies.tolist()
+        grid.pop("enerigies", None)
     elif method == "clenshaw_curtis":
         clenshaw_curtis_nodes(grid.get("num_points", 33), task["ele_T"], grid.get("half_width", 0.4))
     else:
