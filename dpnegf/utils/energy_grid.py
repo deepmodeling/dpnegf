@@ -74,6 +74,26 @@ def uniform_nodes(options):
     return np.linspace(lo, hi, n, dtype=np.float64)
 
 
+def direct_nodes(options):
+    """Return unique explicit energies in their original order."""
+    values = options.get("energies", options.get("enerigies"))
+    if (
+        not isinstance(values, list)
+        or not values
+        or any(isinstance(e, (bool, np.bool_))
+               or not isinstance(e, (int, float, np.integer, np.floating))
+               for e in values)
+    ):
+        raise ValueError("direct grid requires energies to be a nonempty list of finite numbers")
+    energies = np.asarray(values, dtype=np.float64)
+    if not np.isfinite(energies).all():
+        raise ValueError("direct grid requires energies to be a nonempty list of finite numbers")
+    unique = list(dict.fromkeys(energies))
+    if len({f"{e:.8f}" for e in unique}) != len(unique):
+        raise ValueError("Distinct energy nodes collide at the self-energy cache precision (8 decimals)")
+    return np.asarray(unique, dtype=np.float64)
+
+
 def clenshaw_curtis_nodes(
     num_points=33,
     temperature=300.0,
@@ -168,8 +188,14 @@ def _clenshaw_curtis(options, mu, temperature):
     return mu + offsets, weights
 
 
+def _direct(options, mu, temperature):
+    energies = direct_nodes(options)
+    return energies, trapezoid_weights(energies) * fermi_window(energies, mu, temperature)
+
+
 GRID_METHODS = {
     "uniform": _uniform,
+    "direct": _direct,
     "clenshaw_curtis": _clenshaw_curtis,
 }
 

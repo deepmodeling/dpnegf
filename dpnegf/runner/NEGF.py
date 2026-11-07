@@ -21,7 +21,7 @@ from dpnegf.negf.lead_property import LeadProperty, compute_all_self_energy, _ha
 from dpnegf.utils.constants import Boltzmann, eV2J
 from dpnegf.utils.make_kpoints import kmesh_sampling_negf
 from dpnegf.utils.band_edge import validate_fermi_in_band_gap
-from dpnegf.utils.energy_grid import build_energy_grid, uniform_nodes
+from dpnegf.utils.energy_grid import build_energy_grid, uniform_nodes, direct_nodes
 from dpnegf.utils.conductance import integrate_conductance
 from dpnegf.utils.argcheck import validate_energy_options
 from dpnegf.utils.parrallel import (
@@ -591,6 +591,8 @@ class NEGF(object):
                 self.quadrature_grid = build_energy_grid(
                     self.energy_grid_options, centers, self.ele_T, labels)
                 self.uni_grid = torch.from_numpy(self.quadrature_grid.energies.copy())
+            elif self.energy_grid_options.get("method") == "direct":
+                self.uni_grid = torch.from_numpy(direct_nodes(self.energy_grid_options))
             else:
                 self.uni_grid = torch.from_numpy(uniform_nodes(self.energy_grid_options))
             self.energy_grid = self.uni_grid
