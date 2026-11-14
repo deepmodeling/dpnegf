@@ -290,12 +290,17 @@ class DeviceProperty(object):
         attachment.close()
 
     def release_shared_hs_owner(self):
-        """Drop parent tensor views before its shared region is unlinked."""
+        """Restore private H/S tensors before the pool unlinks shared storage."""
         shared = getattr(self, "_shared_hs_owner", None)
         if shared is None:
             return
         self.release_greenfuncs()
-        self._clear_hs_views()
+        private_blocks = {
+            name: [block.clone() for block in getattr(self, name)]
+            for name in ("hd", "sd", "hl", "hu", "sl", "su")
+        }
+        for name, blocks in private_blocks.items():
+            setattr(self, name, blocks)
         del self._shared_hs_owner
 
     def _load_hamiltonian(self, kpoint, potential, block_tridiagonal):
