@@ -64,7 +64,8 @@ class RGFSolver:
         return cls(prop, options)
 
     @torch.no_grad()
-    def compute_rgf_chunk(self, e_chunk, k, ik, Vbias, energy_offset=0, out=None):
+    def compute_rgf_chunk(self, e_chunk, k, ik, Vbias, energy_offset=0, out=None,
+                          shared_hs_version=None):
         """Solve one energy batch and append CPU outputs in energy order."""
         out = {} if out is None else out
         prop, options = self.deviceprop, self.options
@@ -104,6 +105,7 @@ class RGFSolver:
                 need_gr_lc=False, # set to False for memory saving, can be set to True for lead spectral function G^r * \Gamma * G^a
                 gf_cal_mode=options["gf_cal_mode"],
                 need_trans_eigs=options["need_trans_eigs"],
+                shared_hs_version=shared_hs_version,
                 )
 
             if options["need_trans_eigs"]:

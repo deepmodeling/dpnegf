@@ -27,7 +27,9 @@ from dpnegf.utils.argcheck import validate_energy_options
 from dpnegf.utils.parrallel import (
     _rgf_devices,
     _rgf_chunk_size,
+    _rgf_cpu_thread_limits,
     RGFProcessPool,
+    validate_rgf_options,
 )
 from dpnegf.negf.poisson_init import Grid,Interface3D,Dirichlet,Dielectric
 from dpnegf.negf.scf_method import PDIISMixer,DIISMixer,BroydenFirstMixer,BroydenSecondMixer,AndersonMixer
@@ -157,17 +159,25 @@ class NEGF(object):
         # --- unpack the three nested option groups added in the schema refactor ---
         # rgf_options: device placement and energy-loop chunking for the RGF sweep
         rgf_options = dict(rgf_options or {})
-        self.rgf_devices = _rgf_devices(rgf_options)
+        validated_rgf = validate_rgf_options(rgf_options, scf=scf)
+        self.cpu_workers = validated_rgf["cpu_workers"]
+        self.cpu_threads = validated_rgf["cpu_threads"]
+        self.rgf_main_threads = 1 if self.cpu_workers > 1 else self.cpu_threads
+        self.rgf_pool_options = {
+            name: validated_rgf[name] for name in (
+                "startup_timeout", "sync_timeout", "task_timeout",
+                "max_pending_results")
+        }
+        if self.cpu_workers > 1 and rgf_options.get("devices") is None:
+            self.rgf_devices = [torch.device("cpu")] * self.cpu_workers
+        else:
+            self.rgf_devices = _rgf_devices(rgf_options)
         self.rgf_device = self.rgf_devices[0]
         if len(self.rgf_devices) > 1 and scf:
             raise ValueError("Multi-GPU RGF currently requires scf=false.")
-        self.e_batch_size = rgf_options.get("e_batch_size", None)
-        if self.e_batch_size is not None:
-            batch = self.e_batch_size
-            if (isinstance(batch, bool) or not isinstance(batch, (int, float))
-                    or not np.isfinite(batch) or batch < 1 or int(batch) != batch):
-                raise ValueError("rgf_options.e_batch_size must be a positive integer or None.")
-            self.e_batch_size = int(batch)
+        self.e_batch_size = validated_rgf["e_batch_size"]
+        if self.cpu_workers > 1 and self.e_batch_size is None:
+            self.e_batch_size = 1
 
         # self_energy_options: solver, cache, and CPU parallelism for the SE sweep
         se_opts = dict(self_energy_options or {})
@@ -854,8 +864,11 @@ class NEGF(object):
         # Self-Energy Calculaiton or Loading
         self.prepare_self_energy(scf_require)
 
-        pool_context = (RGFProcessPool.from_runner(self)
-                        if len(self.rgf_devices) > 1 else nullcontext())
+        pool_context = (
+            RGFProcessPool.from_runner(self)
+            if self.cpu_workers > 1 or len(self.rgf_devices) > 1
+            else nullcontext()
+        )
         with pool_context as rgf_pool:
             self._negf_compute(scf_require, Vbias, rgf_pool=rgf_pool)
 
@@ -976,16 +989,18 @@ class NEGF(object):
                                         se_info_display=self.se_info_display
                                         )
 
-                            self.deviceprop.cal_green_function(
-                                energy=e, kpoint=k,
-                                eta_device=self.eta_device,
-                                block_tridiagonal=self.block_tridiagonal,
-                                Vbias=Vbias,
-                                need_lesser=False,
-                                need_greater=False,
-                                need_gr_lc=False,
-                                need_trans_eigs=self.need_trans_eigs,
-                                )
+                            with _rgf_cpu_thread_limits(
+                                    self.rgf_main_threads if self.rgf_device.type == "cpu" else None):
+                                self.deviceprop.cal_green_function(
+                                    energy=e, kpoint=k,
+                                    eta_device=self.eta_device,
+                                    block_tridiagonal=self.block_tridiagonal,
+                                    Vbias=Vbias,
+                                    need_lesser=False,
+                                    need_greater=False,
+                                    need_gr_lc=False,
+                                    need_trans_eigs=self.need_trans_eigs,
+                                    )
 
                             if self.need_trans_eigs:
                                 self.store_trans_eigs(k, ik)
@@ -996,12 +1011,14 @@ class NEGF(object):
                             if self.out_ldos:
                                 self.out.setdefault('LDOS', {}).setdefault(str(k), []).append(self.compute_LDOS(k))
                     else:
-                        if rgf_pool is not None:
-                            rgf_pool.run_energy_loop(self.uni_grid, k, ik, Vbias, self.out)
-                        else:
-                            chunk = _rgf_chunk_size(self, len(self.uni_grid), k, Vbias)
-                            for e_chunk in torch.split(self.uni_grid, chunk):
-                                self.compute_rgf_chunk(e_chunk, k, ik, Vbias)
+                        with _rgf_cpu_thread_limits(
+                                self.rgf_main_threads if self.rgf_device.type == "cpu" else None):
+                            if rgf_pool is not None:
+                                rgf_pool.run_energy_loop(self.uni_grid, k, ik, Vbias, self.out)
+                            else:
+                                chunk = _rgf_chunk_size(self, len(self.uni_grid), k, Vbias)
+                                for e_chunk in torch.split(self.uni_grid, chunk):
+                                    self.compute_rgf_chunk(e_chunk, k, ik, Vbias)
 
                     # over energy loop in uni_gird
                     # The following code is for output properties before NEGF ends

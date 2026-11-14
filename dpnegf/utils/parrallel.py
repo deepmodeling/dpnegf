@@ -1,16 +1,24 @@
 """Functions and classes for the parallel environment."""
 
+import copy
 import os
 import logging
 import multiprocessing as mp
-from multiprocessing.connection import wait
+import math
 import pickle
+import queue
+import threading
+import time
 import traceback
-from typing import Tuple, List, Any
+from contextlib import contextmanager
+from numbers import Integral, Real
+from typing import Any, List, Tuple
 import datetime
 
 import numpy as np
 import torch
+from joblib import cpu_count
+from threadpoolctl import threadpool_info, threadpool_limits
 
 try:
     from mpi4py import MPI
@@ -43,6 +51,94 @@ def _rgf_devices(options):
             raise ValueError(f"RGF CUDA device is unavailable: {device}.")
         resolved.append(device)
     return resolved
+
+
+def _positive_integer(value, name):
+    if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
+        raise ValueError(f"rgf_options.{name} must be a positive integer.")
+    return int(value)
+
+
+def _timeout_value(value, name):
+    if value is None:
+        return None
+    if (isinstance(value, bool) or not isinstance(value, Real)
+            or not math.isfinite(value) or value <= 0):
+        raise ValueError(f"rgf_options.{name} must be a positive finite number or None.")
+    return float(value)
+
+
+def _rgf_cpu_options(options):
+    workers = options.get("cpu_workers", 1)
+    workers = _positive_integer(workers, "cpu_workers")
+    threads = options.get("cpu_threads")
+    if threads is not None:
+        threads = _positive_integer(threads, "cpu_threads")
+    return {"cpu_workers": workers, "cpu_threads": threads}
+
+
+def _rgf_pool_options(options):
+    window = options.get("max_pending_results")
+    if window is not None:
+        _positive_integer(window, "max_pending_results")
+    return {
+        "startup_timeout": _timeout_value(options.get("startup_timeout", 600.0), "startup_timeout"),
+        "sync_timeout": _timeout_value(options.get("sync_timeout", 600.0), "sync_timeout"),
+        "task_timeout": _timeout_value(options.get("task_timeout", 3000.0), "task_timeout"),
+        "max_pending_results": window,
+    }
+
+
+def validate_rgf_options(options, scf=False):
+    """Normalize and cross-check CPU worker and process-pool settings."""
+    options = dict(options or {})
+    cpu = _rgf_cpu_options(options)
+    pool = _rgf_pool_options(options)
+    workers, threads = cpu["cpu_workers"], cpu["cpu_threads"]
+    explicit_devices = options.get("devices") is not None
+    device = torch.device(options.get("device", "cpu"))
+
+    if workers > 1 and scf:
+        raise ValueError("Multiple CPU RGF workers require scf=false.")
+    if (workers != 1 or threads is not None) and (explicit_devices or device.type == "cuda"):
+        raise ValueError("CPU RGF worker options cannot be combined with CUDA or rgf_options.devices.")
+
+    if workers > 1 or threads is not None:
+        effective_threads = threads if threads is not None else 1
+        budget = cpu_count()
+        if workers * effective_threads > budget:
+            raise ValueError(
+                f"rgf_options.cpu_workers * cpu_threads requests "
+                f"{workers * effective_threads} threads, exceeding the available CPU budget {budget}."
+            )
+
+    batch = options.get("e_batch_size")
+    if batch is not None and (
+        isinstance(batch, bool) or not isinstance(batch, Real)
+        or not math.isfinite(batch) or batch < 1 or int(batch) != batch
+    ):
+        raise ValueError("rgf_options.e_batch_size must be a positive integer or None.")
+    if workers > 1 and batch not in (None, 1):
+        raise ValueError("Multiple CPU RGF workers require e_batch_size=1 or None.")
+    return {
+        **cpu, **pool,
+        "e_batch_size": None if batch is None else int(batch),
+    }
+
+
+@contextmanager
+def _rgf_cpu_thread_limits(threads):
+    """Temporarily limit Torch and native CPU pools for one RGF phase."""
+    if threads is None:
+        yield
+        return
+    original = torch.get_num_threads()
+    try:
+        torch.set_num_threads(threads)
+        with threadpool_limits(limits=threads):
+            yield
+    finally:
+        torch.set_num_threads(original)
 
 
 def _auto_chunk_size(runner, n_grid):
@@ -152,28 +248,54 @@ def _recv_packet(connection):
 
 
 def _rgf_worker_main(connection, device, spec):
-    """Spawn entry point: build an independent solver, then serve all k points."""
+    """Spawn entry point: build a solver and serve synchronized RGF tasks."""
+    solver = None
     try:
-        from dpnegf.negf.rgf_solver import RGFSolver
         torch.set_default_dtype(spec["default_dtype"])
-        torch.set_num_threads(1)
         device = torch.device(device)
+        worker_threads = (1 if device.type == "cuda" else
+                          spec.get("options", {}).get("worker_threads", 1))
+        torch.set_num_threads(worker_threads)
+        torch.set_num_interop_threads(1)
         if device.type == "cuda":
             torch.cuda.set_device(device)
+        from dpnegf.negf.rgf_solver import RGFSolver
+
         solver = RGFSolver.from_cache(spec, device)
-        _send_packet(connection, ("ready", os.getpid()))
-        while True:
-            command, args = _recv_packet(connection)
-            if command == "close":
-                break
-            if command == "chunk_size":
-                _send_packet(connection, ("chunk_size", _rgf_chunk_size(solver, *args)))
-            elif command == "solve":
-                index, energies, k, ik, bias, offset = args
-                outputs = solver.compute_rgf_chunk(energies, k, ik, bias, offset)
-                _send_packet(connection, ("result", index, _cpu_payload(outputs)))
-            else:
-                raise ValueError(f"Unknown RGF worker command: {command}")
+        prop = solver.deviceprop
+        with threadpool_limits(limits=worker_threads):
+            _send_packet(connection, ("ready", {
+                "pid": os.getpid(), "device": str(device),
+                "torch_intra_threads": torch.get_num_threads(),
+                "torch_inter_threads": torch.get_num_interop_threads(),
+                "threadpools": threadpool_info(),
+            }))
+            while True:
+                command, args = _recv_packet(connection)
+                if command == "close":
+                    break
+                if command == "shared_hs":
+                    descriptor = args
+                    prop.install_shared_hs(descriptor)
+                    _send_packet(connection, (
+                        "shared_hs", descriptor["version"], descriptor["name"]))
+                elif command == "chunk_size":
+                    per_device, k, bias = args
+                    if device.type == "cpu" and getattr(prop, "_shared_hs_worker", False):
+                        batch_size = 1
+                    else:
+                        batch_size = _rgf_chunk_size(
+                            solver, per_device, k, bias)
+                    _send_packet(connection, ("chunk_size", batch_size))
+                elif command == "solve":
+                    index, energies, k, ik, bias, offset, shared_version = args
+                    outputs = solver.compute_rgf_chunk(
+                        energies, k, ik, bias, offset,
+                        shared_hs_version=shared_version,
+                    )
+                    _send_packet(connection, ("result", index, _cpu_payload(outputs)))
+                else:
+                    raise ValueError(f"Unknown RGF worker command: {command}")
     except (EOFError, BrokenPipeError):
         pass  # Parent closed or terminated the pool.
     except BaseException as exc:
@@ -182,6 +304,11 @@ def _rgf_worker_main(connection, device, spec):
         except (OSError, EOFError):
             pass
     finally:
+        if solver is not None:
+            try:
+                solver.deviceprop.detach_shared_hs()
+            except (BufferError, OSError):
+                pass
         connection.close()
 
 
@@ -190,27 +317,48 @@ class RGFWorkerError(RuntimeError):
 
 
 class RGFProcessPool:
-    """One persistent spawn process per device, with bounded in-flight batches.
+    """Persistent spawn workers with bounded, timeout-aware energy scheduling."""
 
-    Inputs contain only cache paths and numerical metadata. Replies may arrive
-    in any order; failures are observed immediately, even if an earlier batch
-    is still running. Results are merged and new work assigned in grid order.
-    """
-
-    def __init__(self, devices, spec):
+    def __init__(self, devices, spec, *, startup_timeout=600.0,
+                 sync_timeout=600.0, task_timeout=3000.0,
+                 max_pending_results=None, share_cpu_hs=False,
+                 cpu_threads=None):
         if not devices:
             raise ValueError("An RGF process pool requires at least one device.")
         self.devices = [torch.device(device) for device in devices]
+        self.startup_timeout = _timeout_value(startup_timeout, "startup_timeout")
+        self.sync_timeout = _timeout_value(sync_timeout, "sync_timeout")
+        self.task_timeout = _timeout_value(task_timeout, "task_timeout")
+        if max_pending_results is None:
+            self.max_pending_results = 2 * len(self.devices)
+        else:
+            self.max_pending_results = _positive_integer(
+                max_pending_results, "max_pending_results")
+        self.share_cpu_hs = bool(share_cpu_hs)
+        self.cpu_threads = cpu_threads
         self.processes = []
         self.connections = []
+        self.receiver_threads = []
+        self.process_watchers = []
+        self.messages = queue.Queue()
+        self._messages_lock = threading.Lock()
+        self.pending = {}
         self.worker_pids = []
+        self.worker_info = []
         self.closed = False
+        self._deviceprop = None
+        self.block_tridiagonal = spec.get("options", {}).get("block_tridiagonal", True)
+        self._shared_hs = None
+        self._owner_regions = []
         context = mp.get_context("spawn")
         try:
             for device in self.devices:
                 parent, child = context.Pipe()
                 process = context.Process(target=_rgf_worker_main,
                                           args=(child, str(device), spec))
+                started = time.monotonic()
+                self._set_pending(len(self.processes), "startup", started,
+                                  self.startup_timeout, {})
                 try:
                     process.start()
                 except BaseException:
@@ -220,20 +368,50 @@ class RGFProcessPool:
                     child.close()
                 self.connections.append(parent)
                 self.processes.append(process)
+                receiver = threading.Thread(
+                    target=self._receiver_main, args=(len(self.connections) - 1, parent),
+                    name=f"rgf-recv-{process.pid}", daemon=True,
+                )
+                receiver.start()
+                self.receiver_threads.append(receiver)
+                watcher = threading.Thread(
+                    target=self._watch_process_exit,
+                    args=(len(self.processes) - 1, process),
+                    name=f"rgf-exit-{process.pid}", daemon=True,
+                )
+                watcher.start()
+                self.process_watchers.append(watcher)
             ready = {}
             while len(ready) < len(self.processes):
-                slot, packet = self._receive()
+                slot, packet, _received_at = self._receive()
                 if packet[0] != "ready" or slot in ready:
                     raise RGFWorkerError(f"Unexpected RGF startup reply: {packet[0]}")
-                ready[slot] = packet[1]
+                self._clear_pending(slot)
+                info = packet[1]
+                if isinstance(info, dict):
+                    ready[slot] = info["pid"]
+                    self.worker_info.append((slot, info))
+                else:
+                    ready[slot] = info
             self.worker_pids = [ready[slot] for slot in range(len(self.processes))]
+            self.worker_info = [info for _slot, info in sorted(self.worker_info)]
+            for info in self.worker_info:
+                log.info(
+                    "RGF worker pid=%s device=%s torch_threads=%s/%s threadpools=%s",
+                    info.get("pid"), info.get("device"),
+                    info.get("torch_intra_threads"), info.get("torch_inter_threads"),
+                    info.get("threadpools"),
+                )
         except BaseException:
-            self.terminate()
+            try:
+                self.terminate()
+            except RGFWorkerError:
+                log.exception("RGF pool cleanup failed while handling startup error")
             raise
 
     @classmethod
-    def from_runner(cls, runner):
-        """Pass saved H/S paths and metadata; workers read the files themselves."""
+    def from_runner(cls, runner, share_cpu_hs=True):
+        """Create workers from cache paths; CPU workers share prepared H/S blocks."""
         from dpnegf.negf.rgf_solver import rgf_solver_options
         prop = runner.deviceprop
         ham = prop.hamiltonian
@@ -253,81 +431,299 @@ class RGFProcessPool:
                 for name in ("lead_L", "lead_R")
             },
         })
-        return cls(runner.rgf_devices, spec)
+        cpu_workers = getattr(runner, "cpu_workers", 1)
+        threads = getattr(runner, "cpu_threads", None)
+        worker_threads = threads if threads is not None else (1 if cpu_workers > 1 else None)
+        if worker_threads is not None:
+            spec["options"]["worker_threads"] = worker_threads
+        pool_options = getattr(runner, "rgf_pool_options", {})
+        pool = cls(
+            runner.rgf_devices, spec,
+            startup_timeout=pool_options.get("startup_timeout", 600.0),
+            sync_timeout=pool_options.get("sync_timeout", 600.0),
+            task_timeout=pool_options.get("task_timeout", 3000.0),
+            max_pending_results=pool_options.get("max_pending_results"),
+            share_cpu_hs=share_cpu_hs and cpu_workers > 1,
+            cpu_threads=worker_threads,
+        )
+        pool._deviceprop = prop
+        return pool
+
+    def _receiver_main(self, slot, connection):
+        while True:
+            try:
+                packet = _recv_packet(connection)
+                event = (slot, packet, None, time.monotonic())
+            except BaseException as exc:
+                event = (slot, None, exc, time.monotonic())
+            self._queue_message(event)
+            if event[1] is None:
+                return
+            del packet, event
+
+    def _queue_message(self, event):
+        with self._messages_lock:
+            if not self.closed:
+                self.messages.put(event)
+
+    def _watch_process_exit(self, slot, process):
+        exitcode = None
+        if all(hasattr(os, name) for name in ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")):
+            flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
+            while True:
+                try:
+                    status = os.waitid(os.P_PID, process.pid, flags)
+                except ChildProcessError:
+                    break
+                if status is not None and status.si_pid:
+                    exitcode = (
+                        status.si_status
+                        if status.si_code == getattr(os, "CLD_EXITED", 1)
+                        else -status.si_status
+                    )
+                    break
+                time.sleep(0.05)
+        else:
+            try:
+                from multiprocessing.connection import wait as wait_connections
+                wait_connections([process.sentinel])
+            except (OSError, ValueError):
+                return
+        self._queue_message((
+            slot, ("process_exit", exitcode), None, time.monotonic()))
+
+    def _set_pending(self, slot, phase, started, timeout, metadata):
+        deadline = None if timeout is None else started + timeout
+        self.pending[slot] = (phase, started, deadline, metadata)
+
+    def _clear_pending(self, slot):
+        self.pending.pop(slot, None)
+
+    def _timeout_error(self, slot, phase, started, deadline, metadata, now):
+        process = self.processes[slot]
+        elapsed = now - started
+        limit = "disabled" if deadline is None else f"{deadline - started:.1f}s"
+        detail = ""
+        if phase == "task":
+            detail = (
+                f"; task={metadata['index']}, k={metadata['k']}, ik={metadata['ik']}, "
+                f"energy=[{metadata['energy_start']:.8g}, {metadata['energy_end']:.8g}], "
+                f"offset={metadata['offset']}"
+            )
+        elif phase == "sync":
+            detail = f"; command={metadata.get('kind', 'shared H/S')}"
+        message = (
+            f"RGF {phase} timeout: pid={process.pid}, device={self.devices[slot]}, "
+            f"elapsed={elapsed:.1f}s, limit={limit}{detail}."
+        )
+        if phase == "task":
+            message += (
+                "\nThe calculation system may be too large for this timeout. "
+                "Increase rgf_options.task_timeout or set it to None to disable "
+                "the deadline. Slow I/O or a stalled worker may also cause this error."
+            )
+        return RGFWorkerError(message)
+
+    def _worker_exit_error(self, slot, exitcode):
+        process = self.processes[slot]
+        pending = self.pending.get(slot)
+        detail = ""
+        if pending is not None:
+            phase, _started, _deadline, metadata = pending
+            detail = f" while waiting for {phase}"
+            if phase == "task":
+                detail += (
+                    f" task={metadata['index']}, k={metadata['k']}, ik={metadata['ik']}, "
+                    f"energy=[{metadata['energy_start']:.8g}, "
+                    f"{metadata['energy_end']:.8g}], offset={metadata['offset']}"
+                )
+            elif phase == "sync":
+                detail += f" command={metadata.get('kind', 'sync')}"
+        return RGFWorkerError(
+            f"RGF worker exited: pid={process.pid}, device={self.devices[slot]}, "
+            f"exit-code={exitcode}{detail}."
+        )
 
     def _receive(self):
-        handles = self.connections + [process.sentinel for process in self.processes]
-        readable = wait(handles)
-        for slot, connection in enumerate(self.connections):
-            if connection in readable:
-                try:
-                    packet = _recv_packet(connection)
-                except (OSError, EOFError) as exc:
-                    raise RGFWorkerError(f"RGF worker on {self.devices[slot]} disconnected") from exc
-                if packet[0] == "error":
-                    _, kind, message, trace = packet
-                    raise RGFWorkerError(
-                        f"RGF worker on {self.devices[slot]} failed ({kind}): {message}\n{trace}")
-                return slot, packet
-        for slot, process in enumerate(self.processes):
-            if process.sentinel in readable:
+        while True:
+            deadlines = [record[2] for record in self.pending.values()
+                         if record[2] is not None]
+            timeout = None if not deadlines else max(0.0, min(deadlines) - time.monotonic())
+            try:
+                slot, packet, error, received_at = self.messages.get(timeout=timeout)
+            except queue.Empty:
+                now = time.monotonic()
+                expired = [
+                    (slot, record) for slot, record in self.pending.items()
+                    if record[2] is not None and now >= record[2]
+                ]
+                if expired:
+                    slot, record = min(expired, key=lambda item: item[1][2])
+                    raise self._timeout_error(slot, *record[:3], record[3], now)
+                continue
+
+            if error is not None:
+                process = self.processes[slot]
+                process.join(timeout=0.2)
+                if process.exitcode is not None:
+                    raise self._worker_exit_error(slot, process.exitcode) from error
                 raise RGFWorkerError(
-                    f"RGF worker on {self.devices[slot]} exited with code {process.exitcode}")
-        raise RGFWorkerError("No RGF worker reply was received")
+                    f"RGF worker on {self.devices[slot]} disconnected: {error}") from error
+            if packet[0] == "process_exit":
+                process = self.processes[slot]
+                process.join(timeout=0)
+                exitcode = process.exitcode if process.exitcode is not None else packet[1]
+                raise self._worker_exit_error(slot, exitcode)
+            pending = self.pending.get(slot)
+            if pending is not None and pending[2] is not None and received_at > pending[2]:
+                raise self._timeout_error(slot, *pending[:3], pending[3], received_at)
+            if packet[0] == "error":
+                _, kind, message, trace = packet
+                raise RGFWorkerError(
+                    f"RGF worker on {self.devices[slot]} failed ({kind}): {message}\n{trace}")
+            return slot, packet, received_at
+
+    def _sync_shared_hs(self, k, bias):
+        from dpnegf.utils.rgf_shared import SharedHS, contexts_equal, make_hs_context
+
+        prop = self._deviceprop
+        prop.prepare_hamiltonian(k, self.block_tridiagonal, bias)
+        context = make_hs_context(prop.kpoint, prop.V, prop.block_tridiagonal)
+        if self._shared_hs is not None and contexts_equal(self._shared_hs.context, context):
+            return
+
+        previous = self._shared_hs
+        version = 1 if previous is None else previous.version + 1
+        parts = tuple(getattr(prop, name) for name in ("hd", "sd", "hl", "hu", "sl", "su"))
+        shared = SharedHS.publish(parts, context, version)
+        self._owner_regions.append(shared)
+        shared.descriptor["orbital_mapping"] = copy.deepcopy(
+            getattr(prop, "_orbital_mapping_snapshot", None))
+        prop.install_shared_hs_owner(shared)
+        acknowledgements = set()
+        for slot, connection in enumerate(self.connections):
+            started = time.monotonic()
+            self._set_pending(slot, "sync", started, self.sync_timeout,
+                              {"kind": f"shared H/S version {version}"})
+            _send_packet(connection, ("shared_hs", shared.descriptor))
+        while len(acknowledgements) < len(self.connections):
+            slot, packet, _received_at = self._receive()
+            if (packet[0] != "shared_hs" or packet[1] != version
+                    or packet[2] != shared.descriptor["name"] or slot in acknowledgements):
+                raise RGFWorkerError(f"Unexpected shared H/S acknowledgement: {packet[0]}")
+            self._clear_pending(slot)
+            acknowledgements.add(slot)
+        self._shared_hs = shared
+        if previous is not None:
+            previous.close()
+            self._owner_regions.remove(previous)
+
+    @staticmethod
+    def _merge_outputs(out, k, outputs):
+        output_key = str(k)
+        worker_key = str(_cpu_payload(k))
+        for name, by_k in outputs.items():
+            out.setdefault(name, {}).setdefault(output_key, []).extend(by_k[worker_key])
 
     def run_energy_loop(self, grid, k, ik, bias, out):
         if self.closed:
             raise RuntimeError("RGF process pool is closed")
         try:
+            if len(grid) == 0:
+                return
+            if self.share_cpu_hs:
+                self._sync_shared_hs(k, bias)
+
             per_device = max(1, len(grid) // len(self.processes))
             for connection in self.connections:
+                slot = self.connections.index(connection)
+                started = time.monotonic()
+                self._set_pending(slot, "sync", started, self.sync_timeout,
+                                  {"kind": "batch-size"})
                 _send_packet(connection, ("chunk_size", (
-                    per_device, _cpu_payload(k), _cpu_payload(bias))))
+                    per_device if not self.share_cpu_hs else 1,
+                    None if self.share_cpu_hs else _cpu_payload(k),
+                    None if self.share_cpu_hs else _cpu_payload(bias))))
             caps = {}
             while len(caps) < len(self.processes):
-                slot, packet = self._receive()
+                slot, packet, _received_at = self._receive()
                 if packet[0] != "chunk_size" or slot in caps:
                     raise RGFWorkerError(f"Unexpected RGF batch-size reply: {packet[0]}")
+                self._clear_pending(slot)
                 caps[slot] = packet[1]
             chunk = min(caps.values())
-            log.info("Multi-GPU RGF spawn workers %s on %s; e_batch_size=%s per GPU",
+            log.info("RGF spawn workers %s on %s; e_batch_size=%s",
                      self.worker_pids, [str(device) for device in self.devices], chunk)
-            batches = iter(enumerate(torch.split(grid.detach().cpu(), chunk)))
-            active, completed = {}, {}
-
-            def submit(slot):
-                item = next(batches, None)
-                if item is None:
-                    return
-                index, energies = item
-                _send_packet(self.connections[slot], ("solve", (
-                    index, energies, _cpu_payload(k), ik, _cpu_payload(bias), index * chunk)))
-                active[slot] = index
-
-            for slot in range(len(self.processes)):
-                submit(slot)
+            grid_cpu = grid.detach().to("cpu")
+            total_tasks = (len(grid_cpu) + chunk - 1) // chunk
+            next_assign = 0
             next_index = 0
-            while active:
-                slot, packet = self._receive()
+            active, completed = {}, {}
+            scan_outputs = {}
+
+            def submit_available():
+                nonlocal next_assign
+                for slot in range(len(self.processes)):
+                    if (slot in active or next_assign >= total_tasks
+                            or len(active) + len(completed) >= self.max_pending_results):
+                        continue
+                    index = next_assign
+                    offset = index * chunk
+                    energies = grid_cpu[offset:min(offset + chunk, len(grid_cpu))].clone()
+                    metadata = {
+                        "index": index,
+                        "k": np.asarray(_cpu_payload(k)).tolist(), "ik": ik,
+                        "energy_start": float(energies[0]),
+                        "energy_end": float(energies[-1]), "offset": offset,
+                    }
+                    started = time.monotonic()
+                    self._set_pending(slot, "task", started, self.task_timeout, metadata)
+                    shared_version = self._shared_hs.version if self.share_cpu_hs else None
+                    _send_packet(self.connections[slot], ("solve", (
+                        index, energies, _cpu_payload(k), ik,
+                        None if self.share_cpu_hs else _cpu_payload(bias), offset,
+                        shared_version)))
+                    active[slot] = index
+                    next_assign += 1
+
+            submit_available()
+            while active or next_assign < total_tasks:
+                slot, packet, _received_at = self._receive()
                 if packet[0] != "result" or active.get(slot) != packet[1]:
                     raise RGFWorkerError(f"Unexpected RGF result: {packet[0]}")
+                self._clear_pending(slot)
+                del active[slot]
                 completed[packet[1]] = (slot, packet[2])
+                submit_available()
                 while next_index in completed:
-                    slot, outputs = completed.pop(next_index)
-                    for name, by_k in outputs.items():
-                        out.setdefault(name, {}).setdefault(str(k), []).extend(by_k[str(k)])
-                    del active[slot]
-                    submit(slot)
+                    _slot, outputs = completed.pop(next_index)
+                    self._merge_outputs(scan_outputs, k, outputs)
                     next_index += 1
+                submit_available()
+            self._merge_outputs(out, k, scan_outputs)
         except BaseException:
-            self.terminate()
+            try:
+                self.terminate()
+            except RGFWorkerError:
+                log.exception("RGF pool cleanup failed while handling worker error")
             raise
+
+    def _release_shared_hs(self):
+        prop = self._deviceprop
+        if prop is not None and hasattr(prop, "release_shared_hs_owner"):
+            prop.release_shared_hs_owner()
+        for region in list(self._owner_regions):
+            try:
+                region.close()
+            except (BufferError, FileNotFoundError, OSError):
+                pass
+        self._owner_regions.clear()
+        self._shared_hs = None
 
     def terminate(self):
         """Stop all workers, including peers blocked in a solver or IPC send."""
-        if self.closed:
-            return
-        self.closed = True
+        with self._messages_lock:
+            self.closed = True
         for process in self.processes:
             if process.is_alive():
                 process.terminate()
@@ -340,13 +736,34 @@ class RGFProcessPool:
             process.join(timeout=2)
         for connection in self.connections:
             connection.close()
+        threads = self.receiver_threads + self.process_watchers
+        for thread in threads:
+            thread.join(timeout=1)
+        alive_threads = [thread for thread in threads if thread.is_alive()]
+        with self._messages_lock:
+            while True:
+                try:
+                    self.messages.get_nowait()
+                except queue.Empty:
+                    break
+        self.pending.clear()
+        self._release_shared_hs()
+        if alive_threads:
+            details = ", ".join(
+                f"{thread.name}(ident={thread.ident})" for thread in alive_threads)
+            raise RGFWorkerError(
+                f"RGF pool cleanup left threads alive: {details}"
+            )
 
     def close(self):
         if self.closed:
             return
         try:
             for connection in self.connections:
-                _send_packet(connection, ("close", ()))
+                try:
+                    _send_packet(connection, ("close", ()))
+                except (OSError, EOFError):
+                    pass
             for process in self.processes:
                 process.join(timeout=2)
         finally:
@@ -359,7 +776,10 @@ class RGFProcessPool:
         if exc_type is None:
             self.close()
         else:
-            self.terminate()
+            try:
+                self.terminate()
+            except RGFWorkerError:
+                log.exception("RGF pool cleanup failed while handling calculation error")
 
 
 class MPIMultiLevel:

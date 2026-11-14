@@ -198,9 +198,9 @@ def negf():
                                "on-disk cache, and CPU parallelism (joblib workers, "
                                "BLAS threads, ek batching).")
     doc_rgf_options = ("Recursive Green's function stage options: compute device "
-                       "('cpu' or 'cuda[:index]'), optional multiple CUDA devices, "
-                       "and energy-loop chunk size. Independent "
-                       "from the self-energy pool, which always runs on CPU.")
+                       "('cpu' or 'cuda[:index]'), optional CPU workers or multiple "
+                       "CUDA devices, energy-loop chunk size, and worker deadlines. "
+                       "Independent from the self-energy pool, which always runs on CPU.")
     doc_hs_cache = "On-disk cache of the device Hamiltonian and overlap matrix."
     doc_density_options = ""
     doc_output_options = "Which physical quantities to write out at the end of the run."
@@ -388,15 +388,29 @@ def rgf_options_group():
                    "density and local-current integrals use the first device. "
                    "Multiple devices require scf=false. Indices follow CUDA_VISIBLE_DEVICES.")
     doc_e_batch = ("Number of energy points solved in one batched RGF call. None "
-                   "(default) auto-picks from free CUDA memory on 'cuda'; on 'cpu' "
-                   "the full grid is used. In multi-GPU mode this is the batch size "
-                   "per GPU; None uses the smallest device memory budget and "
-                   "splits the grid into at least one batch per selected GPU "
-                   "when there are enough energy points.")
+                   "(default) auto-picks from free CUDA memory on 'cuda'; on a "
+                   "single CPU it uses the full grid. In multi-GPU mode it is the "
+                   "batch size per GPU. Multiple CPU workers require batch size 1; "
+                   "null resolves to 1 in that mode.")
+    doc_cpu_workers = ("Number of CPU worker processes for the non-SCF RGF energy sweep. "
+                       "Default 1 runs in the main process; values above 1 use spawn "
+                       "workers and require e_batch_size=1 or null.")
+    doc_cpu_threads = ("Torch and BLAS/OpenMP threads per CPU RGF worker. Null leaves the "
+                       "single-process caller unchanged and uses one thread per spawned "
+                       "CPU worker.")
+    doc_timeout = "Positive finite worker deadline in seconds, or null to disable it."
+    doc_pending = ("Maximum number of in-flight plus completed-but-not-yet-merged energy "
+                   "batches. Null defaults to twice the worker count.")
     return [
         Argument("device", str, optional=True, default="cpu", doc=doc_device),
         Argument("devices", [list, None], optional=True, default=None, doc=doc_devices),
         Argument("e_batch_size", [int, float, None], optional=True, default=None, doc=doc_e_batch),
+        Argument("cpu_workers", int, optional=True, default=1, doc=doc_cpu_workers),
+        Argument("cpu_threads", [int, None], optional=True, default=None, doc=doc_cpu_threads),
+        Argument("startup_timeout", [int, float, None], optional=True, default=600.0, doc=doc_timeout),
+        Argument("sync_timeout", [int, float, None], optional=True, default=600.0, doc=doc_timeout),
+        Argument("task_timeout", [int, float, None], optional=True, default=3000.0, doc=doc_timeout),
+        Argument("max_pending_results", [int, None], optional=True, default=None, doc=doc_pending),
     ]
 
 
@@ -679,8 +693,14 @@ def normalize_run(data):
     run_op.check_value(data, strict=True)
 
     if data.get("task_options", {}).get("task") == "negf":
+        from dpnegf.utils.parrallel import validate_rgf_options
+
         validate_energy_options(data["task_options"])
         task = data["task_options"]
+        rgf_options = task["rgf_options"]
+        validated_rgf = validate_rgf_options(rgf_options, scf=task["scf"])
+        if validated_rgf["cpu_workers"] > 1 and rgf_options.get("e_batch_size") is None:
+            rgf_options["e_batch_size"] = 1
         if task["btd_initialization"] not in ["dense", "direct"]:
             raise ValueError(f"Invalid btd_initialization: {task['btd_initialization']}. Must be 'dense' or 'direct'.")
         if task["btd_initialization"] == "direct":
