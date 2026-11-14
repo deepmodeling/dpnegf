@@ -341,6 +341,7 @@ class RGFProcessPool:
         self.receiver_threads = []
         self.process_watchers = []
         self.messages = queue.Queue()
+        self._messages_lock = threading.Lock()
         self.pending = {}
         self.worker_pids = []
         self.worker_info = []
@@ -402,7 +403,10 @@ class RGFProcessPool:
                     info.get("threadpools"),
                 )
         except BaseException:
-            self.terminate()
+            try:
+                self.terminate()
+            except RGFWorkerError:
+                log.exception("RGF pool cleanup failed while handling startup error")
             raise
 
     @classmethod
@@ -452,9 +456,15 @@ class RGFProcessPool:
                 event = (slot, packet, None, time.monotonic())
             except BaseException as exc:
                 event = (slot, None, exc, time.monotonic())
-            self.messages.put(event)
+            self._queue_message(event)
             if event[1] is None:
                 return
+            del packet, event
+
+    def _queue_message(self, event):
+        with self._messages_lock:
+            if not self.closed:
+                self.messages.put(event)
 
     def _watch_process_exit(self, slot, process):
         exitcode = None
@@ -479,7 +489,7 @@ class RGFProcessPool:
                 wait_connections([process.sentinel])
             except (OSError, ValueError):
                 return
-        self.messages.put((
+        self._queue_message((
             slot, ("process_exit", exitcode), None, time.monotonic()))
 
     def _set_pending(self, slot, phase, started, timeout, metadata):
@@ -649,6 +659,7 @@ class RGFProcessPool:
             next_assign = 0
             next_index = 0
             active, completed = {}, {}
+            scan_outputs = {}
 
             def submit_available():
                 nonlocal next_assign
@@ -686,11 +697,15 @@ class RGFProcessPool:
                 submit_available()
                 while next_index in completed:
                     _slot, outputs = completed.pop(next_index)
-                    self._merge_outputs(out, k, outputs)
+                    self._merge_outputs(scan_outputs, k, outputs)
                     next_index += 1
                 submit_available()
+            self._merge_outputs(out, k, scan_outputs)
         except BaseException:
-            self.terminate()
+            try:
+                self.terminate()
+            except RGFWorkerError:
+                log.exception("RGF pool cleanup failed while handling worker error")
             raise
 
     def _release_shared_hs(self):
@@ -707,9 +722,8 @@ class RGFProcessPool:
 
     def terminate(self):
         """Stop all workers, including peers blocked in a solver or IPC send."""
-        if self.closed:
-            return
-        self.closed = True
+        with self._messages_lock:
+            self.closed = True
         for process in self.processes:
             if process.is_alive():
                 process.terminate()
@@ -722,11 +736,24 @@ class RGFProcessPool:
             process.join(timeout=2)
         for connection in self.connections:
             connection.close()
-        for receiver in self.receiver_threads:
-            receiver.join(timeout=1)
-        for watcher in self.process_watchers:
-            watcher.join(timeout=1)
+        threads = self.receiver_threads + self.process_watchers
+        for thread in threads:
+            thread.join(timeout=1)
+        alive_threads = [thread for thread in threads if thread.is_alive()]
+        with self._messages_lock:
+            while True:
+                try:
+                    self.messages.get_nowait()
+                except queue.Empty:
+                    break
+        self.pending.clear()
         self._release_shared_hs()
+        if alive_threads:
+            details = ", ".join(
+                f"{thread.name}(ident={thread.ident})" for thread in alive_threads)
+            raise RGFWorkerError(
+                f"RGF pool cleanup left threads alive: {details}"
+            )
 
     def close(self):
         if self.closed:
@@ -749,7 +776,10 @@ class RGFProcessPool:
         if exc_type is None:
             self.close()
         else:
-            self.terminate()
+            try:
+                self.terminate()
+            except RGFWorkerError:
+                log.exception("RGF pool cleanup failed while handling calculation error")
 
 
 class MPIMultiLevel:
