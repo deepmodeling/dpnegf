@@ -424,6 +424,9 @@ cover parent-side self-energy preparation, H/S loading and publication, or a
 whole NEGF run. A parent-side command send can also block before a worker reply
 deadline can be checked. A timeout terminates all workers and discards the
 incomplete sweep; no energy point is skipped or retried.</p>
+<p>At <code class="docutils literal notranslate"><span class="pre">INFO</span></code> level, each worker reports only its PID, device and Torch thread
+counts. Run the CLI with <code class="docutils literal notranslate"><span class="pre">-ll</span> <span class="pre">DEBUG</span></code> to include per-energy RGF chunk progress
+and the full BLAS/OpenMP <code class="docutils literal notranslate"><span class="pre">threadpool_info()</span></code> diagnostics.</p>
 <p>Python callers must use a main guard because workers use the <code class="docutils literal notranslate"><span class="pre">spawn</span></code> start
 method:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">dpnegf.entrypoints.run</span><span class="w"> </span><span class="kn">import</span> <span class="n">run</span>
