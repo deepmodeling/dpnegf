@@ -1734,7 +1734,7 @@ run_op:
             | type: ``dict``, optional, default: ``{}``
             | argument path: ``run_op/task_options[negf]/rgf_options``
 
-            Recursive Green's function stage options: compute device ('cpu' or 'cuda[:index]'), optional multiple CUDA devices, and energy-loop chunk size. Independent from the self-energy pool, which always runs on CPU.
+            Recursive Green's function stage options: compute device ('cpu' or 'cuda[:index]'), optional CPU workers or multiple CUDA devices, energy-loop chunk size, and worker deadlines. Independent from the self-energy pool, which always runs on CPU.
 
             .. _`run_op/task_options[negf]/rgf_options/device`: 
 
@@ -1758,7 +1758,55 @@ run_op:
                 | type: ``int`` | ``float`` | ``NoneType``, optional, default: ``None``
                 | argument path: ``run_op/task_options[negf]/rgf_options/e_batch_size``
 
-                Number of energy points solved in one batched RGF call. None (default) auto-picks from free CUDA memory on 'cuda'; on 'cpu' the full grid is used. In multi-GPU mode this is the batch size per GPU; None uses the smallest device memory budget and splits the grid into at least one batch per selected GPU when there are enough energy points.
+                Number of energy points solved in one batched RGF call. None (default) auto-picks from free CUDA memory on 'cuda'; on a single CPU it uses the full grid. In multi-GPU mode it is the batch size per GPU. Multiple CPU workers require batch size 1; null resolves to 1 in that mode.
+
+            .. _`run_op/task_options[negf]/rgf_options/cpu_workers`:
+
+            cpu_workers:
+                | type: ``int``, optional, default: ``1``
+                | argument path: ``run_op/task_options[negf]/rgf_options/cpu_workers``
+
+                Number of CPU worker processes for the non-SCF RGF energy sweep. Default 1 runs in the main process; values above 1 use spawn workers and require e_batch_size=1 or null.
+
+            .. _`run_op/task_options[negf]/rgf_options/cpu_threads`:
+
+            cpu_threads:
+                | type: ``int`` | ``NoneType``, optional, default: ``None``
+                | argument path: ``run_op/task_options[negf]/rgf_options/cpu_threads``
+
+                Torch and BLAS/OpenMP threads per CPU RGF worker. Null leaves the single-process caller unchanged and uses one thread per spawned CPU worker.
+
+            .. _`run_op/task_options[negf]/rgf_options/startup_timeout`:
+
+            startup_timeout:
+                | type: ``int`` | ``float`` | ``NoneType``, optional, default: ``600.0``
+                | argument path: ``run_op/task_options[negf]/rgf_options/startup_timeout``
+
+                Positive finite worker deadline in seconds, or null to disable it.
+
+            .. _`run_op/task_options[negf]/rgf_options/sync_timeout`:
+
+            sync_timeout:
+                | type: ``int`` | ``float`` | ``NoneType``, optional, default: ``600.0``
+                | argument path: ``run_op/task_options[negf]/rgf_options/sync_timeout``
+
+                Positive finite worker deadline in seconds, or null to disable it.
+
+            .. _`run_op/task_options[negf]/rgf_options/task_timeout`:
+
+            task_timeout:
+                | type: ``int`` | ``float`` | ``NoneType``, optional, default: ``3000.0``
+                | argument path: ``run_op/task_options[negf]/rgf_options/task_timeout``
+
+                Positive finite worker deadline in seconds, or null to disable it.
+
+            .. _`run_op/task_options[negf]/rgf_options/max_pending_results`:
+
+            max_pending_results:
+                | type: ``int`` | ``NoneType``, optional, default: ``None``
+                | argument path: ``run_op/task_options[negf]/rgf_options/max_pending_results``
+
+                Maximum number of in-flight plus completed-but-not-yet-merged energy batches. Null defaults to twice the worker count.
 
         .. _`run_op/task_options[negf]/e_fermi`: 
 
