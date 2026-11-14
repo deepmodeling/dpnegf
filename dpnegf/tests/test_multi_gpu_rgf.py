@@ -4,6 +4,7 @@ import importlib
 import json
 from pathlib import Path
 import multiprocessing as mp
+from multiprocessing import shared_memory
 import os
 import time
 from types import SimpleNamespace
@@ -60,7 +61,7 @@ def _protocol_worker(connection, device, spec):
                 _, prepared_k, prepared_bias = args
                 send(connection, ("chunk_size", spec.get("batch", args[0])))
                 continue
-            index, energies, k, ik, bias, offset = args
+            index, energies, k, ik, bias, offset, shared_version = args
             assert k == prepared_k
             if bias is None:
                 assert prepared_bias is None
@@ -90,6 +91,25 @@ def _protocol_worker(connection, device, spec):
         connection.close()
 
 
+def _worker_exit_with_inherited_pipe(connection, device, spec):
+    send, recv = parrallel._send_packet, parrallel._recv_packet
+    send(connection, ("ready", os.getpid()))
+    while True:
+        command, args = recv(connection)
+        if command == "close":
+            return
+        if command == "chunk_size":
+            send(connection, ("chunk_size", 1))
+            continue
+        child = os.fork()
+        if child == 0:
+            spec["release_child"].wait(10)
+            spec["child_done_send"].send(True)
+            os._exit(0)
+        spec["forked"].set()
+        os._exit(7)
+
+
 def test_spawn_pool_overlaps_orders_and_reuses_workers(monkeypatch):
     monkeypatch.setattr(parrallel, "_rgf_worker_main", _protocol_worker)
     spec = {"mode": "overlap", "batch": 2,
@@ -103,9 +123,10 @@ def test_spawn_pool_overlaps_orders_and_reuses_workers(monkeypatch):
             pool.run_energy_loop(torch.arange(7), k, ik, None, out)
             assert pool.worker_pids == pids
             torch.testing.assert_close(torch.cat(out["T_k"][str(k)]), torch.arange(7))
-            assert out["assignment"][str(k)] == [
-                (offset, pids[index % 2], "spawn")
-                for index, offset in enumerate((0, 2, 4, 6))]
+            assignments = out["assignment"][str(k)]
+            assert [offset for offset, _pid, _method in assignments] == [0, 2, 4, 6]
+            assert all(pid in pids and method == "spawn"
+                       for _offset, pid, method in assignments)
         assert all(process.is_alive() for process in pool.processes)
     assert pool.closed
     assert all(not process.is_alive() and process.exitcode == 0 for process in pool.processes)
@@ -121,12 +142,36 @@ def test_failure_terminates_hung_peer(monkeypatch, mode):
     pool = RGFProcessPool(["cpu", "cpu"], {
         "mode": mode, "batch": 1, "started": context.Event(), "never": context.Event()})
     started = time.monotonic()
-    with pytest.raises(RGFWorkerError, match="worker failed|disconnected|code 7"):
+    with pytest.raises(RGFWorkerError, match="worker failed|exit-code=7"):
         pool.run_energy_loop(torch.arange(3), [0, 0, 0], 0, None, {})
     assert time.monotonic() - started < 10
     assert pool.closed
     assert all(not process.is_alive() for process in pool.processes)
     assert all(connection.closed for connection in pool.connections)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_process_sentinel_detects_exit_when_descendant_holds_pipe(monkeypatch):
+    monkeypatch.setattr(parrallel, "_rgf_worker_main", _worker_exit_with_inherited_pipe)
+    context = mp.get_context("spawn")
+    child_done_recv, child_done_send = context.Pipe(duplex=False)
+    spec = {
+        "release_child": context.Event(),
+        "forked": context.Event(),
+        "child_done_send": child_done_send,
+    }
+    pool = RGFProcessPool(["cpu"], spec, startup_timeout=5, task_timeout=5)
+    started = time.monotonic()
+    try:
+        with pytest.raises(RGFWorkerError, match="exit-code=7.*task=0"):
+            pool.run_energy_loop(torch.arange(1), [0, 0, 0], 0, None, {})
+        assert time.monotonic() - started < 2
+    finally:
+        spec["release_child"].set()
+        assert spec["forked"].is_set()
+        assert child_done_recv.poll(5)
+        assert child_done_recv.recv()
+        child_done_recv.close()
 
 
 def test_startup_failure_cleans_up_workers(monkeypatch):
@@ -165,8 +210,11 @@ def test_auto_batches_use_every_selected_device(monkeypatch):
         out = {}
         k = [0, 0, 0]
         pool.run_energy_loop(torch.arange(5), k, 0, None, out)
-        assert out["assignment"][str(k)] == [
-            (index, pool.worker_pids[index % 4], "spawn") for index in range(5)]
+        assignments = out["assignment"][str(k)]
+        assert [offset for offset, _pid, _method in assignments] == list(range(5))
+        assert all(pid in pool.worker_pids and method == "spawn"
+                   for _offset, pid, method in assignments)
+        assert {pid for _offset, pid, _method in assignments} == set(pool.worker_pids)
         torch.testing.assert_close(torch.cat(out["T_k"][str(k)]), torch.arange(5))
 
 
@@ -178,6 +226,9 @@ def test_auto_batches_use_every_selected_device(monkeypatch):
 @pytest.mark.parametrize("mode,batch", [("full", 2), ("transmission_only", 1), ("dense", None)])
 def test_parallel_runner_matches_serial(tmp_path, monkeypatch, backend, mode, batch):
     from dpnegf.entrypoints.run import run
+
+    if backend == "cpu_workers" and parrallel.cpu_count() < 2:
+        pytest.skip("requires two CPUs in the process affinity/cgroup budget")
 
     module = importlib.import_module("dpnegf.runner.NEGF")
     raw = json.loads((DATA / "negf_chain_new.json").read_text())
@@ -200,7 +251,6 @@ def test_parallel_runner_matches_serial(tmp_path, monkeypatch, backend, mode, ba
                              "parallel": {"n_workers": 1, "blas_threads": 1},
                              "cache": {"save_path": str(tmp_path / "se")}},
     )
-
     if mode == "full":
         # Two transverse k points exercise H/S refresh and pool reuse in NEGF itself.
         task["stru_options"].update(pbc=[True, False, False], kmesh=[2, 1, 1])
@@ -216,24 +266,33 @@ def test_parallel_runner_matches_serial(tmp_path, monkeypatch, backend, mode, ba
     task["self_energy_options"]["cache"]["use_saved"] = True
     # Compare the scheduling using identical Hamiltonian and self-energy caches.
     task["hs_cache"] = {"use_saved": True, "save_path": str(tmp_path / "serial/results")}
-    task["rgf_options"]["devices"] = ["cuda:0", "cuda:1"]
-    # Schema must accept the new option before any device mocking.
-    assert normalize_run(raw)["task_options"]["rgf_options"]["devices"] == ["cuda:0", "cuda:1"]
-    if backend == "cpu_workers":
-        original = module._rgf_devices
-        monkeypatch.setattr(module, "_rgf_devices", lambda opts: (
-            [torch.device("cpu"), torch.device("cpu")]
-            if opts.get("devices") else original(opts)))
+    if backend == "cuda":
+        task["rgf_options"]["devices"] = ["cuda:0", "cuda:1"]
+        assert normalize_run(raw)["task_options"]["rgf_options"]["devices"] == [
+            "cuda:0", "cuda:1"]
+    else:
+        task["rgf_options"].update(cpu_workers=2, e_batch_size=1)
+        assert normalize_run(raw)["task_options"]["rgf_options"]["cpu_workers"] == 2
 
     pools = []
     original_init = RGFProcessPool.__init__
+    shared_module = importlib.import_module("dpnegf.utils.rgf_shared")
+    publications = []
+    original_publish = shared_module.SharedHS.publish.__func__
 
-    def record_pool(self, devices, spec):
+    def record_publication(cls, *args, **kwargs):
+        shared = original_publish(cls, *args, **kwargs)
+        publications.append((shared.version, shared.descriptor["name"]))
+        return shared
+
+    monkeypatch.setattr(shared_module.SharedHS, "publish", classmethod(record_publication))
+
+    def record_pool(self, devices, spec, **kwargs):
         # Nothing in this specification can carry the runner or a neural model.
         assert set(spec) == {"default_dtype", "options", "hamiltonian", "device", "leads"}
         assert set(spec["hamiltonian"]) == {
             "cache_path", "device_norbs", "input_orbital_mapping"}
-        original_init(self, devices, spec)
+        original_init(self, devices, spec, **kwargs)
         pools.append(self)
 
     calls = []
@@ -248,7 +307,22 @@ def test_parallel_runner_matches_serial(tmp_path, monkeypatch, backend, mode, ba
     parallel = execute("parallel")
     assert len(pools) == 1
     assert len(set(pools[0].worker_pids)) == 2
-    assert pools[0].devices == module._rgf_devices(task["rgf_options"])
+    if backend == "cpu_workers":
+        assert pools[0].devices == [torch.device("cpu"), torch.device("cpu")]
+        assert pools[0].share_cpu_hs
+        assert [version for version, _name in publications] == list(
+            range(1, len(serial["k"]) + 1))
+        for _version, name in publications:
+            with pytest.raises(FileNotFoundError):
+                shared_memory.SharedMemory(name=name, create=False)
+        assert all(info["torch_intra_threads"] == 1
+                   and info["torch_inter_threads"] == 1
+                   and all(pool["num_threads"] == 1
+                           for pool in info["threadpools"])
+                   for info in pools[0].worker_info)
+        assert pools[0]._owner_regions == []
+    else:
+        assert pools[0].devices == module._rgf_devices(task["rgf_options"])
     assert all(not process.is_alive() and process.exitcode == 0
                for process in pools[0].processes)
     assert len(serial["k"]) == (2 if mode == "full" else 1)

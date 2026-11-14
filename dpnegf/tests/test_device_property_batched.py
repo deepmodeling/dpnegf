@@ -124,6 +124,28 @@ def test_prepared_hamiltonian_is_reused_until_context_changes(tmp_path, change):
         dev.cal_transmission_eigs()
 
 
+def test_hamiltonian_context_comparison_is_exact_and_finite(tmp_path):
+    sizes = [3, 4, 2]
+    hd, sd, hl, hu, sl, su, *_ = _make_btd_inputs(1, sizes, seed=13)
+    dev = _make_deviceprop(sizes, hd, sd, hl, hu, sl, su)
+    dev.results_path = str(tmp_path)
+    original_load = dev.hamiltonian.get_hs_device
+    load = Mock(wraps=original_load)
+    dev.hamiltonian.get_hs_device = load
+
+    dev.prepare_hamiltonian([0.0, 0.0, 0.0], True, torch.tensor(0.1))
+    assert dev.kpoint.dtype == torch.float64
+    dev.prepare_hamiltonian([1e-8, 0.0, 0.0], True, torch.tensor(0.1))
+    dev.prepare_hamiltonian([1e-8, 0.0, 0.0], True, torch.tensor(0.10000001))
+    dev.prepare_hamiltonian([1e-8, 0.0, 0.0], True, torch.tensor([0.10000001]))
+    assert load.call_count == 4
+
+    with pytest.raises(ValueError, match="finite"):
+        dev.prepare_hamiltonian([1e-8, float("nan"), 0.0], True, torch.tensor(0.1))
+    with pytest.raises(ValueError, match="finite"):
+        dev.prepare_hamiltonian([0.0, 0.0, 0.0], True, torch.tensor(float("inf")))
+
+
 @pytest.fixture
 def solved_device(tmp_path):
     sizes = [3, 4, 2]
@@ -189,7 +211,7 @@ def test_failed_hamiltonian_switch_preserves_committed_context(solved_device, ch
     dev.prepare_hamiltonian(k, layout, bias)
     assert load.call_count == 2
     assert dev.hd is not previous["hd"]
-    torch.testing.assert_close(dev.kpoint, torch.tensor(k))
+    torch.testing.assert_close(dev.kpoint, torch.tensor(k, dtype=torch.float64))
     torch.testing.assert_close(dev.V, bias)
     assert dev.block_tridiagonal == layout
     dev.prepare_hamiltonian(k, layout, bias)
@@ -251,7 +273,7 @@ def test_context_tags_do_not_alias_mutable_inputs(solved_device):
     dev.hamiltonian.get_hs_device = load
     dev.prepare_hamiltonian(k, True, bias)
     k[0], bias[...] = 0.25, 0.3
-    torch.testing.assert_close(dev.kpoint, torch.tensor([0.5, 0., 0.]))
+    torch.testing.assert_close(dev.kpoint, torch.tensor([0.5, 0., 0.], dtype=torch.float64))
     torch.testing.assert_close(dev.V, torch.tensor(0.2))
     dev.prepare_hamiltonian(k, True, bias)
     assert load.call_count == 2
