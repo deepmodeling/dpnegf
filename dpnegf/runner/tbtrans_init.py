@@ -1,6 +1,5 @@
 import numpy as np
 import logging
-import shutil
 import re
 from dptb.utils.tools import j_loader,j_must_have
 from typing import Optional, Union
@@ -18,16 +17,13 @@ log = logging.getLogger(__name__)
 try:
     import sisl
     from sisl.orbital import Orbital
-    
+
     sisl_installed = True
-
 except ImportError:
-    log.error('sisl is not installed.Thus the input for TBtrans can not be generated, please install it first!')
+    # Availability is reported by the tbtrans_negf entry point, where the
+    # optional dependency is actually required. Importing this module and
+    # spawned RGF workers must not emit unrelated dependency messages.
     sisl_installed = False
-
-
-if  shutil.which('tbtrans') is None:
-    log.error('tbtrans is not in the Environment PATH. Thus the input for TBtrans can be generated but not run.')
  
 #  TBTransInputSet is used to transform input data for DeePTB-negf into TBtrans input files.
 #  TBtrans (Tight-Binding transport) is a generic computer program which calculates transport and other physical quantities

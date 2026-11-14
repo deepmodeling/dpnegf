@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import shutil
 from typing import Optional
 from pathlib import Path
 from dptb.nn.build import build_model
@@ -9,7 +10,6 @@ from dpnegf.utils.argcheck import normalize_run
 from dpnegf.utils.tools import j_loader
 from dpnegf.utils.tools import j_must_have
 from dpnegf.runner.NEGF import NEGF
-from dpnegf.runner.tbtrans_init import TBTransInputSet,sisl_installed
 
 
 
@@ -110,9 +110,19 @@ def run(
         #         report_file.write(profiler.output_html())
 
     elif task == 'tbtrans_negf':
-        if not(sisl_installed):
-            log.error(msg="sisl is required to perform tbtrans calculation !")
-            raise RuntimeError
+        # Keep optional TBtrans dependencies and diagnostics out of ordinary
+        # NEGF runs and out of spawned RGF workers re-importing the CLI.
+        from dpnegf.runner.tbtrans_init import TBTransInputSet, sisl_installed
+
+        if not sisl_installed:
+            raise RuntimeError(
+                "sisl is required to generate TBtrans input; please install it first."
+            )
+        if shutil.which('tbtrans') is None:
+            log.warning(
+                "tbtrans is not in the Environment PATH; input files can be "
+                "generated but TBtrans cannot be run."
+            )
         basis_dict = json.load(open(init_model))['common_options']['basis']
         tbtrans_init = TBTransInputSet(
             model=model, 

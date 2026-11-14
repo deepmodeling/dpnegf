@@ -397,10 +397,13 @@ class RGFProcessPool:
             self.worker_info = [info for _slot, info in sorted(self.worker_info)]
             for info in self.worker_info:
                 log.info(
-                    "RGF worker pid=%s device=%s torch_threads=%s/%s threadpools=%s",
+                    "RGF worker pid=%s device=%s torch_threads=%s/%s",
                     info.get("pid"), info.get("device"),
                     info.get("torch_intra_threads"), info.get("torch_inter_threads"),
-                    info.get("threadpools"),
+                )
+                log.debug(
+                    "RGF worker pid=%s threadpools=%s",
+                    info.get("pid"), info.get("threadpools"),
                 )
         except BaseException:
             try:

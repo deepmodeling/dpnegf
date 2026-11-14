@@ -70,7 +70,7 @@ class RGFSolver:
         out = {} if out is None else out
         prop, options = self.deviceprop, self.options
         e_batch_size = len(e_chunk)
-        log.info(
+        log.debug(
             f"computing green's functions on {self.rgf_device} for chunk "
             f"e=[{float(e_chunk[0]):>6.3f}..{float(e_chunk[-1]):>6.3f}], B={e_batch_size}"
         )
