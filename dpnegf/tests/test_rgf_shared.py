@@ -112,7 +112,8 @@ def test_context_matching_is_exact_and_shape_sensitive():
 
 def test_worker_context_is_float64_and_cannot_reload_unsynchronized_hs():
     parts = _parts()
-    context = make_hs_context([0.125, 0.0, 0.0], torch.tensor(0.2), True)
+    context = make_hs_context(
+        [0.125, 0.0, 0.0], torch.tensor(0.2, dtype=torch.float32), True)
     owner = SharedHS.publish(parts, context, version=1)
     deviceprop = DeviceProperty.__new__(DeviceProperty)
     deviceprop.greenfuncs = 0
@@ -139,6 +140,55 @@ def test_worker_context_is_float64_and_cannot_reload_unsynchronized_hs():
         torch.set_default_dtype(original_dtype)
         deviceprop.detach_shared_hs()
         owner.close()
+
+
+class _ReusableHamiltonian:
+    def __init__(self, parts):
+        self.parts = parts
+
+    def get_hs_device(self, kpoint, potential, block_tridiagonal, device=None):
+        return tuple([[block.to(device) for block in group] for group in self.parts])
+
+    def get_orbital_map(self):
+        return {"status": "unknown", "orbital_map": None}
+
+
+def test_owner_pool_release_restores_reusable_device_property(tmp_path):
+    parts = _parts()
+    deviceprop = DeviceProperty.__new__(DeviceProperty)
+    deviceprop.greenfuncs = 0
+    deviceprop.hamiltonian = _ReusableHamiltonian(parts)
+    deviceprop.rgf_device = torch.device("cpu")
+    deviceprop.results_path = str(tmp_path)
+    deviceprop.kpoint = None
+    deviceprop.prepare_hamiltonian(
+        [0.25, 0.0, -0.5], True, torch.tensor([0.1, 0.2]))
+    expected = {
+        name: [block.clone() for block in getattr(deviceprop, name)]
+        for name in ("hd", "sd", "hl", "hu", "sl", "su")
+    }
+    context = make_hs_context(deviceprop.kpoint, deviceprop.V, True)
+    shared = SharedHS.publish(
+        tuple(getattr(deviceprop, name) for name in ("hd", "sd", "hl", "hu", "sl", "su")),
+        context, version=1,
+    )
+    shared.descriptor["orbital_mapping"] = deviceprop._orbital_mapping_snapshot
+    deviceprop.install_shared_hs_owner(shared)
+
+    deviceprop.release_shared_hs_owner()
+    shared.close()
+    assert not hasattr(deviceprop, "_shared_hs_owner")
+    assert deviceprop.kpoint.dtype == torch.float64
+    assert torch.equal(deviceprop.V, torch.tensor([0.1, 0.2]))
+    for name, expected_blocks in expected.items():
+        actual_blocks = getattr(deviceprop, name)
+        assert len(actual_blocks) == len(expected_blocks)
+        for actual, expected_block in zip(actual_blocks, expected_blocks):
+            torch.testing.assert_close(actual, expected_block)
+            assert actual.untyped_storage().data_ptr() != expected_block.untyped_storage().data_ptr()
+
+    deviceprop.prepare_hamiltonian([0.25, 0.0, -0.5], True, torch.tensor([0.1, 0.2]))
+    assert all(hasattr(deviceprop, name) for name in expected)
 
 
 def test_owner_view_install_failure_can_release_shared_mapping():

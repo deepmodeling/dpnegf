@@ -178,6 +178,9 @@ def test_shared_mapping_timeout_unlinks_owner_region(monkeypatch, tmp_path):
         pool.run_energy_loop(torch.arange(2), [0.0, 0.0, 0.0], 0, None, {})
     assert spec["attached"].is_set()
     assert pool.closed and pool._owner_regions == []
+    assert all(hasattr(deviceprop, name) for name in ("hd", "sd", "hl", "hu", "sl", "su"))
+    assert not hasattr(deviceprop, "_shared_hs_owner")
+    deviceprop.prepare_hamiltonian([0.0, 0.0, 0.0], True, None)
     assert len(published_names) == 1
     with pytest.raises(FileNotFoundError):
         SharedHS.attach({
@@ -202,8 +205,23 @@ def test_shared_tasks_send_context_version_instead_of_bias(monkeypatch, tmp_path
         sent_bias, version = spec["seen_tasks"].get(timeout=2)
         assert sent_bias is None
         assert version == 1
+    assert all(hasattr(deviceprop, name) for name in ("hd", "sd", "hl", "hu", "sl", "su"))
+    assert not hasattr(deviceprop, "_shared_hs_owner")
+    deviceprop.prepare_hamiltonian([0.0, 0.0, 0.0], True, bias)
+
+    second_spec = {
+        "batch": 1, "attached": context.Event(), "seen_tasks": context.Queue(),
+    }
+    with _pool(monkeypatch, second_spec, workers=1, share_cpu_hs=True) as pool:
+        pool._deviceprop = deviceprop
+        pool.run_energy_loop(torch.arange(1), [0.0, 0.0, 0.0], 0, bias, {})
+        sent_bias, version = second_spec["seen_tasks"].get(timeout=2)
+        assert sent_bias is None
+        assert version == 1
     spec["seen_tasks"].close()
     spec["seen_tasks"].join_thread()
+    second_spec["seen_tasks"].close()
+    second_spec["seen_tasks"].join_thread()
 
 
 class _UncopyableMapping:
