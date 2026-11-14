@@ -131,6 +131,8 @@ def test_spawn_pool_overlaps_orders_and_reuses_workers(monkeypatch):
     assert pool.closed
     assert all(not process.is_alive() and process.exitcode == 0 for process in pool.processes)
     assert all(connection.closed for connection in pool.connections)
+    assert all(not thread.is_alive()
+               for thread in pool.receiver_threads + pool.process_watchers)
     with pytest.raises(RuntimeError, match="closed"):
         pool.run_energy_loop(torch.arange(1), [0, 0, 0], 0, None, {})
 
@@ -148,6 +150,8 @@ def test_failure_terminates_hung_peer(monkeypatch, mode):
     assert pool.closed
     assert all(not process.is_alive() for process in pool.processes)
     assert all(connection.closed for connection in pool.connections)
+    assert all(not thread.is_alive()
+               for thread in pool.receiver_threads + pool.process_watchers)
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
