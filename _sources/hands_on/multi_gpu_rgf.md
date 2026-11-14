@@ -26,12 +26,11 @@ to the process. For example, with `CUDA_VISIBLE_DEVICES=2,3`, `cuda:0` and `cuda
 refer to physical GPUs 2 and 3. Omitting `devices` preserves the single-device
 behavior, including when `device` is `"cuda"`.
 
-`e_batch_size` is the number of energy points in each batch on each GPU. With
-two GPUs and a batch size of 1, energies are assigned alternately: GPU 0 computes
-points 0, 2, 4, ... and GPU 1 computes points 1, 3, 5, .... For a batch size of 4,
-GPU 0 first computes points 0–3 and GPU 1 computes points 4–7. The next batch
-assigned to a GPU starts after its previous batch has completed. At most one
-batch is active on each GPU. A final short batch is supported.
+`e_batch_size` is the number of energy points in each batch on each GPU. Each
+worker runs at most one batch at a time and claims another batch as soon as it
+finishes, so assignment can vary with worker speed. The parent stores completed
+batches by their energy-grid index and merges them in the original order. A
+final short batch is supported.
 
 Omitting `e_batch_size` or setting it to `null` selects a common batch size from
 the smallest free-memory budget across the chosen GPUs, capped to distribute
@@ -55,11 +54,18 @@ its in-memory H/S tensors to workers. After reading the files, a worker keeps
 its own H/S blocks for subsequent energy batches at that k point.
 
 The same worker pool serves all k points in a calculation, retaining each
-worker's PID and CUDA context. H/S blocks are refreshed when the k point changes.
-Workers shut down after the sweep. If a worker reports an exception or exits
-unexpectedly, the parent terminates and joins every worker, including workers
-still blocked in a solver, and raises an error with the available worker
-traceback.
+worker's PID and CUDA context. Workers shut down after the sweep. If a worker
+reports an exception, exits unexpectedly, or exceeds a configured deadline,
+the parent terminates and joins every worker, including workers still blocked
+in a solver, and raises an error with the available worker traceback. Startup
+and synchronization deadlines default to 600 seconds; each batch defaults to a
+3000-second task deadline. Set `startup_timeout`, `sync_timeout`, or
+`task_timeout` to null to disable the corresponding deadline. The task deadline
+includes worker cache reads, RGF, output handling, serialization and IPC.
+
+`max_pending_results` bounds active plus completed-but-not-yet-merged batches.
+It defaults to twice the worker count. Results remain in energy order even
+though workers claim tasks dynamically.
 
 When calling the Python API from a script, put the entry call inside a main
 guard so spawned processes can import the script safely:

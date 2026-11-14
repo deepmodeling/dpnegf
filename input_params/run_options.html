@@ -195,6 +195,8 @@
 <li class="toctree-l1 has-children"><a class="reference internal" href="../hands_on/index.html">A quick Example</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../hands_on/tutorial1_c_chain.html">Tutorial 1:  Quantum Transport in a One-Dimensional Chain</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../hands_on/tutorial2_2d_mat.html">Tutorial 2:  Quantum Transport in 2D materials</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hands_on/cpu_parallel_rgf.html">CPU Parallel RGF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../hands_on/multi_gpu_rgf.html">Multi-GPU RGF</a></li>
 </ul>
 </details></li>
 </ul>
@@ -2037,7 +2039,7 @@
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">dict</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">{}</span></code></div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/rgf_options</span></code></div>
 </div>
-<p>Recursive Green’s function stage options: compute device (‘cpu’ or ‘cuda[:index]’), optional multiple CUDA devices, and energy-loop chunk size. Independent from the self-energy pool, which always runs on CPU.</p>
+<p>Recursive Green’s function stage options: compute device (‘cpu’ or ‘cuda[:index]’), optional CPU workers or multiple CUDA devices, energy-loop chunk size, and worker deadlines. Independent from the self-energy pool, which always runs on CPU.</p>
 <dl id="run-op-task-options-negf-rgf-options-device">
 <dt>device:</dt><dd><div class="line-block">
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">str</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">cpu</span></code></div>
@@ -2059,7 +2061,55 @@
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">int</span></code> | <code class="docutils literal notranslate"><span class="pre">float</span></code> | <code class="docutils literal notranslate"><span class="pre">NoneType</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">None</span></code></div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/rgf_options/e_batch_size</span></code></div>
 </div>
-<p>Number of energy points solved in one batched RGF call. None (default) auto-picks from free CUDA memory on ‘cuda’; on ‘cpu’ the full grid is used. In multi-GPU mode this is the batch size per GPU; None uses the smallest device memory budget and splits the grid into at least one batch per selected GPU when there are enough energy points.</p>
+<p>Number of energy points solved in one batched RGF call. None (default) auto-picks from free CUDA memory on ‘cuda’; on a single CPU it uses the full grid. In multi-GPU mode it is the batch size per GPU. Multiple CPU workers require batch size 1; null resolves to 1 in that mode.</p>
+</dd>
+</dl>
+<dl id="run-op-task-options-negf-rgf-options-cpu-workers">
+<dt>cpu_workers:</dt><dd><div class="line-block">
+<div class="line">type: <code class="docutils literal notranslate"><span class="pre">int</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">1</span></code></div>
+<div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/rgf_options/cpu_workers</span></code></div>
+</div>
+<p>Number of CPU worker processes for the non-SCF RGF energy sweep. Default 1 runs in the main process; values above 1 use spawn workers and require e_batch_size=1 or null.</p>
+</dd>
+</dl>
+<dl id="run-op-task-options-negf-rgf-options-cpu-threads">
+<dt>cpu_threads:</dt><dd><div class="line-block">
+<div class="line">type: <code class="docutils literal notranslate"><span class="pre">int</span></code> | <code class="docutils literal notranslate"><span class="pre">NoneType</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">None</span></code></div>
+<div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/rgf_options/cpu_threads</span></code></div>
+</div>
+<p>Torch and BLAS/OpenMP threads per CPU RGF worker. Null leaves the single-process caller unchanged and uses one thread per spawned CPU worker.</p>
+</dd>
+</dl>
+<dl id="run-op-task-options-negf-rgf-options-startup-timeout">
+<dt>startup_timeout:</dt><dd><div class="line-block">
+<div class="line">type: <code class="docutils literal notranslate"><span class="pre">int</span></code> | <code class="docutils literal notranslate"><span class="pre">float</span></code> | <code class="docutils literal notranslate"><span class="pre">NoneType</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">600.0</span></code></div>
+<div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/rgf_options/startup_timeout</span></code></div>
+</div>
+<p>Positive finite worker deadline in seconds, or null to disable it.</p>
+</dd>
+</dl>
+<dl id="run-op-task-options-negf-rgf-options-sync-timeout">
+<dt>sync_timeout:</dt><dd><div class="line-block">
+<div class="line">type: <code class="docutils literal notranslate"><span class="pre">int</span></code> | <code class="docutils literal notranslate"><span class="pre">float</span></code> | <code class="docutils literal notranslate"><span class="pre">NoneType</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">600.0</span></code></div>
+<div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/rgf_options/sync_timeout</span></code></div>
+</div>
+<p>Positive finite worker deadline in seconds, or null to disable it.</p>
+</dd>
+</dl>
+<dl id="run-op-task-options-negf-rgf-options-task-timeout">
+<dt>task_timeout:</dt><dd><div class="line-block">
+<div class="line">type: <code class="docutils literal notranslate"><span class="pre">int</span></code> | <code class="docutils literal notranslate"><span class="pre">float</span></code> | <code class="docutils literal notranslate"><span class="pre">NoneType</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">3000.0</span></code></div>
+<div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/rgf_options/task_timeout</span></code></div>
+</div>
+<p>Positive finite worker deadline in seconds, or null to disable it.</p>
+</dd>
+</dl>
+<dl id="run-op-task-options-negf-rgf-options-max-pending-results">
+<dt>max_pending_results:</dt><dd><div class="line-block">
+<div class="line">type: <code class="docutils literal notranslate"><span class="pre">int</span></code> | <code class="docutils literal notranslate"><span class="pre">NoneType</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">None</span></code></div>
+<div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/rgf_options/max_pending_results</span></code></div>
+</div>
+<p>Maximum number of in-flight plus completed-but-not-yet-merged energy batches. Null defaults to twice the worker count.</p>
 </dd>
 </dl>
 </dd>

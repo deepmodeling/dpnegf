@@ -50,7 +50,7 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="How to Cite" href="../CITATIONS.html" />
+    <link rel="next" title="CPU Parallel RGF" href="cpu_parallel_rgf.html" />
     <link rel="prev" title="Tutorial 1: Quantum Transport in a One-Dimensional Chain" href="tutorial1_c_chain.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -203,6 +203,8 @@
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">A quick Example</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l2"><a class="reference internal" href="tutorial1_c_chain.html">Tutorial 1:  Quantum Transport in a One-Dimensional Chain</a></li>
 <li class="toctree-l2 current active"><a class="current reference internal" href="#">Tutorial 2:  Quantum Transport in 2D materials</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu_parallel_rgf.html">CPU Parallel RGF</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multi_gpu_rgf.html">Multi-GPU RGF</a></li>
 </ul>
 </details></li>
 </ul>
@@ -394,7 +396,7 @@
                 <article class="bd-article">
                   
   <section class="tex2jax_ignore mathjax_ignore" id="tutorial-2-quantum-transport-in-2d-materials">
-<h1>Tutorial 2:  Quantum Transport in 2D materials<a class="headerlink" href="#tutorial-2-quantum-transport-in-2d-materials" title="Link to this heading">#</a></h1>
+<span id="tutorial-2--quantum-transport-in-2d-materials"></span><h1>Tutorial 2:  Quantum Transport in 2D materials<a class="headerlink" href="#tutorial-2-quantum-transport-in-2d-materials" title="Link to this heading">#</a></h1>
 <section id="introduction">
 <h2>Introduction<a class="headerlink" href="#introduction" title="Link to this heading">#</a></h2>
 <p><strong>DPNEGF</strong> is a Python package that integrates the Deep Learning Tight-Binding (<strong>DeePTB</strong>) approach with the Non-Equilibrium Green’s Function (<strong>NEGF</strong>) method,
@@ -417,7 +419,7 @@ high-efficiency algorithm for high-throughput and large-scale quantum transport 
 </section>
 </section>
 <section id="quantum-transport-in-graphene">
-<h2>1. Quantum Transport in Graphene<a class="headerlink" href="#quantum-transport-in-graphene" title="Link to this heading">#</a></h2>
+<span id="1-quantum-transport-in-graphene"></span><h2>1. Quantum Transport in Graphene<a class="headerlink" href="#quantum-transport-in-graphene" title="Link to this heading">#</a></h2>
 <p>Two-dimensional (2D) materials have attracted significant attention in condensed matter physics and nanoelectronics owing to their unique properties.</p>
 <p>Graphene is the natural starting point for studying quantum transport in 2D materials. As the first experimentally realized 2D material, it combines a simple lattice structure with unique electronic features such as linear Dirac dispersion and high carrier mobility.</p>
 <p>In this section, we will use graphene to introduce the basic steps of quantum transport calculations, including the evaluation of electrode self-energies and transmission spectra. The same methodology will later be extended to hBN and MoS<sub>2</sub>.</p>
@@ -469,7 +471,7 @@ high-efficiency algorithm for high-throughput and large-scale quantum transport 
 </div>
 </div>
 <section id="extract-system-specific-model">
-<h3>1.1 Extract system-specific model<a class="headerlink" href="#extract-system-specific-model" title="Link to this heading">#</a></h3>
+<span id="11-extract-system-specific-model"></span><h3>1.1 Extract system-specific model<a class="headerlink" href="#extract-system-specific-model" title="Link to this heading">#</a></h3>
 <p>Here we briefly outline the procedure for extracting a system-specific model from the baseline model. For more details, please refer to the  <a class="reference external" href="https://www.bohrium.com/notebooks/15254953382">DeePTB tutorial</a>.</p>
 <p>First, decide on the elements and basis set for the target system. For graphene, we choose the ‘spd*’ for carbon, specified in <code class="docutils literal notranslate"><span class="pre">extra_baseline/c_spd.json</span></code>. The command <code class="docutils literal notranslate"><span class="pre">dptb</span> <span class="pre">esk</span> <span class="pre">c_spd.json</span> <span class="pre">-o</span> <span class="pre">grap_spd_model</span></code> generates the extracted model <code class="docutils literal notranslate"><span class="pre">sktb.json</span></code>.</p>
 <p>To achieve higher accuracy, we further train the extracted model using <code class="docutils literal notranslate"><span class="pre">sktb.json</span></code> as the initialization.
@@ -578,7 +580,7 @@ DPNEGF INFO    No Fermi energy provided, using estimated value: -3.5830 eV
 <p>The DFT band structure demonstrates excellent agreement with the DeePTB model. Critically, the model accurately reproduces the hallmark electronic features of graphene. The Fermi level  is correctly positioned at the Dirac point, located at the K high-symmetry point of the Brillouin zone. The linear dispersion near this point, forming the characteristic Dirac cone, is clearly visible and matches the reference data precisely.</p>
 </section>
 <section id="principal-layers-in-leads">
-<h3>1.2 Principal layers in leads<a class="headerlink" href="#principal-layers-in-leads" title="Link to this heading">#</a></h3>
+<span id="12-principal-layers-in-leads"></span><h3>1.2 Principal layers in leads<a class="headerlink" href="#principal-layers-in-leads" title="Link to this heading">#</a></h3>
 <p>Now we can pay attention to quantum transport simulaitons.</p>
 <div class="cell docutils container">
 <div class="cell_input docutils container">
@@ -645,7 +647,7 @@ by <code class="docutils literal notranslate"><span class="pre">NEGF.update_atom
 <p>Now we can strat the NEGF calculation!</p>
 </section>
 <section id="negf-calculation-for-graphene">
-<h3>1.3 NEGF calculation for graphene<a class="headerlink" href="#negf-calculation-for-graphene" title="Link to this heading">#</a></h3>
+<span id="13-negf-calculation-for-graphene"></span><h3>1.3 NEGF calculation for graphene<a class="headerlink" href="#negf-calculation-for-graphene" title="Link to this heading">#</a></h3>
 <p>For NEGF calculation on systems with leads having periodicity along the transverse direction, it’s natural to calculate the <span class="math notranslate nohighlight">\(k\)</span>-resolved transmission <span class="math notranslate nohighlight">\(T(k,E)\)</span> and sum up for the total transmission <span class="math notranslate nohighlight">\(T(E) = \sum_k w_k T(k,E)\)</span> where <span class="math notranslate nohighlight">\(w_k\)</span> is the weight for the specified <span class="math notranslate nohighlight">\(k\)</span>.</p>
 <p>Firstly, we only consider the Gamma point calculation for graphene.</p>
 <div class="cell docutils container">
@@ -930,7 +932,7 @@ However, if directly loading the saved self-energies, it takes ~6 mins.</p>
 </section>
 </section>
 <section id="quantum-transport-in-hbn">
-<h2>2. Quantum Transport in hBN<a class="headerlink" href="#quantum-transport-in-hbn" title="Link to this heading">#</a></h2>
+<span id="2-quantum-transport-in-hbn"></span><h2>2. Quantum Transport in hBN<a class="headerlink" href="#quantum-transport-in-hbn" title="Link to this heading">#</a></h2>
 <p>Here we extend DPNEGF’s application to <strong>hBN</strong> illustrating its capability to various materials.</p>
 <p>For simpilicy, we have prepared a model in <code class="docutils literal notranslate"><span class="pre">example/hBN/train/</span></code>. Users can just run the same commands above to repeat the procedures.</p>
 <div class="cell docutils container">
@@ -1334,7 +1336,7 @@ DPNEGF INFO    computing green's function at e = 8.045
 <p>The transmission spectrum of hBN clearly shows a wide plateau of zero transmission around the Fermi level. This feature directly corresponds to the band gap observed in the previously calculated electronic band structure.</p>
 </section>
 <section id="quantum-transport-in-mos2">
-<h2>3. Quantum Transport in MoS<sub>2</sub><a class="headerlink" href="#quantum-transport-in-mos2" title="Link to this heading">#</a></h2>
+<span id="3-quantum-transport-in-mos2"></span><h2>3. Quantum Transport in MoS<sub>2</sub><a class="headerlink" href="#quantum-transport-in-mos2" title="Link to this heading">#</a></h2>
 <p>DPNEGF can perform NEGF calculations using electronic structures from any DFT software. For codes without NEGF support (e.g., plane-wave DFT such as VASP), DeePTB extracts the electronic outputs and converts them into NEGF-ready Hamiltonians. Compared with Wannierization, DeePTB offers a faster and more transferable way to construct Hamiltonians.</p>
 <p>Here, we use the MoS<sub>2</sub> band structure from ABACUS and compute the corresponding transmission spectrum, demonstrating how DPNEGF enables NEGF analysis even when the original DFT code does not provide it.</p>
 <div class="cell docutils container">
@@ -1639,11 +1641,11 @@ DPNEGF INFO    computing green's function at e = 8.045
       </div>
     </a>
     <a class="right-next"
-       href="../CITATIONS.html"
+       href="cpu_parallel_rgf.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">How to Cite</p>
+        <p class="prev-next-title">CPU Parallel RGF</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>

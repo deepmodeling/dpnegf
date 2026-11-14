@@ -48,6 +48,8 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="How to Cite" href="../CITATIONS.html" />
+    <link rel="prev" title="CPU Parallel RGF" href="cpu_parallel_rgf.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="" />
@@ -145,8 +147,6 @@
       
       
       
-        
-      
       <dialog id="pst-primary-sidebar-modal"></dialog>
       <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
         
@@ -192,11 +192,13 @@
         <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
     <div class="bd-toc-item navbar-nav active">
         <p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Start</span></p>
-<ul class="nav bd-sidenav">
+<ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../easy_install.html">Installation Guide</a></li>
-<li class="toctree-l1 has-children"><a class="reference internal" href="index.html">A quick Example</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">A quick Example</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l2"><a class="reference internal" href="tutorial1_c_chain.html">Tutorial 1:  Quantum Transport in a One-Dimensional Chain</a></li>
 <li class="toctree-l2"><a class="reference internal" href="tutorial2_2d_mat.html">Tutorial 2:  Quantum Transport in 2D materials</a></li>
+<li class="toctree-l2"><a class="reference internal" href="cpu_parallel_rgf.html">CPU Parallel RGF</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">Multi-GPU RGF</a></li>
 </ul>
 </details></li>
 </ul>
@@ -389,12 +391,11 @@ model inference and Hamiltonian initialization independently; it can also be
 to the process. For example, with <code class="docutils literal notranslate"><span class="pre">CUDA_VISIBLE_DEVICES=2,3</span></code>, <code class="docutils literal notranslate"><span class="pre">cuda:0</span></code> and <code class="docutils literal notranslate"><span class="pre">cuda:1</span></code>
 refer to physical GPUs 2 and 3. Omitting <code class="docutils literal notranslate"><span class="pre">devices</span></code> preserves the single-device
 behavior, including when <code class="docutils literal notranslate"><span class="pre">device</span></code> is <code class="docutils literal notranslate"><span class="pre">&quot;cuda&quot;</span></code>.</p>
-<p><code class="docutils literal notranslate"><span class="pre">e_batch_size</span></code> is the number of energy points in each batch on each GPU. With
-two GPUs and a batch size of 1, energies are assigned alternately: GPU 0 computes
-points 0, 2, 4, … and GPU 1 computes points 1, 3, 5, … For a batch size of 4,
-GPU 0 first computes points 0–3 and GPU 1 computes points 4–7. The next batch
-assigned to a GPU starts after its previous batch has completed. At most one
-batch is active on each GPU. A final short batch is supported.</p>
+<p><code class="docutils literal notranslate"><span class="pre">e_batch_size</span></code> is the number of energy points in each batch on each GPU. Each
+worker runs at most one batch at a time and claims another batch as soon as it
+finishes, so assignment can vary with worker speed. The parent stores completed
+batches by their energy-grid index and merges them in the original order. A
+final short batch is supported.</p>
 <p>Omitting <code class="docutils literal notranslate"><span class="pre">e_batch_size</span></code> or setting it to <code class="docutils literal notranslate"><span class="pre">null</span></code> selects a common batch size from
 the smallest free-memory budget across the chosen GPUs, capped to distribute
 work over all GPUs when there are enough energy points. An explicit batch size
@@ -414,11 +415,17 @@ point’s H/S. The parent passes the cache path and metadata; it does not send
 its in-memory H/S tensors to workers. After reading the files, a worker keeps
 its own H/S blocks for subsequent energy batches at that k point.</p>
 <p>The same worker pool serves all k points in a calculation, retaining each
-worker’s PID and CUDA context. H/S blocks are refreshed when the k point changes.
-Workers shut down after the sweep. If a worker reports an exception or exits
-unexpectedly, the parent terminates and joins every worker, including workers
-still blocked in a solver, and raises an error with the available worker
-traceback.</p>
+worker’s PID and CUDA context. Workers shut down after the sweep. If a worker
+reports an exception, exits unexpectedly, or exceeds a configured deadline,
+the parent terminates and joins every worker, including workers still blocked
+in a solver, and raises an error with the available worker traceback. Startup
+and synchronization deadlines default to 600 seconds; each batch defaults to a
+3000-second task deadline. Set <code class="docutils literal notranslate"><span class="pre">startup_timeout</span></code>, <code class="docutils literal notranslate"><span class="pre">sync_timeout</span></code>, or
+<code class="docutils literal notranslate"><span class="pre">task_timeout</span></code> to null to disable the corresponding deadline. The task deadline
+includes worker cache reads, RGF, output handling, serialization and IPC.</p>
+<p><code class="docutils literal notranslate"><span class="pre">max_pending_results</span></code> bounds active plus completed-but-not-yet-merged batches.
+It defaults to twice the worker count. Results remain in energy order even
+though workers claim tasks dynamically.</p>
 <p>When calling the Python API from a script, put the entry call inside a main
 guard so spawned processes can import the script safely:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">dpnegf.entrypoints.run</span><span class="w"> </span><span class="kn">import</span> <span class="n">run</span>
@@ -445,6 +452,24 @@ energy calculation or its H/S storage across GPUs.</p>
                 <footer class="prev-next-footer d-print-none">
                   
 <div class="prev-next-area">
+    <a class="left-prev"
+       href="cpu_parallel_rgf.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">CPU Parallel RGF</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../CITATIONS.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">How to Cite</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
 </div>
                 </footer>
               
