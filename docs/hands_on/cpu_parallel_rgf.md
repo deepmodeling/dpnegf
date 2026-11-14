@@ -62,6 +62,10 @@ whole NEGF run. A parent-side command send can also block before a worker reply
 deadline can be checked. A timeout terminates all workers and discards the
 incomplete sweep; no energy point is skipped or retried.
 
+At `INFO` level, each worker reports only its PID, device and Torch thread
+counts. Run the CLI with `-ll DEBUG` to include per-energy RGF chunk progress
+and the full BLAS/OpenMP `threadpool_info()` diagnostics.
+
 Python callers must use a main guard because workers use the `spawn` start
 method:
 

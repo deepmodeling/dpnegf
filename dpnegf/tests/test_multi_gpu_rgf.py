@@ -2,12 +2,16 @@
 
 import importlib
 import json
+import logging
 from pathlib import Path
 import multiprocessing as mp
 from multiprocessing import shared_memory
 import os
+import subprocess
+import sys
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -51,7 +55,14 @@ def _protocol_worker(connection, device, spec):
         send(connection, ("error", "ValueError", "startup failed", "test traceback"))
         connection.close()
         return
-    send(connection, ("ready", os.getpid()))
+    if spec.get("ready_details"):
+        send(connection, ("ready", {
+            "pid": os.getpid(), "device": str(device),
+            "torch_intra_threads": 1, "torch_inter_threads": 1,
+            "threadpools": [{"prefix": "test-openblas", "filepath": "/tmp/test-openblas.so"}],
+        }))
+    else:
+        send(connection, ("ready", os.getpid()))
     try:
         while True:
             command, args = recv(connection)
@@ -108,6 +119,79 @@ def _worker_exit_with_inherited_pipe(connection, device, spec):
             os._exit(0)
         spec["forked"].set()
         os._exit(7)
+
+
+def test_cli_import_defers_tbtrans_dependencies():
+    code = """
+import builtins
+
+original_import = builtins.__import__
+
+def guarded_import(name, *args, **kwargs):
+    if name == 'dpnegf.runner.tbtrans_init':
+        raise AssertionError('ordinary CLI import must not load TBtrans')
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+import dpnegf.entrypoints.run
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_worker_ready_log_verbosity(monkeypatch, caplog):
+    monkeypatch.setattr(parrallel, "_rgf_worker_main", _protocol_worker)
+    with caplog.at_level(logging.DEBUG, logger=parrallel.__name__):
+        with RGFProcessPool(["cpu"], {"ready_details": True}):
+            pass
+
+    records = [
+        record for record in caplog.records
+        if record.name == parrallel.__name__
+        and record.message.startswith("RGF worker pid=")
+    ]
+    assert len(records) == 2
+    summary = next(record for record in records if "torch_threads=" in record.message)
+    details = next(record for record in records if "threadpools=" in record.message)
+    assert summary.levelno == logging.INFO
+    assert "threadpools=" not in summary.message
+    assert details.levelno == logging.DEBUG
+    assert "test-openblas" in details.message
+
+
+def test_chunk_progress_is_debug_only(caplog):
+    from dpnegf.negf import rgf_solver
+
+    prop = SimpleNamespace(
+        rgf_device="cpu",
+        lead_L=SimpleNamespace(self_energy=Mock(), se=torch.zeros(1, 1)),
+        lead_R=SimpleNamespace(self_energy=Mock(), se=torch.zeros(1, 1)),
+        cal_green_function=Mock(),
+        release_greenfuncs=Mock(),
+    )
+    solver = rgf_solver.RGFSolver(prop, {
+        "e_batch_size": 1, "block_tridiagonal": True,
+        "eta_lead": 1e-5, "eta_device": 0.0,
+        "sgf_solver": "Sancho-Rubio", "self_energy_save_path": "",
+        "se_cache_format": "h5", "se_info_display": False,
+        "gf_cal_mode": "full", "need_trans_eigs": False,
+        "trans_eigs_options": {}, "out_dos": False, "out_tc": False,
+        "out_current_nscf": False, "out_ldos": False,
+    })
+
+    for level, expected_records in ((logging.INFO, 0), (logging.DEBUG, 1)):
+        caplog.clear()
+        with caplog.at_level(level, logger=rgf_solver.__name__):
+            solver.compute_rgf_chunk(torch.tensor([-3.0]), [0, 0, 0], 0, None)
+        records = [
+            record for record in caplog.records
+            if "computing green's functions on cpu for chunk" in record.message
+        ]
+        assert len(records) == expected_records
+        if records:
+            assert records[0].levelno == logging.DEBUG
 
 
 def test_spawn_pool_overlaps_orders_and_reuses_workers(monkeypatch):
