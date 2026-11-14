@@ -147,9 +147,11 @@ class DeviceProperty(object):
         This performs no energy-dependent Green-function allocations.
         """
         layout_changed = getattr(self, "block_tridiagonal", None) != block_tridiagonal
-        candidate_kpoint = torch.as_tensor(kpoint).clone()
-        new_k = self.kpoint is None or bool(
-            torch.abs(self.kpoint - candidate_kpoint).sum() > 1e-5)
+        candidate_kpoint = torch.as_tensor(
+            kpoint, dtype=torch.float64, device="cpu").reshape(-1).clone()
+        if candidate_kpoint.numel() != 3 or not torch.isfinite(candidate_kpoint).all():
+            raise ValueError("RGF k-point must contain exactly three finite coordinates.")
+        new_k = self.kpoint is None or not torch.equal(self.kpoint, candidate_kpoint)
         old_potential = getattr(self, "V", None)
 
         if Vbias is None:
@@ -162,8 +164,29 @@ class DeviceProperty(object):
 
         assert torch.is_tensor(candidate_potential)
         candidate_potential = candidate_potential.to(self.rgf_device).clone()
-        new_v = old_potential is None or bool(
-            torch.abs(candidate_potential - old_potential).sum() > 1e-5)
+        if not torch.isfinite(candidate_potential).all():
+            raise ValueError("RGF device potential must contain only finite values.")
+        new_v = (
+            old_potential is None
+            or old_potential.shape != candidate_potential.shape
+            or not torch.equal(old_potential, candidate_potential)
+        )
+
+        if getattr(self, "_shared_hs_worker", False):
+            if new_k or new_v or layout_changed:
+                raise RuntimeError(
+                    "RGF worker received an H/S context that was not synchronized "
+                    "by the process pool."
+                )
+            if not all(hasattr(self, name) for name in ("hd", "sd", "hl", "hu", "sl", "su")):
+                attachment = getattr(self, "_shared_hs_attachment", None)
+                if attachment is None:
+                    raise RuntimeError("RGF worker lost its shared H/S attachment.")
+                self._set_shared_hs_views(attachment, attachment.descriptor)
+            self.oldV = old_potential
+            self.newK_flag = False
+            self.newV_flag = False
+            return
 
         if (not all(hasattr(self, name) for name in ("hd", "sd", "hl", "su", "sl", "hu"))
                 or new_k or new_v or layout_changed):
@@ -179,6 +202,101 @@ class DeviceProperty(object):
         self.oldV = old_potential
         self.newK_flag = new_k
         self.newV_flag = new_v
+
+    def install_shared_hs(self, descriptor):
+        """Replace the current H/S mapping with a synchronized worker view."""
+        from dpnegf.utils.rgf_shared import SharedHS
+
+        self.release_greenfuncs()
+        previous = getattr(self, "_shared_hs_attachment", None)
+        if previous is not None:
+            self._clear_hs_views()
+            del self._shared_hs_attachment
+            previous.close()
+        attachment = SharedHS.attach(descriptor)
+        try:
+            self._set_shared_hs_views(attachment, descriptor)
+        except BaseException:
+            self._clear_hs_views()
+            attachment.close()
+            raise
+        self._shared_hs_attachment = attachment
+        self._shared_hs_worker = True
+
+    def install_shared_hs_owner(self, shared):
+        """Install the owner's views after publishing the current H/S blocks."""
+        self.release_greenfuncs()
+        self._shared_hs_owner = shared
+        self._set_shared_hs_views(shared, shared.descriptor)
+
+    def prepare_shared_hs_context(self, kpoint, block_tridiagonal, version):
+        """Use a synchronized context without copying its potential per task."""
+        attachment = getattr(self, "_shared_hs_attachment", None)
+        if (not getattr(self, "_shared_hs_worker", False) or attachment is None
+                or attachment.version != version):
+            raise RuntimeError(
+                f"RGF worker has no synchronized H/S version {version}."
+            )
+
+        context = attachment.descriptor["context"]
+        candidate_kpoint = torch.as_tensor(
+            kpoint, dtype=torch.float64, device="cpu").reshape(-1)
+        synchronized_kpoint = torch.as_tensor(
+            context["kpoint"], dtype=torch.float64, device="cpu").reshape(-1)
+        if (candidate_kpoint.numel() != 3 or not torch.isfinite(candidate_kpoint).all()
+                or not torch.equal(candidate_kpoint, synchronized_kpoint)
+                or context["block_tridiagonal"] != block_tridiagonal):
+            raise RuntimeError(
+                f"RGF task does not match synchronized H/S version {version}."
+            )
+
+        if not all(hasattr(self, name) for name in ("hd", "sd", "hl", "hu", "sl", "su")):
+            self._set_shared_hs_views(attachment, attachment.descriptor)
+        self.oldV = self.V
+        self.newK_flag = False
+        self.newV_flag = False
+
+    def _set_shared_hs_views(self, shared, descriptor):
+        (self.hd, self.sd, self.hl, self.hu, self.sl, self.su) = shared.torch_views()
+        context = descriptor["context"]
+        self.kpoint = torch.as_tensor(
+            context["kpoint"], dtype=torch.float64, device="cpu").clone()
+        self.V = torch.as_tensor(
+            context["potential"], device=self.rgf_device).clone()
+        self.block_tridiagonal = context["block_tridiagonal"]
+        self._orbital_mapping_snapshot = copy.deepcopy(
+            descriptor.get("orbital_mapping"))
+        self.oldV = None
+        self.newK_flag = False
+        self.newV_flag = False
+
+    def _clear_hs_views(self):
+        for name in ("hd", "sd", "hl", "hu", "sl", "su"):
+            if hasattr(self, name):
+                delattr(self, name)
+        for name in ("kpoint", "V", "block_tridiagonal", "_orbital_mapping_snapshot"):
+            if hasattr(self, name):
+                delattr(self, name)
+
+    def detach_shared_hs(self):
+        """Detach a worker mapping after dropping all tensor views."""
+        attachment = getattr(self, "_shared_hs_attachment", None)
+        if attachment is None:
+            return
+        self.release_greenfuncs()
+        self._clear_hs_views()
+        del self._shared_hs_attachment
+        self._shared_hs_worker = False
+        attachment.close()
+
+    def release_shared_hs_owner(self):
+        """Drop parent tensor views before its shared region is unlinked."""
+        shared = getattr(self, "_shared_hs_owner", None)
+        if shared is None:
+            return
+        self.release_greenfuncs()
+        self._clear_hs_views()
+        del self._shared_hs_owner
 
     def _load_hamiltonian(self, kpoint, potential, block_tridiagonal):
         """Stage all blocks and their provenance without changing device state."""
@@ -197,7 +315,8 @@ class DeviceProperty(object):
 
     def cal_green_function(self, energy, kpoint, eta_device=0., block_tridiagonal=True, Vbias=None,
                            HS_inmem:bool=True, need_lesser:bool=False, need_greater:bool=False,
-                           need_gr_lc:bool=False, gf_cal_mode:str="full", need_trans_eigs:bool=False):
+                           need_gr_lc:bool=False, gf_cal_mode:str="full", need_trans_eigs:bool=False,
+                           shared_hs_version=None):
         ''' computes the Green's function for a given energy and k-point in device.
 
         the tags used here to identify different Green's functions follows the NEGF theory
@@ -242,7 +361,10 @@ class DeviceProperty(object):
         B = energy.shape[0]
         batched_mode = B > 1
 
-        self.prepare_hamiltonian(kpoint, block_tridiagonal, Vbias)
+        if shared_hs_version is None:
+            self.prepare_hamiltonian(kpoint, block_tridiagonal, Vbias)
+        else:
+            self.prepare_shared_hs_context(kpoint, block_tridiagonal, shared_hs_version)
 
         tags = ["g_trans","gr_lc", \
                "grd", "grl", "gru", "gr_left", \
