@@ -503,6 +503,10 @@ class NEGF(object):
         # initialize density class
         self.density_options = density_options
         self.generate_energy_grid()
+        # DOS and transmission do not require density integration. In particular,
+        # a single transmission energy cannot initialize Fiori's direct integral.
+        if not (self.scf or self.out_density or self.out_potential):
+            return
         if self.density_options["method"] == "Ozaki":
             self.density = Ozaki(R=self.density_options["R"], 
                                  M_cut=self.density_options["M_cut"], 
