@@ -1,6 +1,7 @@
 import torch
 from typing import List
 from dpnegf.negf.surface_green import selfEnergy
+from dpnegf.negf.boundary_self_energy import prepare_boundary_schur_plan
 import logging
 import os
 from dpnegf.utils.constants import Boltzmann, eV2J
@@ -135,7 +136,10 @@ class LeadProperty(object):
         assert len(np.array(kpoint).reshape(-1)) == 3
         # according to given kpoint and e_mesh, calculating or loading the self energy and surface green function to self.
         if not isinstance(energy, torch.Tensor):
-            energy = torch.tensor(energy) # Energy relative to Ef
+            if np.iscomplexobj(energy):
+                energy = torch.tensor(energy, dtype=torch.complex128)
+            else:
+                energy = torch.tensor(energy) # Energy relative to Ef
         
         save_path = self._get_save_path(kpoint, energy, save_format, save_path)
         # log.info(f"Self energy save path: {save_path}")
@@ -302,8 +306,9 @@ class LeadProperty(object):
         subblocks = self.hamiltonian.get_hs_device(kpoint, only_subblocks=True)
         # calculate self energy
         if not self.useBloch:
-            if  not hasattr(self, "HL") \
+            if  not hasattr(self, "HLk") \
                 or abs(self.voltage_old-self.voltage)>1e-6 \
+                or self.kpoint is None \
                 or max(abs(self.kpoint-torch.tensor(kpoint)))>1e-6:
 
                 self.HLk, self.HLLk, self.HDLk, self.SLk, self.SLLk, self.SDLk \
@@ -321,6 +326,23 @@ class LeadProperty(object):
                 tab = self.tab,
                 reduced=metadata.get("contact_reduced", False),
             )
+
+            boundary_plan = None
+            if method == "Boundary-Schur":
+                plan_key = tuple(
+                    (id(value), getattr(value, "_version", None))
+                    for value in (self.HLLk, self.SLLk, self.HDLk, self.SDLk)
+                ) + (
+                    tuple(np.asarray(subblocks, dtype=int).reshape(-1).tolist()),
+                    self.tab,
+                    bool(metadata.get("contact_reduced", False)),
+                )
+                if getattr(self, "_boundary_schur_plan_key", None) != plan_key:
+                    self._boundary_schur_plan = prepare_boundary_schur_plan(
+                        self.HLLk, self.SLLk, HDL_reduced, SDL_reduced,
+                    )
+                    self._boundary_schur_plan_key = plan_key
+                boundary_plan = self._boundary_schur_plan
             
             self.se, _ = selfEnergy(
                 ee=energy,
@@ -333,12 +355,17 @@ class LeadProperty(object):
                 E_ref=self.E_ref,
                 etaLead=eta_lead, 
                 method=method,
-                numba_jit=se_numba_jit
+                numba_jit=se_numba_jit,
+                boundary_plan=boundary_plan,
             )
 
             # torch.save(self.se, os.path.join(self.results_path, f"se_nobloch_k{kpoint[0]}_{kpoint[1]}_{kpoint[2]}_{energy}.pth"))
         
         else:
+            bloch_method = "Sancho-Rubio" if method == "Boundary-Schur" else method
+            if method == "Boundary-Schur":
+                log.info("Boundary-Schur requires a non-Bloch contact projection; "
+                         "using Sancho-Rubio for the Bloch lead.")
             if not hasattr(self, "HL") \
                 or abs(self.voltage_old-self.voltage)>1e-6 \
                 or max(abs(self.kpoint-torch.tensor(kpoint)))>1e-6:
@@ -362,7 +389,7 @@ class LeadProperty(object):
                     sLL=self.SLLk,            #TODO: check chemiPot settiing is correct or not
                     E_ref=self.E_ref,  # temmporarily change to self.efermi for the case in which applying lead bias to corresponding to Nanotcad
                     etaLead=eta_lead, 
-                    method=method,
+                    method=bloch_method,
                     numba_jit=se_numba_jit
                 )
                 phase_factor_m = torch.zeros([m_size,m_size],dtype=torch.complex128)
@@ -391,6 +418,8 @@ class LeadProperty(object):
             # In subblocks case, the self energy shape of left/right lead should be consistent with subblocks[0] and subblocks[-1]
         if not HS_inmem:
             del self.HLk, self.HLLk, self.HDLk, self.SLk, self.SLLk, self.SDLk
+            self.__dict__.pop("_boundary_schur_plan", None)
+            self.__dict__.pop("_boundary_schur_plan_key", None)
 
         return self.se
 
@@ -652,7 +681,8 @@ def _get_safe_n_workers(lead_L, lead_R, requested_n_workers=-1, max_memory_fract
 
 
 def _autotune_blas_threads(leadL_pack, sample_kpoint, sample_energy, eta_lead,
-                            n_workers, cpu_count, se_numba_jit, requested=None):
+                            n_workers, cpu_count, se_numba_jit, requested=None,
+                            method="Sancho-Rubio"):
     """Pick per-worker BLAS threads by timing the real surface-green code path.
 
     The Lopez-Sancho loop in ``surface_green._surface_green_{numba,scipy}_core``
@@ -740,12 +770,12 @@ def _autotune_blas_threads(leadL_pack, sample_kpoint, sample_energy, eta_lead,
             with threadpool_limits(limits=t, user_api='blas'):
                 _compute_self_energy_from_pack(
                     leadL_pack, sample_kpoint, sample_energy,
-                    eta_lead, se_numba_jit=se_numba_jit,
+                    eta_lead, method=method, se_numba_jit=se_numba_jit,
                 )
                 start = time.perf_counter()
                 _compute_self_energy_from_pack(
                     leadL_pack, sample_kpoint, sample_energy,
-                    eta_lead, se_numba_jit=se_numba_jit,
+                    eta_lead, method=method, se_numba_jit=se_numba_jit,
                 )
                 elapsed = time.perf_counter() - start
         except Exception as e:
@@ -787,7 +817,8 @@ def _sample_principal_layer_dim(pack, sample_kpoint):
 
 def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
                             self_energy_save_path=None, ek_batch_size=200,
-                            cpu_budget=None, n_workers=-1, se_numba_jit=None, blas_threads=None):
+                            cpu_budget=None, n_workers=-1, se_numba_jit=None, blas_threads=None,
+                            method="Sancho-Rubio"):
     """
     Computes and saves self-energy matrices for all combinations of k-points and energy values
     for left and right leads.
@@ -829,6 +860,9 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
         use up to 4 budgeted threads if either principal layer has at least
         256 orbitals, otherwise 1. Longer batches retain sample-based tuning.
         Choices are reused per active worker count within this call.
+    method : str, optional
+        Self-energy solver: ``Sancho-Rubio``, ``Lopez-Sancho``, or
+        ``Boundary-Schur``. Boundary-Schur falls back to Sancho when needed.
 
     Returns
     -------
@@ -874,6 +908,9 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
     # bearing model that loky/cloudpickle cannot serialize).
     leadL_pack = _precompute_lead_kdata(lead_L, kpoints_grid)
     leadR_pack = _precompute_lead_kdata(lead_R, kpoints_grid)
+    if method == "Boundary-Schur":
+        _prepare_boundary_schur_plans(leadL_pack)
+        _prepare_boundary_schur_plans(leadR_pack)
 
     total_tasks = [(k, e) for k in kpoints_grid for e in energy_grid]
     # Capture the parent's log level so loky workers (which start with a clean
@@ -894,6 +931,7 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
             blas_threads_per_worker = _autotune_blas_threads(
                 leadL_pack, sample_kpoint, sample_energy, eta,
                 active_workers, cpu_count, se_numba_jit, requested=blas_threads,
+                method=method,
             )
             autotune_status = "skipped (user-requested)"
         elif per_worker_budget == 1:
@@ -910,7 +948,7 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
         else:
             blas_threads_per_worker = _autotune_blas_threads(
                 leadL_pack, sample_kpoint, sample_energy, eta,
-                active_workers, cpu_count, se_numba_jit,
+                active_workers, cpu_count, se_numba_jit, method=method,
             )
             autotune_status = "enabled (parent-process sample)"
         threads_by_workers[active_workers] = blas_threads_per_worker
@@ -921,7 +959,8 @@ def compute_all_self_energy(eta, lead_L, lead_R, kpoints_grid, energy_grid,
         Parallel(n_jobs=active_workers, backend="loky")(
             delayed(_self_energy_worker_blas)(k, e, eta, leadL_pack, leadR_pack,
                                                self_energy_save_path, se_numba_jit,
-                                               parent_log_level, blas_threads_per_worker)
+                                               parent_log_level, blas_threads_per_worker,
+                                               method=method)
             for k, e in batch
         )
 
@@ -1009,6 +1048,25 @@ def _precompute_lead_kdata(lead, kpoints_grid):
     return pack
 
 
+def _prepare_boundary_schur_plans(pack):
+    """Prepare per-k structural plans only when Boundary-Schur is selected."""
+    if pack.get("useBloch"):
+        return
+    for entry in pack.get("kdata", {}).values():
+        if not all(name in entry for name in ("HLLk", "SLLk", "HDLk", "SDLk", "subblocks")):
+            continue
+        hdl, sdl = LeadProperty.HDL_reduced(
+            entry["HDLk"],
+            entry["SDLk"],
+            entry["subblocks"],
+            tab=entry.get("lead_tab"),
+            reduced=entry.get("contact_reduced", False),
+        )
+        entry["boundary_schur_plan"] = prepare_boundary_schur_plan(
+            entry["HLLk"], entry["SLLk"], hdl, sdl,
+        )
+
+
 def _to_numpy_c128(x):
     """Detach torch tensors and cast to a C-contiguous complex128 numpy array.
 
@@ -1052,7 +1110,10 @@ def _compute_self_energy_from_pack(pack, k, e, eta_lead, method="Lopez-Sancho", 
     the dict produced by _precompute_lead_kdata. Mirrors the math in
     lead_property.py self_energy_cal (non-Bloch and Bloch branches)."""
     if not isinstance(e, torch.Tensor):
-        energy = torch.tensor(e)
+        if np.iscomplexobj(e):
+            energy = torch.tensor(e, dtype=torch.complex128)
+        else:
+            energy = torch.tensor(e)
     else:
         energy = e
 
@@ -1081,6 +1142,7 @@ def _compute_self_energy_from_pack(pack, k, e, eta_lead, method="Lopez-Sancho", 
             method=method,
             numba_jit=se_numba_jit,
             h10=entry["h10"], s10=entry["s10"],
+            boundary_plan=entry.get("boundary_schur_plan") if method == "Boundary-Schur" else None,
         )
         return se
 
@@ -1092,6 +1154,7 @@ def _compute_self_energy_from_pack(pack, k, e, eta_lead, method="Lopez-Sancho", 
     for be in entry["bloch_entries"]:
         k_bloch = be["k_bloch"]
         last_HDLk, last_SDLk = be["HDLk"], be["SDLk"]
+        bloch_method = "Sancho-Rubio" if method == "Boundary-Schur" else method
         _, sgf = selfEnergy(
             ee=energy,
             hL=be["HLk"],
@@ -1100,7 +1163,7 @@ def _compute_self_energy_from_pack(pack, k, e, eta_lead, method="Lopez-Sancho", 
             sLL=be["SLLk"],
             E_ref=E_ref,
             etaLead=eta_lead,
-            method=method,
+            method=bloch_method,
             numba_jit=se_numba_jit,
             h10=be["h10"], s10=be["s10"],
         )
@@ -1157,21 +1220,27 @@ def _init_worker_logging(level):
     root_log.addHandler(ch)
 
 
-def _self_energy_worker_pure(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path, se_numba_jit, log_level):
+def _self_energy_worker_pure(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path,
+                             se_numba_jit, log_level, method="Sancho-Rubio"):
     """joblib worker replacement that takes only pickleable packs."""
     _init_worker_logging(log_level)
     save_tmp_L = os.path.join(self_energy_save_path, f"tmp_leadL_k{k[0]}_{k[1]}_{k[2]}_E{e:.8f}.h5")
     save_tmp_R = os.path.join(self_energy_save_path, f"tmp_leadR_k{k[0]}_{k[1]}_{k[2]}_E{e:.8f}.h5")
 
-    seL = _compute_self_energy_from_pack(leadL_pack, k, e, eta, se_numba_jit=se_numba_jit)
-    seR = _compute_self_energy_from_pack(leadR_pack, k, e, eta, se_numba_jit=se_numba_jit)
+    seL = _compute_self_energy_from_pack(
+        leadL_pack, k, e, eta, method=method, se_numba_jit=se_numba_jit,
+    )
+    seR = _compute_self_energy_from_pack(
+        leadR_pack, k, e, eta, method=method, se_numba_jit=se_numba_jit,
+    )
 
     write_to_hdf5(save_tmp_L, k, e, seL)
     write_to_hdf5(save_tmp_R, k, e, seR)
 
 
 def _self_energy_worker_blas(k, e, eta, leadL_pack, leadR_pack, self_energy_save_path,
-                              se_numba_jit, log_level, blas_threads=1):
+                              se_numba_jit, log_level, blas_threads=1,
+                              method="Sancho-Rubio"):
     """Loky entry point that pins this worker's BLAS/LAPACK runtime to a bounded
     thread count, then delegates to `_self_energy_worker_pure`.
 
@@ -1191,11 +1260,12 @@ def _self_energy_worker_blas(k, e, eta, leadL_pack, leadR_pack, self_energy_save
     with threadpool_limits(limits=blas_threads, user_api='blas'):
         return _self_energy_worker_pure(
             k, e, eta, leadL_pack, leadR_pack,
-            self_energy_save_path, se_numba_jit, log_level,
+            self_energy_save_path, se_numba_jit, log_level, method,
         )
 
 
-def self_energy_worker(k, e, eta, lead_L, lead_R, self_energy_save_path, se_numba_jit=None):
+def self_energy_worker(k, e, eta, lead_L, lead_R, self_energy_save_path,
+                       se_numba_jit=None, method="Sancho-Rubio"):
     """
     Calculates the self-energy for left and right leads at a given k-point and energy,
     and saves the results to HDF5 files.
@@ -1224,8 +1294,12 @@ def self_energy_worker(k, e, eta, lead_L, lead_R, self_energy_save_path, se_numb
     save_tmp_L = os.path.join(self_energy_save_path, f"tmp_leadL_k{k[0]}_{k[1]}_{k[2]}_E{e:.8f}.h5")
     save_tmp_R = os.path.join(self_energy_save_path, f"tmp_leadR_k{k[0]}_{k[1]}_{k[2]}_E{e:.8f}.h5")
 
-    seL = lead_L.self_energy_cal(kpoint=k, energy=e, eta_lead=eta, se_numba_jit=se_numba_jit)
-    seR = lead_R.self_energy_cal(kpoint=k, energy=e, eta_lead=eta, se_numba_jit=se_numba_jit)
+    seL = lead_L.self_energy_cal(
+        kpoint=k, energy=e, eta_lead=eta, method=method, se_numba_jit=se_numba_jit,
+    )
+    seR = lead_R.self_energy_cal(
+        kpoint=k, energy=e, eta_lead=eta, method=method, se_numba_jit=se_numba_jit,
+    )
 
     write_to_hdf5(save_tmp_L, k, e, seL)
     write_to_hdf5(save_tmp_R, k, e, seR)

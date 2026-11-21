@@ -140,7 +140,8 @@ class Ozaki(Density):
         self.R = R
         self.n_gauss = n_gauss
 
-    def integrate(self, deviceprop, kpoint, eta_lead=1e-5, eta_device=0.,Vbias=None,block_tridiagonal=False):
+    def integrate(self, deviceprop, kpoint, eta_lead=1e-5, eta_device=0.,Vbias=None,
+                  block_tridiagonal=False, self_energy_method="Lopez-Sancho"):
         '''calculates the equilibrium and non-equilibrium density matrices for a given k-point.
         
         Parameters
@@ -164,15 +165,27 @@ class Ozaki(Density):
         kBT = deviceprop.kBT
         # add 0th order moment
         poles = 1j* self.poles * kBT + deviceprop.lead_L.mu - deviceprop.mu # left lead expression for rho_eq
-        deviceprop.lead_L.self_energy(kpoint=kpoint, energy=1j*self.R-deviceprop.mu)
-        deviceprop.lead_R.self_energy(kpoint=kpoint, energy=1j*self.R-deviceprop.mu)
+        deviceprop.lead_L.self_energy(
+            kpoint=kpoint, energy=1j*self.R-deviceprop.mu,
+            eta_lead=eta_lead, method=self_energy_method,
+        )
+        deviceprop.lead_R.self_energy(
+            kpoint=kpoint, energy=1j*self.R-deviceprop.mu,
+            eta_lead=eta_lead, method=self_energy_method,
+        )
         deviceprop.cal_green_function(energy=1j*self.R-deviceprop.mu, kpoint=kpoint, block_tridiagonal=block_tridiagonal,
                                       Vbias = Vbias)
         g0 = deviceprop.grd[0]
         DM_eq = 1.0j * self.R * g0
         for i, e in enumerate(poles):
-            deviceprop.lead_L.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead)
-            deviceprop.lead_R.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead)
+            deviceprop.lead_L.self_energy(
+                kpoint=kpoint, energy=e, eta_lead=eta_lead,
+                method=self_energy_method,
+            )
+            deviceprop.lead_R.self_energy(
+                kpoint=kpoint, energy=e, eta_lead=eta_lead,
+                method=self_energy_method,
+            )
             deviceprop.cal_green_function(energy=e, kpoint=kpoint, block_tridiagonal=block_tridiagonal, eta_device=eta_device,\
                                           Vbias = Vbias)
             term = ((-4 * 1j * kBT) * deviceprop.grd[0] * self.residues[i]).imag
@@ -187,8 +200,14 @@ class Ozaki(Density):
             xs, wlg = gauss_xw(xl=torch.scalar_tensor(xl), xu=torch.scalar_tensor(xu), n=self.n_gauss)
             DM_neq = 0.
             for i, e in enumerate(xs):
-                deviceprop.lead_L.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead)
-                deviceprop.lead_R.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead)
+                deviceprop.lead_L.self_energy(
+                    kpoint=kpoint, energy=e, eta_lead=eta_lead,
+                    method=self_energy_method,
+                )
+                deviceprop.lead_R.self_energy(
+                    kpoint=kpoint, energy=e, eta_lead=eta_lead,
+                    method=self_energy_method,
+                )
                 deviceprop.cal_green_function(energy=e, kpoint=kpoint, block_tridiagonal=block_tridiagonal, eta_device=eta_device)
                 gr_gamma_ga = torch.mm(torch.mm(deviceprop.grd[0], deviceprop.lead_R.gamma.to(deviceprop.grd[0].device)), deviceprop.grd[0].conj().T).real
                 gr_gamma_ga = gr_gamma_ga * (deviceprop.lead_R.fermi_dirac(e+deviceprop.mu) - deviceprop.lead_L.fermi_dirac(e+deviceprop.mu))
@@ -267,20 +286,33 @@ class Fiori(Density):
 
     def density_integrate_Fiori(self,e_grid,kpoint,Vbias,block_tridiagonal,subblocks,integrate_way,deviceprop,
                                 device_atom_norbs,potential_at_atom,with_Dirichlet_leads,free_charge,E_ref,
-                                eta_lead=1e-5, eta_device=1e-5, self_energy_save_path=None):
+                                eta_lead=1e-5, eta_device=1e-5, self_energy_save_path=None,
+                                self_energy_method="Lopez-Sancho"):
 
         for eidx, e in enumerate(self.integrate_range):
             if not with_Dirichlet_leads:
                 # Follow the NanoTCAD ViDES code:
                 #   Because the Dirichlet leads are not included, self-energy of the leads would be updated in each iteration
                 #   to ensure the Neuamnn boundary condition in the leads.
-                deviceprop.lead_L.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead, save=False)
-                deviceprop.lead_R.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead, save=False)
+                deviceprop.lead_L.self_energy_cal(
+                    kpoint=kpoint, energy=e, eta_lead=eta_lead,
+                    method=self_energy_method,
+                )
+                deviceprop.lead_R.self_energy_cal(
+                    kpoint=kpoint, energy=e, eta_lead=eta_lead,
+                    method=self_energy_method,
+                )
             else:
                 # For the Dirichlet leads, the self-energy of the leads is only calculated once and saved.
                 # In each iteration, load the pre-computed self-energy from disk.
-                deviceprop.lead_L.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead, save_path=self_energy_save_path)
-                deviceprop.lead_R.self_energy(kpoint=kpoint, energy=e, eta_lead=eta_lead, save_path=self_energy_save_path)
+                deviceprop.lead_L.self_energy(
+                    kpoint=kpoint, energy=e, eta_lead=eta_lead,
+                    method=self_energy_method, save_path=self_energy_save_path,
+                )
+                deviceprop.lead_R.self_energy(
+                    kpoint=kpoint, energy=e, eta_lead=eta_lead,
+                    method=self_energy_method, save_path=self_energy_save_path,
+                )
 
 
             deviceprop.cal_green_function(energy=e, kpoint=kpoint, block_tridiagonal=block_tridiagonal,\
