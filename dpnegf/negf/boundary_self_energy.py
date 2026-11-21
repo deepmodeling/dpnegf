@@ -111,13 +111,17 @@ def _decimate(d_bulk, d_surface, alpha, beta):
     for iteration in range(1, 102):
         rhs = np.concatenate((alpha, beta), axis=1)
         solved = np.linalg.solve(d_bulk, rhs)
-        x_alpha = solved[:, :size]
-        x_beta = solved[:, size:]
+        alpha_products = alpha @ solved
+        alpha_next = alpha_products[:, :size].copy()
+        d_bulk_next = d_bulk - alpha_products[:, size:]
+        del alpha_products
 
-        alpha_next = alpha @ x_alpha
-        beta_next = beta @ x_beta
-        d_bulk_next = d_bulk - alpha @ x_beta - beta @ x_alpha
-        d_surface_next = d_surface - beta @ x_alpha
+        beta_products = beta @ solved
+        beta_next = beta_products[:, size:].copy()
+        beta_x_alpha = beta_products[:, :size]
+        d_bulk_next -= beta_x_alpha
+        d_surface_next = d_surface - beta_x_alpha
+        del beta_products, beta_x_alpha, solved
         d_bulk, d_surface = d_bulk_next, d_surface_next
         alpha, beta = alpha_next, beta_next
 
