@@ -131,7 +131,8 @@ def _decimate(d_bulk, d_surface, alpha, beta):
     raise ArithmeticError("Boundary-Schur Sancho decimation did not converge after 101 iterations.")
 
 
-def _fixed_point_residual(a, u, green, lower, rest=None, sigma_rr=None, chunk_size=128):
+def _fixed_point_residual(a, green, u=None, lower=None, rest=None, sigma_rr=None,
+                          chunk_size=128):
     """Check the original boundary equation without a second dense residual."""
     size = a.shape[0]
     worst = 0.0
@@ -194,20 +195,25 @@ def _solve_boundary_schur(hL, hLL, sL, sLL, hDL, sDL, e0, eta,
         a_eff = a_bb
     del a_bb
 
-    u = z * sLL[np.ix_(b, b)] - hLL[np.ix_(b, b)]
-    lower = z * s10[np.ix_(b, b)] - h10[np.ix_(b, b)]
-    del hL, hLL, sL, sLL, h10, s10
     boundary_size = b.size
     use_two_endpoints = plan.has_two_endpoints
 
     if use_two_endpoints:
         c, r = plan.core, plan.rest
+        boundary_core = b[c]
+        boundary_rest = b[r]
+        t = z * sLL[np.ix_(boundary_rest, boundary_core)] - hLL[
+            np.ix_(boundary_rest, boundary_core)
+        ]
+        t_reverse = z * s10[np.ix_(boundary_core, boundary_rest)] - h10[
+            np.ix_(boundary_core, boundary_rest)
+        ]
+        del hL, hLL, sL, sLL, h10, s10, boundary_core, boundary_rest
+
         acc = a_eff[np.ix_(c, c)]
         acr = a_eff[np.ix_(c, r)]
         arc = a_eff[np.ix_(r, c)]
         arr = a_eff[np.ix_(r, r)]
-        t = u[np.ix_(r, c)]
-        t_reverse = lower[np.ix_(c, r)]
         endpoint_rhs = np.concatenate((arc, t), axis=1)
         endpoint_solve = np.linalg.solve(arr, endpoint_rhs)
         x_rc = endpoint_solve[:, :c.size]
@@ -237,6 +243,9 @@ def _solve_boundary_schur(hL, hLL, sL, sLL, hDL, sDL, e0, eta,
         mode = "boundary-schur-two-endpoint"
         core_size = int(c.size)
     else:
+        u = z * sLL[np.ix_(b, b)] - hLL[np.ix_(b, b)]
+        lower = z * s10[np.ix_(b, b)] - h10[np.ix_(b, b)]
+        del hL, hLL, sL, sLL, h10, s10
         g_boundary, iterations, inverse_residual = _decimate(
             a_eff, a_eff, -lower, -u,
         )
@@ -244,14 +253,17 @@ def _solve_boundary_schur(hL, hLL, sL, sLL, hDL, sDL, e0, eta,
         mode = "boundary-schur-boundary"
         core_size = int(boundary_size)
 
-    fixed_point_residual = _fixed_point_residual(
-        a_eff, u, g_boundary, lower,
-        rest=plan.rest if use_two_endpoints else None,
-        sigma_rr=sigma_rr_check,
-    )
-    del a_eff, u, lower
     if use_two_endpoints:
+        fixed_point_residual = _fixed_point_residual(
+            a_eff, g_boundary, rest=r, sigma_rr=sigma_rr_check,
+        )
         del c, r, t, t_reverse, sigma_rr_check
+    else:
+        fixed_point_residual = _fixed_point_residual(
+            a_eff, g_boundary, u=u, lower=lower,
+        )
+        del u, lower
+    del a_eff
     if not np.isfinite(fixed_point_residual) or fixed_point_residual >= 3.0e-5:
         raise ArithmeticError(
             f"Boundary-Schur fixed-point residual {fixed_point_residual:.3e} exceeds tolerance."
