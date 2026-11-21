@@ -1914,13 +1914,13 @@
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">dict</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">{}</span></code></div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/self_energy_options</span></code></div>
 </div>
-<p>Self-energy stage options: SGF solver, numba JIT, on-disk cache, and CPU parallelism (joblib workers, BLAS threads, ek batching).</p>
+<p>Self-energy stage options: SGF solver (including the contact-projected Boundary-Schur method), numba JIT, on-disk cache, and CPU parallelism (joblib workers, BLAS threads, ek batching).</p>
 <dl id="run-op-task-options-negf-self-energy-options-solver">
 <dt>solver:</dt><dd><div class="line-block">
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">str</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">Sancho-Rubio</span></code></div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[negf]/self_energy_options/solver</span></code></div>
 </div>
-<p>Surface Green’s function solver. ‘Sancho-Rubio’ (default) or ‘Lopez-Sancho’.</p>
+<p>Self-energy solver: ‘Sancho-Rubio’ (default), ‘Lopez-Sancho’, ‘GEP’, or ‘Boundary-Schur’. The first three return the full principal-layer surface Green’s function; Boundary-Schur computes a contact-projected self-energy with Sancho fallback.</p>
 </dd>
 </dl>
 <dl id="run-op-task-options-negf-self-energy-options-numba-jit">
@@ -3759,7 +3759,7 @@
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">str</span></code>, optional, default: <code class="docutils literal notranslate"><span class="pre">Sancho-Rubio</span></code></div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options[tbtrans_negf]/sgf_solver</span></code></div>
 </div>
-<p>Surface Green’s function solver. ‘Sancho-Rubio’ (default) or ‘Lopez-Sancho’.</p>
+<p>Self-energy solver: ‘Sancho-Rubio’ (default), ‘Lopez-Sancho’, ‘GEP’, or ‘Boundary-Schur’.</p>
 </dd>
 </dl>
 <dl id="run-op-task-options-tbtrans-negf-espacing">
