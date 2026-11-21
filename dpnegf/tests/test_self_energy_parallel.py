@@ -74,6 +74,44 @@ def test_explicit_threads_use_actual_workers_without_probes(scheduler, caplog, r
     assert "autotune=skipped (user-requested)" in caplog.text
 
 
+def test_selected_solver_is_passed_to_batch_workers(scheduler):
+    scheduler.run(2, blas_threads=2, method="Boundary-Schur")
+    assert scheduler.worker.call_count == 2
+    for call in scheduler.worker.call_args_list:
+        assert call.kwargs["method"] == "Boundary-Schur"
+
+
+def test_prepare_self_energy_logs_method_after_header(monkeypatch, tmp_path, caplog):
+    import importlib
+
+    negf_module = importlib.import_module("dpnegf.runner.NEGF")
+    runner = negf_module.NEGF.__new__(negf_module.NEGF)
+    runner.self_energy_save_path = str(tmp_path / "self_energy")
+    runner.results_path = str(tmp_path)
+    runner.use_saved_se = False
+    runner.sgf_solver = "Boundary-Schur"
+    runner.scf = False
+    runner.eta_lead = 1e-5
+    runner.deviceprop = SimpleNamespace(lead_L=object(), lead_R=object())
+    runner.kpoints = [[0.0, 0.0, 0.0]]
+    runner.uni_grid = np.array([0.0])
+    runner.ek_batch_size = 1
+    runner.cpu_budget = 1
+    runner.n_workers = 1
+    runner.se_numba_jit = False
+    runner.blas_threads = 1
+    monkeypatch.setattr(negf_module, "compute_all_self_energy", Mock())
+
+    with caplog.at_level(logging.INFO, logger=negf_module.__name__):
+        runner.prepare_self_energy(scf_require=False)
+
+    messages = [record.getMessage() for record in caplog.records]
+    header_index = messages.index("------Self-energy calculation------")
+    assert messages[header_index + 1] == (
+        "Self-energy method: Boundary-Schur (fallback to Sancho-Rubio when needed)."
+    )
+
+
 @pytest.mark.parametrize("left_dim,right_dim,expected", [
     (255, 255, 1), (256, 32, 4), (32, 256, 4), (512, 512, 4),
 ])

@@ -43,7 +43,8 @@ def tbtrans_negf():
     doc_scf_options = "SCF mixing options (only used when `scf` is true)."
     doc_stru_options = "Structure partition and k-mesh options: device region, left/right leads, PBC, k-mesh."
     doc_poisson_options = "Poisson solver options (only used when `scf` is true)."
-    doc_sgf_solver = "Surface Green's function solver. 'Sancho-Rubio' (default) or 'Lopez-Sancho'."
+    doc_sgf_solver = ("Self-energy solver: 'Sancho-Rubio' (default), 'Lopez-Sancho', "
+                      "'GEP', or 'Boundary-Schur'.")
     doc_espacing = "Energy grid spacing in `unit`. Required."
     doc_emin = "Lower bound of the energy grid in `unit`. Required."
     doc_emax = "Upper bound of the energy grid in `unit`. Required."
@@ -194,7 +195,8 @@ def negf():
     doc_eta_lead = "Small imaginary broadening added to the lead energy. Default: 1e-5."
     doc_eta_device = "Small imaginary broadening added to the device energy. Default: 0."
 
-    doc_self_energy_options = ("Self-energy stage options: SGF solver, numba JIT, "
+    doc_self_energy_options = ("Self-energy stage options: SGF solver (including the "
+                               "contact-projected Boundary-Schur method), numba JIT, "
                                "on-disk cache, and CPU parallelism (joblib workers, "
                                "BLAS threads, ek batching).")
     doc_rgf_options = ("Recursive Green's function stage options: compute device "
@@ -353,8 +355,10 @@ def self_energy_parallel_options():
 
 
 def self_energy_options():
-    doc_solver = ("Surface Green's function solver. 'Sancho-Rubio' (default) or "
-                  "'Lopez-Sancho'.")
+    doc_solver = ("Self-energy solver: 'Sancho-Rubio' (default), 'Lopez-Sancho', "
+                  "'GEP', or 'Boundary-Schur'. The first three return the full "
+                  "principal-layer surface Green's function; Boundary-Schur "
+                  "computes a contact-projected self-energy with Sancho fallback.")
     doc_numba_jit = ("Whether to JIT-compile the surface Green's function core with "
                      "numba. None (default) uses numba when available.")
     doc_info_display = ("Whether to log per-(k, E) self-energy solver info. Verbose; "
@@ -694,9 +698,12 @@ def normalize_run(data):
 
     if data.get("task_options", {}).get("task") == "negf":
         from dpnegf.utils.parrallel import validate_rgf_options
+        from dpnegf.negf.surface_green import validate_self_energy_method
 
         validate_energy_options(data["task_options"])
         task = data["task_options"]
+        self_energy_options = task.get("self_energy_options") or {}
+        validate_self_energy_method(self_energy_options.get("solver", "Sancho-Rubio"))
         rgf_options = task["rgf_options"]
         validated_rgf = validate_rgf_options(rgf_options, scf=task["scf"])
         if validated_rgf["cpu_workers"] > 1 and rgf_options.get("e_batch_size") is None:

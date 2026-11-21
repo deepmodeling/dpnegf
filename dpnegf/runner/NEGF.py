@@ -810,6 +810,12 @@ class NEGF(object):
         """
         # self energy calculation
         log.info(msg="------Self-energy calculation------")
+        if self.use_saved_se:
+            log.info("Self-energy method: saved cache (solver=%s was not run).", self.sgf_solver)
+        elif self.sgf_solver == "Boundary-Schur":
+            log.info("Self-energy method: Boundary-Schur (fallback to Sancho-Rubio when needed).")
+        else:
+            log.info("Self-energy method: %s", self.sgf_solver)
         if  self.self_energy_save_path is None:
             self.self_energy_save_path = os.path.join(self.results_path, "self_energy") 
         os.makedirs(self.self_energy_save_path, exist_ok=True)
@@ -832,7 +838,8 @@ class NEGF(object):
                                         ek_batch_size=self.ek_batch_size,
                                         cpu_budget=self.cpu_budget, n_workers=self.n_workers,
                                         se_numba_jit=self.se_numba_jit,
-                                        blas_threads=self.blas_threads)
+                                        blas_threads=self.blas_threads,
+                                        method=self.sgf_solver)
             elif not self.scf:
                 # In non-scf case, the self-energy of the leads is calculated for each energy point in the energy grid.
                 compute_all_self_energy(self.eta_lead, self.deviceprop.lead_L, self.deviceprop.lead_R,
@@ -840,7 +847,8 @@ class NEGF(object):
                                         ek_batch_size=self.ek_batch_size,
                                         cpu_budget=self.cpu_budget, n_workers=self.n_workers,
                                         se_numba_jit=self.se_numba_jit,
-                                        blas_threads=self.blas_threads)
+                                        blas_threads=self.blas_threads,
+                                        method=self.sgf_solver)
         log.info(msg="-----------------------------------\n")
 
 
@@ -943,7 +951,8 @@ class NEGF(object):
                         eta_lead = self.eta_lead,
                         eta_device = self.eta_device,
                         E_ref = self.deviceprop.E_ref,
-                        self_energy_save_path = self.self_energy_save_path
+                        self_energy_save_path = self.self_energy_save_path,
+                        self_energy_method = self.sgf_solver,
                         )
                 else:
                     # TODO: add Ozaki support for NanoTCAD-style SCF
@@ -1048,7 +1057,8 @@ class NEGF(object):
                                     potential_at_atom = self.potential_at_atom,
                                     free_charge = self.free_charge,
                                     eta_lead = self.eta_lead,
-                                    eta_device = self.eta_device
+                                    eta_device = self.eta_device,
+                                    self_energy_method = self.sgf_solver,
                                     )
                                 prop_freecharge = self.out.setdefault('FREE_CHARGE', {})
                                 prop_freecharge[str(k)] = self.free_charge[str(k)]
@@ -1228,7 +1238,14 @@ class NEGF(object):
         return self.deviceprop._cal_current_nscf_(ee, tc)
 
     def compute_density_Ozaki(self, kpoint,Vbias):
-        DM_eq, DM_neq = self.density.integrate(deviceprop=self.deviceprop, kpoint=kpoint, Vbias=Vbias, block_tridiagonal=self.block_tridiagonal)
+        DM_eq, DM_neq = self.density.integrate(
+            deviceprop=self.deviceprop,
+            kpoint=kpoint,
+            Vbias=Vbias,
+            block_tridiagonal=self.block_tridiagonal,
+            eta_lead=self.eta_lead,
+            self_energy_method=self.sgf_solver,
+        )
         return DM_eq, DM_neq
      
 
