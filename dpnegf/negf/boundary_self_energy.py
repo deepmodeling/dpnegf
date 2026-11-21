@@ -22,7 +22,7 @@ class BoundarySchurNotApplicable(Exception):
 
 
 @dataclass(frozen=True)
-class BoundarySchurPlan:
+class BoundarySchurConfig:
     size: int
     boundary: np.ndarray
     internal: np.ndarray
@@ -86,7 +86,7 @@ def prepare_boundary_schur_plan(h01, s01, hDL, sDL):
         core = np.empty(0, dtype=np.intp)
         rest = np.empty(0, dtype=np.intp)
 
-    return BoundarySchurPlan(
+    return BoundarySchurConfig(
         size=n,
         boundary=np.asarray(boundary, dtype=np.intp),
         internal=np.asarray(internal, dtype=np.intp),

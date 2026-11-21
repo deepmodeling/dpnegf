@@ -1608,7 +1608,7 @@ run_op:
             | type: ``dict``, optional, default: ``{}``
             | argument path: ``run_op/task_options[negf]/self_energy_options``
 
-            Self-energy stage options: SGF solver, numba JIT, on-disk cache, and CPU parallelism (joblib workers, BLAS threads, ek batching).
+            Self-energy stage options: SGF solver (including the contact-projected Boundary-Schur method), numba JIT, on-disk cache, and CPU parallelism (joblib workers, BLAS threads, ek batching).
 
             .. _`run_op/task_options[negf]/self_energy_options/solver`: 
 
@@ -1616,7 +1616,7 @@ run_op:
                 | type: ``str``, optional, default: ``Sancho-Rubio``
                 | argument path: ``run_op/task_options[negf]/self_energy_options/solver``
 
-                Surface Green's function solver. 'Sancho-Rubio' (default) or 'Lopez-Sancho'.
+                Self-energy solver: 'Sancho-Rubio' (default), 'Lopez-Sancho', 'GEP', or 'Boundary-Schur'. The first three return the full principal-layer surface Green's function; Boundary-Schur computes a contact-projected self-energy with Sancho fallback.
 
             .. _`run_op/task_options[negf]/self_energy_options/numba_jit`: 
 
@@ -3519,7 +3519,7 @@ run_op:
             | type: ``str``, optional, default: ``Sancho-Rubio``
             | argument path: ``run_op/task_options[tbtrans_negf]/sgf_solver``
 
-            Surface Green's function solver. 'Sancho-Rubio' (default) or 'Lopez-Sancho'.
+            Self-energy solver: 'Sancho-Rubio' (default), 'Lopez-Sancho', 'GEP', or 'Boundary-Schur'.
 
         .. _`run_op/task_options[tbtrans_negf]/espacing`: 
 
