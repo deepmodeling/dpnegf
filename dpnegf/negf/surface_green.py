@@ -5,9 +5,22 @@ import torch
 
 log = logging.getLogger(__name__)
 
+SELF_ENERGY_METHODS = frozenset({
+    "Sancho-Rubio", "Lopez-Sancho", "Boundary-Schur", "GEP",
+})
+SURFACE_GREEN_METHODS = frozenset({"Sancho-Rubio", "Lopez-Sancho", "GEP"})
+
+
+def validate_self_energy_method(method):
+    if not isinstance(method, str) or method not in SELF_ENERGY_METHODS:
+        choices = ", ".join(sorted(SELF_ENERGY_METHODS))
+        raise ValueError(f"Unknown self-energy solver {method!r}; expected one of: {choices}.")
+    return method
+
+
 def selfEnergy(hL, hLL, sL, sLL, ee, hDL=None, sDL=None, etaLead=1e-8, Bulk=False,
                     E_ref=0.0, dtype=np.complex128, device='cpu', method='Lopez-Sancho', numba_jit=None,
-                    h10=None, s10=None):
+                    h10=None, s10=None, boundary_plan=None):
     '''calculates the self-energy and surface Green's function for a given  Hamiltonian and overlap matrix.
 
     Parameters
@@ -38,8 +51,9 @@ def selfEnergy(hL, hLL, sL, sLL, ee, hDL=None, sDL=None, etaLead=1e-8, Bulk=Fals
         The "device" parameter specifies the device on which the calculations will be performed. It can be
         set to 'cpu' for CPU computation or 'cuda' for GPU computation.
     method
-        specify the method for calculating the surface Green's function.The available options
-        are "Lopez-Sancho" and any other value will default to "Lopez-Sancho".
+        ``"Sancho-Rubio"``/``"Lopez-Sancho"`` return the full surface Green
+        function. ``"Boundary-Schur"`` computes only the contact-projected
+        self-energy and returns ``None`` for the Green-function result.
     numba_jit
         A boolean flag that indicates whether to use Numba's Just-In-Time (JIT) compilation for the surface Green's function calculation.
     h10, s10
@@ -49,9 +63,13 @@ def selfEnergy(hL, hLL, sL, sLL, ee, hDL=None, sDL=None, etaLead=1e-8, Bulk=Fals
 
     Returns
     -------
-        two values: Sig and SGF. The former is self-energy and the latter is surface Green's function.
+        Two values: self-energy and surface Green's function. The latter is
+        ``None`` for ``method="Boundary-Schur"`` because its reduced Green
+        function is not the full principal-layer surface Green's function.
 
     '''
+    validate_self_energy_method(method)
+
     hL = convert_to_numpy(hL)
     sL = convert_to_numpy(sL)
     hLL = convert_to_numpy(hLL)
@@ -73,6 +91,18 @@ def selfEnergy(hL, hLL, sL, sLL, ee, hDL=None, sDL=None, etaLead=1e-8, Bulk=Fals
         eeshifted = ee + E_ref
 
     eeshifted = eeshifted.item()
+
+    if method == 'Boundary-Schur':
+        if hDL is None or sDL is None:
+            raise ValueError("Boundary-Schur requires lead-device H/S contacts.")
+        from dpnegf.negf.boundary_self_energy import boundary_self_energy
+
+        sigma, _ = boundary_self_energy(
+            hL=hL, hLL=hLL, sL=sL, sLL=sLL, hDL=hDL, sDL=sDL,
+            energy=ee, E_ref=E_ref, etaLead=etaLead, numba_jit=numba_jit,
+            h10=h10, s10=s10, plan=boundary_plan,
+        )
+        return sigma.to(device=device), None
 
     if hDL is None:
         ESH = (eeshifted * sL - hL)
@@ -253,6 +283,10 @@ def surface_green(H, h01, S, s01, ee,
 
     '''
 
+    if method not in SURFACE_GREEN_METHODS:
+        choices = ", ".join(sorted(SURFACE_GREEN_METHODS))
+        raise ValueError(f"Unknown surface-Green solver {method!r}; expected one of: {choices}.")
+
     # default: use numba whenever it compiled successfully
     if numba_jit is None:
         numba_jit = _numba_available
@@ -402,5 +436,5 @@ def convert_to_numpy(data):
         return data.detach().numpy()
     elif isinstance(data, np.ndarray):
         return data
-    elif isinstance(data, float):
+    elif isinstance(data, (int, float, complex, np.number)):
         return np.array(data)
