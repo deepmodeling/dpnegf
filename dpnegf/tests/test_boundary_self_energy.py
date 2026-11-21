@@ -127,17 +127,19 @@ def test_energy_cancellation_does_not_change_structural_partition():
     torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-12)
 
 
-def test_no_dimension_reduction_falls_back_to_sancho():
+def test_no_dimension_reduction_falls_back_to_sancho(caplog):
     h, h01, s, s01, hdl, sdl = _make_lead_problem(full_boundary=True)
     expected, _ = selfEnergy(
         h, h01, s, s01, 0.31, hdl, sdl, etaLead=0.01,
         method="Sancho-Rubio", numba_jit=False,
     )
-    actual, diagnostics = boundary_self_energy(
-        h, h01, s, s01, hdl, sdl, 0.31, etaLead=0.01, numba_jit=False,
-    )
+    with caplog.at_level("INFO", logger=boundary_solver_module.__name__):
+        actual, diagnostics = boundary_self_energy(
+            h, h01, s, s01, hdl, sdl, 0.31, etaLead=0.01, numba_jit=False,
+        )
     assert diagnostics["solver"] == "Sancho-Rubio"
     assert "no effective dimension reduction" in diagnostics["fallback_reason"]
+    assert "fallback: using Sancho-Rubio at E=0.31000000" in caplog.text
     torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-12)
 
 

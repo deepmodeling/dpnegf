@@ -702,7 +702,8 @@ def normalize_run(data):
 
         validate_energy_options(data["task_options"])
         task = data["task_options"]
-        validate_self_energy_method(task["self_energy_options"]["solver"])
+        self_energy_options = task.get("self_energy_options") or {}
+        validate_self_energy_method(self_energy_options.get("solver", "Sancho-Rubio"))
         rgf_options = task["rgf_options"]
         validated_rgf = validate_rgf_options(rgf_options, scf=task["scf"])
         if validated_rgf["cpu_workers"] > 1 and rgf_options.get("e_batch_size") is None:

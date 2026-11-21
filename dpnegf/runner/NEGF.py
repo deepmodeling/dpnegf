@@ -810,6 +810,12 @@ class NEGF(object):
         """
         # self energy calculation
         log.info(msg="------Self-energy calculation------")
+        if self.use_saved_se:
+            log.info("Self-energy method: saved cache (solver=%s was not run).", self.sgf_solver)
+        elif self.sgf_solver == "Boundary-Schur":
+            log.info("Self-energy method: Boundary-Schur (fallback to Sancho-Rubio when needed).")
+        else:
+            log.info("Self-energy method: %s", self.sgf_solver)
         if  self.self_energy_save_path is None:
             self.self_energy_save_path = os.path.join(self.results_path, "self_energy") 
         os.makedirs(self.self_energy_save_path, exist_ok=True)

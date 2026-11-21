@@ -330,7 +330,10 @@ def boundary_self_energy(hL, hLL, sL, sLL, hDL, sDL, energy, E_ref=0.0,
     contacts = plan.contacts
 
     def fallback(reason):
-        log.debug("Boundary-Schur fallback to Sancho-Rubio: %s", reason)
+        log.info(
+            "Boundary-Schur fallback: using Sancho-Rubio at E=%.8f (eta=%g): %s",
+            e0, eta, reason,
+        )
         sigma, _ = _run_sancho(
             hL, hLL, sL, sLL, e0, eta, hDL, sDL, contacts,
             h10, s10, numba_jit,
