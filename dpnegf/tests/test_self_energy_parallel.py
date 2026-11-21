@@ -74,6 +74,13 @@ def test_explicit_threads_use_actual_workers_without_probes(scheduler, caplog, r
     assert "autotune=skipped (user-requested)" in caplog.text
 
 
+def test_selected_solver_is_passed_to_batch_workers(scheduler):
+    scheduler.run(2, blas_threads=2, method="Boundary-Schur")
+    assert scheduler.worker.call_count == 2
+    for call in scheduler.worker.call_args_list:
+        assert call.kwargs["method"] == "Boundary-Schur"
+
+
 @pytest.mark.parametrize("left_dim,right_dim,expected", [
     (255, 255, 1), (256, 32, 4), (32, 256, 4), (512, 512, 4),
 ])
