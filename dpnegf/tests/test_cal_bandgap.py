@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 from scipy import sparse
 
+import dpnegf.runner.cal_bandgap as cal_bandgap_module
 from dpnegf.runner.cal_bandgap import (
     BandGapCalculator,
     _checked_superlu_negative_count,
@@ -81,6 +82,76 @@ def test_checked_shift_invert_recovers_global_band_indices():
     assert allowance <= 1e-7
     for rank in ranks:
         assert spectrum[rank][0] == pytest.approx(expected[rank - 1], abs=1e-8)
+
+
+def test_shift_invert_uses_window_probes_not_full_bisection(monkeypatch):
+    """Sigma seeding and index verification must not bisect every band."""
+    calls = {"n": 0}
+    original = cal_bandgap_module._inertia_count_below
+
+    def counting(hamiltonian, overlap, energy):
+        calls["n"] += 1
+        return original(hamiltonian, overlap, energy)
+
+    monkeypatch.setattr(cal_bandgap_module, "_inertia_count_below", counting)
+    expected = np.linspace(-5.0, 5.0, 64)
+    hamiltonian = sparse.diags(expected, dtype=np.complex128, format="csr")
+    overlap = sparse.eye(64, dtype=np.complex128, format="csr")
+    ranks = list(range(30, 36))
+    options = {"energy_bounds": [-10.0, 10.0], "edge_tol": 1e-6,
+               "energy_shift": None, "dense_limit": 20}
+    spectrum, _, _, solver = _solve_shift_invert(hamiltonian, overlap, ranks, options)
+    assert solver == "shift-invert"
+    # A full inertia bisection to 1e-6 would need more than 100 factorizations.
+    assert calls["n"] < 40
+    for rank in ranks:
+        assert spectrum[rank][0] == pytest.approx(expected[rank - 1], abs=1e-8)
+
+
+def test_shift_invert_warm_start_hint_skips_coarse_location(monkeypatch):
+    calls = {"n": 0}
+    original = cal_bandgap_module._inertia_count_below
+
+    def counting(hamiltonian, overlap, energy):
+        calls["n"] += 1
+        return original(hamiltonian, overlap, energy)
+
+    monkeypatch.setattr(cal_bandgap_module, "_inertia_count_below", counting)
+    expected = np.linspace(-5.0, 5.0, 64)
+    hamiltonian = sparse.diags(expected, dtype=np.complex128, format="csr")
+    overlap = sparse.eye(64, dtype=np.complex128, format="csr")
+    ranks = list(range(30, 36))
+    hint = 0.5 * (expected[31] + expected[32])
+    spectrum, _, _, solver = _solve_shift_invert(
+        hamiltonian, overlap, ranks,
+        {"energy_bounds": [-10.0, 10.0], "edge_tol": 1e-6,
+         "energy_shift": None, "dense_limit": 20},
+        shift_hint=hint,
+    )
+    assert solver == "shift-invert"
+    # Only the window verification probes are needed with a good warm start.
+    assert calls["n"] <= 6
+    for rank in ranks:
+        assert spectrum[rank][0] == pytest.approx(expected[rank - 1], abs=1e-8)
+
+
+def test_shift_invert_falls_back_to_inertia_on_exact_degeneracy():
+    """One Arnoldi run cannot resolve both copies of an exactly degenerate level."""
+    values = np.linspace(-1.0, 1.0, 33)
+    values[16] = values[17] = 0.0  # exact mid-gap degeneracy between ranks 17 and 18
+    hamiltonian = sparse.diags(values, dtype=np.complex128, format="csr")
+    overlap = sparse.eye(33, dtype=np.complex128, format="csr")
+    ranks = [15, 16, 17, 18, 19, 20]
+    spectrum, allowance, probes, solver = _solve_shift_invert(
+        hamiltonian, overlap, ranks,
+        {"energy_bounds": [-10.0, 10.0], "edge_tol": 1e-6,
+         "energy_shift": None, "dense_limit": 20},
+    )
+    assert solver == "inertia-fallback"
+    assert probes > 0
+    assert allowance <= 5e-7
+    for rank in ranks:
+        assert spectrum[rank][0] == pytest.approx(values[rank - 1], abs=1e-6)
 
 
 def test_hbn_finite_gap_and_model_free_hs_cache_reuse(tmp_path):
@@ -192,6 +263,11 @@ def test_realspace_blocks_match_native_hr2hk_for_complex_kpoints():
         s_sparse = BandGapCalculator._assemble_sparse_blocks(s_blocks, atom_norbs, kpoint).toarray()
         np.testing.assert_allclose(h_sparse, h_native[index], rtol=1e-6, atol=2e-6)
         np.testing.assert_allclose(s_sparse, s_native[index], rtol=1e-6, atol=2e-6)
+        # The sparse assembly must hermitianize the raw onsite block the same
+        # way HR2HK completes its triangular storage convention.
+        scale = max(1.0, float(np.abs(h_sparse).max()))
+        assert np.abs(h_sparse - h_sparse.conj().T).max() <= 1e-9 * scale
+        assert np.abs(s_sparse - s_sparse.conj().T).max() <= 1e-9 * max(1.0, float(np.abs(s_sparse).max()))
 
 
 def test_bandgap_cli_task_writes_reviewable_outputs(tmp_path):
@@ -236,3 +312,85 @@ def test_run_import_defers_transport_runners():
         [sys.executable, "-c", code], capture_output=True, text=True, check=False,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_shift_invert_warm_start_seeded_from_nearest_k(monkeypatch):
+    pytest.importorskip("dptb")
+    hints = []
+    original = cal_bandgap_module._solve_shift_invert
+
+    def recording(hamiltonian, overlap, ranks, solver_options, shift_hint=None):
+        hints.append(shift_hint)
+        return original(hamiltonian, overlap, ranks, solver_options, shift_hint=shift_hint)
+
+    monkeypatch.setattr(cal_bandgap_module, "_solve_shift_invert", recording)
+    calculator = BandGapCalculator(
+        structure=str(HBN_STRUCTURE),
+        checkpoint=str(HBN_CHECKPOINT),
+        pbc=[False, False, True],
+        task_options={
+            "structure_options": {"mode": "periodic", "axis": 2, "periodic_length": 4.0},
+            "occupation_options": {"nel_atom": {"B": 3, "N": 5}},
+            "solver_options": {"method": "shift-invert", "edge_tol": 1e-5},
+            "k_options": {"initial_nk": 3, "max_nk": 3},
+            "output_options": {"plot": False},
+            "cache_options": {"use_saved": False, "save": False},
+        },
+    )
+    result = calculator.compute()
+    assert len(hints) == len(result["k_spectra"]) >= 2
+    assert hints[0] is None
+    assert all(hint is not None and np.isfinite(hint) for hint in hints[1:])
+
+
+def test_compute_works_without_threadpoolctl(monkeypatch):
+    pytest.importorskip("dptb")
+    monkeypatch.setitem(sys.modules, "threadpoolctl", None)
+    result = BandGapCalculator(
+        structure=str(HBN_STRUCTURE),
+        checkpoint=str(HBN_CHECKPOINT),
+        pbc=[False, False, False],
+        task_options={
+            **_finite_options("dense"),
+            "cache_options": {"use_saved": False, "save": False},
+        },
+    ).compute()
+    assert result["gap_status"] == "positive_gap"
+
+
+def test_local_refine_targets_only_candidate_bands(monkeypatch):
+    """Each candidate interval refines only the band whose extremum lies there."""
+    refine_calls = []
+    real_minimize = cal_bandgap_module.minimize_scalar
+
+    def spy(fun, **kwargs):
+        refine_calls.append(fun)
+        return real_minimize(fun, **kwargs)
+
+    monkeypatch.setattr(cal_bandgap_module, "minimize_scalar", spy)
+
+    evaluations = {}
+
+    def spectrum_at(x):
+        # Valence maximum at k=0.3, conduction minimum at k=0.45.
+        return {2: (-((x - 0.3) ** 2), 0.0), 3: (1.0 + (x - 0.45) ** 2, 0.0)}
+
+    def evaluate(x):
+        key = float(round(x, 12))
+        if key not in evaluations:
+            evaluations[key] = {"spectrum": spectrum_at(key), "allowance": 0.0}
+        return evaluations[key]
+
+    for point in (0.0, 0.1, 0.2, 0.3, 0.4, 0.5):
+        evaluate(point)
+
+    calculator = BandGapCalculator.__new__(BandGapCalculator)
+    calculator._refine_extrema(evaluations, evaluate, occupied=2)
+
+    # Two intervals per band: (0.2, 0.3)/(0.3, 0.4) for the valence maximum
+    # and (0.3, 0.4)/(0.4, 0.5) for the conduction minimum.
+    assert len(refine_calls) == 4
+    valence = max(item["spectrum"][2][0] for item in evaluations.values())
+    conduction = min(item["spectrum"][3][0] for item in evaluations.values())
+    assert valence == pytest.approx(0.0, abs=1e-8)
+    assert conduction == pytest.approx(1.0, abs=1e-8)
