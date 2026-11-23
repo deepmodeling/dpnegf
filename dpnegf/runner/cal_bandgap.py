@@ -8,6 +8,7 @@ so a validated H/S cache can be used without constructing a checkpoint model.
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import hashlib
 import importlib.metadata
@@ -26,7 +27,7 @@ from scipy.sparse.linalg import ArpackNoConvergence, eigsh, splu
 log = logging.getLogger(__name__)
 
 _CACHE_VERSION = 2
-_ALGORITHM_VERSION = "realspace-blocks-v2"
+_ALGORITHM_VERSION = "realspace-blocks-v3"
 
 
 def _finite_number(value, name, *, positive=False):
@@ -255,36 +256,80 @@ def _solve_inertia(hamiltonian, overlap, ranks, solver_options):
     return intervals, max((item[1] for item in intervals.values()), default=0.0), probes
 
 
-def _solve_shift_invert(hamiltonian, overlap, ranks, solver_options):
-    """Use inertia to verify the band indices returned by generalized eigsh."""
-    reference, _, probes = _solve_inertia(hamiltonian, overlap, ranks, solver_options)
-    safe_shift = 0.5 * (reference[ranks[len(ranks) // 2]][0] + reference[ranks[(len(ranks) - 1) // 2]][0])
-    if abs(safe_shift - reference[ranks[0]][0]) < 4 * solver_options["edge_tol"]:
-        safe_shift -= max(1e-4, 10 * solver_options["edge_tol"])
-    shifts = [solver_options["energy_shift"], safe_shift]
-    shifts = [float(shift) for i, shift in enumerate(shifts) if shift is not None and shift not in shifts[:i]]
+def _solve_shift_invert(hamiltonian, overlap, ranks, solver_options, shift_hint=None):
+    """Solve requested bands near a shift and verify their global band indices.
+
+    The shift comes from a warm start at a neighbouring k point, the user
+    hint, or a coarse inertia bracket of the middle requested ranks.  The
+    Ritz window is accepted only when inertia counts on both sides show that
+    it contains exactly the returned levels and covers the requested ranks;
+    otherwise the window is enlarged or the shift is moved.
+    """
     n = hamiltonian.shape[0]
     if n <= 2:
         values, allowance = _solve_dense(hamiltonian, overlap, ranks)
-        return values, allowance, probes, "dense-fallback"
+        return values, allowance, 0, "dense-fallback"
 
+    probes = 0
+    try:
+        negative = _checked_superlu_negative_count(overlap)
+        probes += 1
+    except Exception as exc:
+        raise ValueError(f"Could not verify overlap positive definiteness with SuperLU: {exc}") from exc
+    if negative:
+        raise ValueError(f"Overlap matrix is not positive definite ({negative} negative modes).")
+
+    base_shift = shift_hint
+    if base_shift is None:
+        base_shift = solver_options["energy_shift"]
+    if base_shift is None:
+        # No hint at all (first solved k point): bracket the middle requested
+        # ranks with a coarse shared bisection.  This only seeds sigma; the
+        # verified Ritz window below determines the returned values.
+        middle = (ranks[(len(ranks) - 1) // 2], ranks[len(ranks) // 2])
+        try:
+            reference, used = _bisect_rank_intervals(
+                hamiltonian, overlap, middle, solver_options["energy_bounds"], 0.05,
+            )
+            probes += used
+            base_shift = 0.5 * sum(reference[rank][0] for rank in middle)
+        except RuntimeError:
+            base_shift = 0.5 * sum(map(float, solver_options["energy_bounds"]))
+    base_shift = float(base_shift)
+
+    shifts = [base_shift]
+    for step in range(6):
+        for sign in (1.0, -1.0):
+            candidate = base_shift + sign * 1e-3 * 3.0**step
+            if all(abs(candidate - seen) > 1e-9 * max(1.0, abs(candidate)) for seen in shifts):
+                shifts.append(candidate)
+    user_hint = solver_options["energy_shift"]
+    if user_hint is not None:
+        user_hint = float(user_hint)
+        if all(abs(user_hint - seen) > 1e-9 * max(1.0, abs(user_hint)) for seen in shifts):
+            shifts.append(user_hint)
+
+    max_eigs = n - 2  # complex Hermitian eigsh delegates to eigs, which needs k < N - 1.
+    initial_eigs = min(max_eigs, max(len(ranks) + 4, 8))
     last_error = None
     for shift in shifts:
-        max_eigs = n - 2  # complex Hermitian eigsh delegates to eigs, which needs k < N - 1.
-        n_eigs = min(max_eigs, max(len(ranks) + 4, 8))
-        while n_eigs < n:
+        n_eigs = initial_eigs
+        while True:
             try:
                 values, vectors = eigsh(
                     hamiltonian, k=n_eigs, M=overlap, sigma=shift, which="LM",
                     tol=1e-10, maxiter=max(1000, 20 * n),
                 )
-            except ArpackNoConvergence as exc:
+            except ArpackNoConvergence:
                 last_error = RuntimeError(f"ARPACK did not converge near shift {shift:g} eV.")
-                n_eigs = min(max_eigs, max(n_eigs + 4, n_eigs * 2))
-                if n_eigs == max_eigs and n_eigs + 4 >= n:
-                    last_error = RuntimeError("ARPACK failed at the maximum sparse Ritz window.")
+                if n_eigs >= max_eigs:
                     break
+                n_eigs = min(max_eigs, max(n_eigs + 4, n_eigs * 2))
                 continue
+            except (RuntimeError, linalg.LinAlgError) as exc:
+                # A singular or unfactorable shifted matrix is fixed by moving sigma.
+                last_error = RuntimeError(f"Shift-invert factorization failed near shift {shift:g} eV: {exc}")
+                break
             order = np.argsort(values)
             values, vectors = np.asarray(values[order]), np.asarray(vectors[:, order])
 
@@ -317,6 +362,7 @@ def _solve_shift_invert(hamiltonian, overlap, ranks, solver_options):
                 try:
                     low_count = _inertia_count_below(hamiltonian, overlap, float(ritz[0] - margin))
                     high_count = _inertia_count_below(hamiltonian, overlap, float(ritz[-1] + margin))
+                    probes += 2
                 except (RuntimeError, ValueError) as exc:
                     last_error = exc
                     margin *= 3
@@ -345,14 +391,27 @@ def _solve_shift_invert(hamiltonian, overlap, ranks, solver_options):
             last_error = RuntimeError(
                 "Shift-invert spectrum was incomplete or did not cover the requested global band indices."
             )
-            if n_eigs == max_eigs:
+            if n_eigs >= max_eigs:
                 break
             n_eigs = min(max_eigs, max(n_eigs + 4, n_eigs * 2))
 
     if n <= solver_options["dense_limit"]:
         dense_values, dense_allowance = _solve_dense(hamiltonian, overlap, ranks)
         return dense_values, dense_allowance, probes, "dense-fallback"
-    raise RuntimeError(f"Checked shift-invert solve failed: {last_error}")
+    # A single Arnoldi run cannot resolve both copies of an exactly degenerate
+    # eigenvalue: the returned subspace is then rank deficient and the Ritz
+    # checks above reject every shift.  The checked inertia solver counts
+    # degenerate levels correctly by construction.
+    log.warning(
+        "Shift-invert failed (%s); falling back to the checked inertia solver for this k point.",
+        last_error,
+    )
+    intervals, extra = _bisect_rank_intervals(
+        hamiltonian, overlap, ranks, solver_options["energy_bounds"], solver_options["edge_tol"],
+    )
+    probes += extra
+    allowance = max((item[1] for item in intervals.values()), default=0.0)
+    return intervals, allowance, probes, "inertia-fallback"
 
 
 class BandGapCalculator:
@@ -570,8 +629,6 @@ class BandGapCalculator:
                 temporary.unlink()
 
     def _cache_key(self, atoms, mode, axis, source_fingerprint):
-        import torch
-
         explicit_cutoffs = self.atomic_data_options
         payload = {
             "cache_version": _CACHE_VERSION,
@@ -586,7 +643,6 @@ class BandGapCalculator:
             "mode": mode,
             "axis": axis,
             "dtype": self.dtype,
-            "graph_default_dtype": str(torch.get_default_dtype()),
             "AtomicData_options": explicit_cutoffs,
         }
         return _json_fingerprint(payload)
@@ -830,7 +886,11 @@ class BandGapCalculator:
             rr, cc = np.meshgrid(row, col, indexing="ij")
             phase = np.exp(-2j * np.pi * float(np.dot(kpoint, shift)))
             if atom_i == atom_j and not np.any(shift):
-                # feature_to_block already materializes the complete onsite block.
+                # feature_to_block materializes the complete onsite block, but
+                # its same-shell entries carry ~1e-8 float asymmetry.  HR2HK
+                # hermitianizes it (upper-triangle storage completed by
+                # block + block^H), so apply the same symmetrization here.
+                block = 0.5 * (block + block.conj().T)
                 rows.append(rr.ravel())
                 columns.append(cc.ravel())
                 values.append(block.ravel())
@@ -889,9 +949,10 @@ class BandGapCalculator:
             method = "dense" if dimension <= self.solver_options["dense_limit"] else "inertia"
         if self.output_options["all_bands"] and method != "dense":
             raise ValueError("The selected automatic solver is sparse; all_bands requires dimension <= dense_limit or method='dense'.")
+        self._resolved_method = method
         use_hr2hk = method == "dense" and self._prepare_hr2hk(h_blocks, s_blocks, model_metadata)
 
-        def solve(kpoint):
+        def solve(kpoint, shift_hint=None):
             if use_hr2hk:
                 h = self._hr2hk_fourier(kpoint)
             else:
@@ -911,7 +972,9 @@ class BandGapCalculator:
                 spectrum, allowance, probes = _solve_inertia(h, s, ranks, self.solver_options)
                 return spectrum, allowance, "inertia", probes
             if method == "shift-invert":
-                spectrum, allowance, probes, solver_name = _solve_shift_invert(h, s, ranks, self.solver_options)
+                spectrum, allowance, probes, solver_name = _solve_shift_invert(
+                    h, s, ranks, self.solver_options, shift_hint=shift_hint,
+                )
                 return spectrum, allowance, solver_name, probes
             raise ValueError(f"Unknown spectrum solver {method!r}.")
 
@@ -950,19 +1013,21 @@ class BandGapCalculator:
         points = sorted(evaluations)
         if len(points) < 2:
             return
-        v = [evaluations[x]["spectrum"][occupied][0] for x in points]
-        c = [evaluations[x]["spectrum"][occupied + 1][0] for x in points]
-        intervals = set()
-        for i in range(len(points)):
-            is_vmax = (i == 0 or v[i] >= v[i - 1]) and (i == len(points) - 1 or v[i] >= v[i + 1])
-            is_cmin = (i == 0 or c[i] <= c[i - 1]) and (i == len(points) - 1 or c[i] <= c[i + 1])
-            if is_vmax or is_cmin:
-                if i > 0:
-                    intervals.add((points[i - 1], points[i]))
-                if i + 1 < len(points):
-                    intervals.add((points[i], points[i + 1]))
-        for left, right in sorted(intervals):
-            for band_rank, sign in ((occupied, -1.0), (occupied + 1, 1.0)):
+        # Candidate intervals for -E_v and E_c are independent: refine each
+        # band only around its own local extrema (including grid endpoints).
+        last = len(points) - 1
+        candidates = {occupied: set(), occupied + 1: set()}
+        for band_rank, better in ((occupied, max), (occupied + 1, min)):
+            sequence = [evaluations[x]["spectrum"][band_rank][0] for x in points]
+            for i in range(len(points)):
+                neighbours = [sequence[j] for j in (i - 1, i + 1) if 0 <= j <= last]
+                if sequence[i] == better([sequence[i], *neighbours]):
+                    if i > 0:
+                        candidates[band_rank].add((points[i - 1], points[i]))
+                    if i < last:
+                        candidates[band_rank].add((points[i], points[i + 1]))
+        for band_rank, sign in ((occupied, -1.0), (occupied + 1, 1.0)):
+            for left, right in sorted(candidates[band_rank]):
                 result = minimize_scalar(
                     lambda x: sign * evaluate(float(x))["spectrum"][band_rank][0],
                     bounds=(left, right), method="bounded",
@@ -1084,7 +1149,10 @@ class BandGapCalculator:
         ax.axhline(0.0, color="black", linewidth=0.6, alpha=0.6)
         ax.set_ylabel("Energy relative to mid-gap (eV)")
         ax.set_xlabel("Fractional k along periodic axis" if result["structure_mode"] == "periodic" else "Finite structure")
-        ax.set_title("Calculated near-gap spectrum")
+        title = "Calculated near-gap spectrum"
+        if result.get("below_requested_resolution"):
+            title += " (gap below requested resolution)"
+        ax.set_title(title)
         if result["structure_mode"] == "finite":
             ax.set_xlim(-0.5, 0.5)
             ax.set_xticks([0], ["finite"])
@@ -1107,7 +1175,11 @@ class BandGapCalculator:
 
     def compute(self):
         """Compute and return a JSON-compatible result dictionary."""
-        from threadpoolctl import threadpool_limits
+        try:
+            from threadpoolctl import threadpool_limits
+        except ImportError:
+            threadpool_limits = None
+            log.info("threadpoolctl is not installed; BLAS thread limiting is skipped.")
 
         self._atoms, mode, axis = self._read_structure()
         source_fingerprint = self._source_fingerprint()
@@ -1149,7 +1221,16 @@ class BandGapCalculator:
                 spectrum_path = self._spectrum_cache_path(identity)
                 cached_spectrum = self._load_cached_spectrum(spectrum_path, identity, ranks)
                 if cached_spectrum is None:
-                    spectrum, allowance, solver_name, probes = solve(kpoint)
+                    shift_hint = None
+                    if self._resolved_method == "shift-invert" and self._evaluations:
+                        # Warm start: shift at the band-edge midpoint of the
+                        # nearest already solved k point.
+                        nearest = min(self._evaluations, key=lambda item: abs(item - key))
+                        edge_spectrum = self._evaluations[nearest]["spectrum"]
+                        shift_hint = 0.5 * (
+                            edge_spectrum[occupied][0] + edge_spectrum[occupied + 1][0]
+                        )
+                    spectrum, allowance, solver_name, probes = solve(kpoint, shift_hint=shift_hint)
                     spectrum_cache_counts["misses"] += 1
                     self._save_cached_spectrum(
                         spectrum_path, identity, spectrum, ranks, allowance, solver_name, probes,
@@ -1164,7 +1245,7 @@ class BandGapCalculator:
                 solver_names.add(solver_name)
             return self._evaluations[key]
 
-        with threadpool_limits(limits=1):
+        with threadpool_limits(limits=1) if threadpool_limits is not None else contextlib.nullcontext():
             if mode == "finite":
                 evaluate(0.0)
                 converged, convergence = True, []
@@ -1225,6 +1306,7 @@ class BandGapCalculator:
                 "dense": "not_estimated_dense",
                 "dense-fallback": "not_estimated_dense",
                 "inertia": "bisection_half_width",
+                "inertia-fallback": "bisection_half_width",
                 "shift-invert": "residual_based_estimate",
             }[name] for name in solver_names),
             "gap_status": gap_status,
@@ -1253,6 +1335,7 @@ class BandGapCalculator:
                         "dense": "not_estimated_dense",
                         "dense-fallback": "not_estimated_dense",
                         "inertia": "bisection_half_width",
+                        "inertia-fallback": "bisection_half_width",
                         "shift-invert": "residual_based_estimate",
                     }[self._evaluations[key]["solver"]],
                     "solver": self._evaluations[key]["solver"],
@@ -1278,6 +1361,12 @@ class BandGapCalculator:
         if "shift-invert" in solver_names:
             result["warnings"].append(
                 "Shift-invert residual allowances are numerical estimates, not certified eigenvalue brackets."
+            )
+        if result["below_requested_resolution"] and signed_gap > 0:
+            result["warnings"].append(
+                f"Signed gap {signed_gap:.6g} eV is below the requested resolution "
+                f"{float(self.k_options['gap_tol']):g} eV; it is not reliably resolved "
+                "as a positive gap at this scale."
             )
         self._save_outputs(result)
         return result
