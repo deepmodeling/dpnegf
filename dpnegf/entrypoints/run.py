@@ -4,12 +4,10 @@ import json
 import shutil
 from typing import Optional
 from pathlib import Path
-from dptb.nn.build import build_model
 from dpnegf.utils.loggers import set_log_handles
 from dpnegf.utils.argcheck import normalize_run
 from dpnegf.utils.tools import j_loader
 from dpnegf.utils.tools import j_must_have
-from dpnegf.runner.NEGF import NEGF
 
 
 
@@ -51,7 +49,9 @@ def run(
 
     set_log_handles(log_level, Path(log_path) if log_path else None)
 
-    jdata = j_loader(INPUT)
+    input_data = j_loader(INPUT)
+    explicit_atomic_data_options = input_data.get("AtomicData_options")
+    jdata = input_data
     jdata = normalize_run(jdata)
 
     if output:
@@ -71,8 +71,6 @@ def run(
     if jdata.get("dtype", None):
         in_common_options.update({"dtype": jdata["dtype"]})
 
-    model = build_model(checkpoint=init_model, common_options=in_common_options)
-    
     if  run_opt['structure'] is None:
         log.warning(msg="Warning! structure is not set in run option, read from input config file.")
         structure = j_must_have(jdata, "structure")
@@ -80,8 +78,30 @@ def run(
 
     struct_file = run_opt["structure"]
 
+    if task == "cal_bandgap":
+        from dpnegf.runner.cal_bandgap import BandGapCalculator
 
-    if task=='negf':
+        calculator = BandGapCalculator(
+            checkpoint=init_model,
+            structure=struct_file,
+            device=jdata.get("device") or "cpu",
+            dtype=jdata.get("dtype"),
+            pbc=jdata.get("pbc"),
+            task_options=task_options,
+            results_path=results_path,
+            # Preserve None when the user omitted these values; the model then
+            # supplies its own graph cutoffs instead of receiving schema defaults.
+            AtomicData_options=explicit_atomic_data_options,
+        )
+        result = calculator.compute()
+        log.info("cal_bandgap calculation successfully completed (%s).", result["gap_status"])
+        return result
+
+    elif task == "negf":
+        from dptb.nn.build import build_model
+        from dpnegf.runner.NEGF import NEGF
+
+        model = build_model(checkpoint=init_model, common_options=in_common_options)
 
         # try:
         #     from pyinstrument import Profiler
@@ -109,10 +129,13 @@ def run(
         #     with open(results_path+'/profile_report.html', 'w') as report_file:
         #         report_file.write(profiler.output_html())
 
-    elif task == 'tbtrans_negf':
+    elif task == "tbtrans_negf":
         # Keep optional TBtrans dependencies and diagnostics out of ordinary
         # NEGF runs and out of spawned RGF workers re-importing the CLI.
+        from dptb.nn.build import build_model
         from dpnegf.runner.tbtrans_init import TBTransInputSet, sisl_installed
+
+        model = build_model(checkpoint=init_model, common_options=in_common_options)
 
         if not sisl_installed:
             raise RuntimeError(
@@ -133,5 +156,6 @@ def run(
             **task_options)
         tbtrans_init.hamil_get_write(write_nc=True)
         log.info(msg='TBtrans input files are successfully generated.')
-    
+    else:
+        raise ValueError(f"Unsupported task: {task!r}")
 
