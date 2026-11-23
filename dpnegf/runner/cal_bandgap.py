@@ -314,21 +314,25 @@ def _solve_shift_invert(hamiltonian, overlap, ranks, solver_options, shift_hint=
     last_error = None
     for shift in shifts:
         n_eigs = initial_eigs
+        current_shift = shift
+        shift_adjustments = 0
+        last_direction = 0
+        step_scale = 1.0
         while True:
             try:
                 values, vectors = eigsh(
-                    hamiltonian, k=n_eigs, M=overlap, sigma=shift, which="LM",
+                    hamiltonian, k=n_eigs, M=overlap, sigma=current_shift, which="LM",
                     tol=1e-10, maxiter=max(1000, 20 * n),
                 )
             except ArpackNoConvergence:
-                last_error = RuntimeError(f"ARPACK did not converge near shift {shift:g} eV.")
+                last_error = RuntimeError(f"ARPACK did not converge near shift {current_shift:g} eV.")
                 if n_eigs >= max_eigs:
                     break
                 n_eigs = min(max_eigs, max(n_eigs + 4, n_eigs * 2))
                 continue
             except (RuntimeError, linalg.LinAlgError) as exc:
                 # A singular or unfactorable shifted matrix is fixed by moving sigma.
-                last_error = RuntimeError(f"Shift-invert factorization failed near shift {shift:g} eV: {exc}")
+                last_error = RuntimeError(f"Shift-invert factorization failed near shift {current_shift:g} eV: {exc}")
                 break
             order = np.argsort(values)
             values, vectors = np.asarray(values[order]), np.asarray(vectors[:, order])
@@ -339,7 +343,7 @@ def _solve_shift_invert(hamiltonian, overlap, ranks, solver_options, shift_hint=
             try:
                 ritz, rotation = linalg.eigh(projected_h, projected_s, check_finite=False)
             except linalg.LinAlgError as exc:
-                last_error = RuntimeError(f"Rayleigh-Ritz projection failed near shift {shift:g} eV: {exc}")
+                last_error = RuntimeError(f"Rayleigh-Ritz projection failed near shift {current_shift:g} eV: {exc}")
                 break
             coefficients = vectors @ rotation
             hc = hamiltonian @ coefficients
@@ -357,7 +361,7 @@ def _solve_shift_invert(hamiltonian, overlap, ranks, solver_options, shift_hint=
                 break
 
             margin = max(1e-6, float(np.max(np.abs(ritz))) * 1e-9)
-            complete = False
+            action = "fail"
             for _ in range(12):
                 try:
                     low_count = _inertia_count_below(hamiltonian, overlap, float(ritz[0] - margin))
@@ -367,30 +371,61 @@ def _solve_shift_invert(hamiltonian, overlap, ranks, solver_options, shift_hint=
                     last_error = exc
                     margin *= 3
                     continue
+                window_levels = high_count - low_count
                 if (
-                    high_count - low_count == len(ritz)
+                    window_levels == len(ritz)
                     and low_count < min(ranks)
                     and high_count >= max(ranks)
                 ):
-                    complete = True
+                    action = "complete"
                     break
-                if high_count - low_count > len(ritz):
+                if window_levels > len(ritz):
+                    # The window is missing levels; grow the Ritz window.
+                    action = "enlarge"
+                    break
+                if window_levels == len(ritz):
+                    # Complete but misaligned window; reposition sigma instead.
+                    action = "adjust"
                     break
                 margin *= 3
-            if complete:
+            if action == "complete":
                 results = {}
                 for rank in ranks:
                     index = rank - low_count - 1
                     if not 0 <= index < len(ritz):
-                        complete = False
+                        action = "fail"
                         break
                     allowance = max(1e-8, float(residuals[index]) * max(1.0, abs(float(ritz[index]))))
                     results[rank] = (float(ritz[index]), allowance)
-                if complete:
+                if action == "complete":
                     return results, max(v[1] for v in results.values()), probes, "shift-invert"
-            last_error = RuntimeError(
-                "Shift-invert spectrum was incomplete or did not cover the requested global band indices."
-            )
+            if action == "adjust":
+                if shift_adjustments >= 8:
+                    last_error = RuntimeError(
+                        "Shift-invert could not align a complete Ritz window onto the requested band indices."
+                    )
+                    break
+                # Move sigma by the counted band-index offset, estimated with
+                # the mean level spacing of the current window; reverse
+                # directions halve the step to avoid oscillation.
+                spacing = max(
+                    (float(ritz[-1]) - float(ritz[0])) / max(1, len(ritz) - 1),
+                    1e-12,
+                )
+                window_center = 0.5 * (low_count + 1 + high_count)
+                target_center = 0.5 * (min(ranks) + max(ranks))
+                offset = (target_center - window_center) * spacing
+                direction = 1 if offset > 0 else -1
+                if direction == -last_direction:
+                    step_scale *= 0.5
+                last_direction = direction
+                current_shift += offset * step_scale
+                shift_adjustments += 1
+                continue
+            if action == "enlarge":
+                last_error = RuntimeError(
+                    "Shift-invert spectrum was incomplete or did not cover the requested global band indices."
+                )
             if n_eigs >= max_eigs:
                 break
             n_eigs = min(max_eigs, max(n_eigs + 4, n_eigs * 2))
@@ -757,9 +792,12 @@ class BandGapCalculator:
         options = self._effective_atomic_data_options(model)
         data = AtomicData.from_ase(atoms, **options)
         data = AtomicData.to_AtomicDataDict(data.to(device="cpu"))
-        for key in (AtomicDataDict.POSITIONS_KEY, AtomicDataDict.CELL_KEY):
-            if key in data:
-                data[key] = data[key].to(dtype=model.dtype)
+        # Sync every floating graph field (edge vectors, cell shifts, ...) to
+        # the model dtype; mixed float32/float64 fields break the model's
+        # internal einsum/phase operations.
+        for key, value in data.items():
+            if torch.is_tensor(value) and value.dtype.is_floating_point:
+                data[key] = value.to(dtype=model.dtype)
         data = model.idp(data)
         data[AtomicDataDict.KPOINT_KEY] = torch.nested.as_nested_tensor(
             [torch.zeros((1, 3), dtype=model.dtype, device="cpu")]
@@ -826,14 +864,11 @@ class BandGapCalculator:
             overlap_blocks=s_blocks if s_blocks is not None else False,
         )
         dtype = getattr(torch, model_metadata.get("dtype", "float32"))
-        for key in (
-            AtomicDataDict.NODE_FEATURES_KEY,
-            AtomicDataDict.EDGE_FEATURES_KEY,
-            AtomicDataDict.NODE_OVERLAP_KEY,
-            AtomicDataDict.EDGE_OVERLAP_KEY,
-        ):
-            if key in data:
-                data[key] = data[key].to(dtype=dtype, device="cpu")
+        # Convert every floating field (features, positions, edge vectors,
+        # cell shifts); HR2HK mixes them with the k point in one dtype.
+        for key, value in data.items():
+            if torch.is_tensor(value) and value.dtype.is_floating_point:
+                data[key] = value.to(dtype=dtype, device="cpu")
 
         self._hr2hk_data = data
         self._hr2hk_h = HR2HK(idp=idp, dtype=dtype, device="cpu")

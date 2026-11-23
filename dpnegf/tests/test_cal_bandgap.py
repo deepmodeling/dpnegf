@@ -135,6 +135,52 @@ def test_shift_invert_warm_start_hint_skips_coarse_location(monkeypatch):
         assert spectrum[rank][0] == pytest.approx(expected[rank - 1], abs=1e-8)
 
 
+def test_shift_invert_repositions_complete_but_misaligned_window(monkeypatch):
+    """A complete window at wrong band indices moves sigma instead of growing."""
+    eigsh_calls = []
+    real_eigsh = cal_bandgap_module.eigsh
+
+    def spy(hamiltonian, k, M, sigma, **kwargs):
+        eigsh_calls.append({"k": k, "sigma": sigma})
+        return real_eigsh(hamiltonian, k=k, M=M, sigma=sigma, **kwargs)
+
+    monkeypatch.setattr(cal_bandgap_module, "eigsh", spy)
+    expected = np.linspace(-5.0, 5.0, 64)
+    hamiltonian = sparse.diags(expected, dtype=np.complex128, format="csr")
+    overlap = sparse.eye(64, dtype=np.complex128, format="csr")
+    ranks = list(range(30, 36))
+    spectrum, _, _, solver = _solve_shift_invert(
+        hamiltonian, overlap, ranks,
+        {"energy_bounds": [-10.0, 10.0], "edge_tol": 1e-6,
+         "energy_shift": float(expected[51]), "dense_limit": 20},  # far above the targets
+    )
+    assert solver == "shift-invert"
+    assert eigsh_calls, "expected at least one ARPACK call"
+    initial_k = eigsh_calls[0]["k"]
+    assert all(call["k"] == initial_k for call in eigsh_calls)
+    assert any(abs(call["sigma"] - expected[51]) > 0.1 for call in eigsh_calls[1:])
+    for rank in ranks:
+        assert spectrum[rank][0] == pytest.approx(expected[rank - 1], abs=1e-8)
+
+
+def test_float64_checkpoint_dtype_supported():
+    pytest.importorskip("dptb")
+    common = {
+        "structure": str(HBN_STRUCTURE),
+        "checkpoint": str(HBN_CHECKPOINT),
+        "pbc": [False, False, False],
+        "task_options": {
+            **_finite_options("dense"),
+            "cache_options": {"use_saved": False, "save": False},
+        },
+    }
+    result64 = BandGapCalculator(dtype="float64", **common).compute()
+    assert result64["gap_status"] == "positive_gap"
+    assert result64["model_dtype"] == "float64"
+    result32 = BandGapCalculator(dtype="float32", **common).compute()
+    assert result64["signed_gap_eV"] == pytest.approx(result32["signed_gap_eV"], abs=1e-5)
+
+
 def test_shift_invert_falls_back_to_inertia_on_exact_degeneracy():
     """One Arnoldi run cannot resolve both copies of an exactly degenerate level."""
     values = np.linspace(-1.0, 1.0, 33)
