@@ -16,7 +16,7 @@ run_op:
         | type: ``dict``, optional
         | argument path: ``run_op/task_options``
 
-        Which transport task to run and its detailed options. See `task_options` below.
+        Which electronic-structure or transport task to run and its detailed options. See `task_options` below.
 
 
         Depending on the value of *task*, different sub args are accepted. 
@@ -26,17 +26,20 @@ run_op:
         task:
             | type: ``str`` (flag key)
             | argument path: ``run_op/task_options/task`` 
-            | possible choices: |code:run_op/task_options[negf]|_, |code:run_op/task_options[tbtrans_negf]|_
+            | possible choices: |code:run_op/task_options[negf]|_, |code:run_op/task_options[tbtrans_negf]|_, |code:run_op/task_options[cal_bandgap]|_
 
             The string define the task to conduct:
                                 - `negf`: for non-equilibrium green function calculation.
                                 - `tbtrans_negf`: for non-equilibrium green function calculation with tbtrans.
+                                - `cal_bandgap`: for finite HOMO-LUMO or one-dimensional periodic band-gap calculation.
                 
 
             .. |code:run_op/task_options[negf]| replace:: ``negf``
             .. _`code:run_op/task_options[negf]`: `run_op/task_options[negf]`_
             .. |code:run_op/task_options[tbtrans_negf]| replace:: ``tbtrans_negf``
             .. _`code:run_op/task_options[tbtrans_negf]`: `run_op/task_options[tbtrans_negf]`_
+            .. |code:run_op/task_options[cal_bandgap]| replace:: ``cal_bandgap``
+            .. _`code:run_op/task_options[cal_bandgap]`: `run_op/task_options[cal_bandgap]`_
 
         .. |flag:run_op/task_options/task| replace:: *task*
         .. _`flag:run_op/task_options/task`: `run_op/task_options/task`_
@@ -3784,4 +3787,11 @@ run_op:
             | argument path: ``run_op/AtomicData_options/oer_max``
 
             Cutoff radius for onsite environment; only used by nnsk models in strain or NRL mode. Default: None.
+
+
+        .. _`run_op/task_options[cal_bandgap]`:
+
+        When |flag:run_op/task_options/task|_ is set to ``cal_bandgap``:
+
+        This task computes a finite HOMO-LUMO gap or a one-dimensional periodic band gap from the full structure and DeePTB checkpoint. It runs on CPU, supports dense, checked SuperLU inertia, and verified shift-invert solvers, and writes results under ``OUTPUT/results``. See the `band-gap calculator guide <../cal_bandgap.md>`_ for the complete option schema and numerical limitations.
 
