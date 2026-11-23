@@ -3793,5 +3793,5 @@ run_op:
 
         When |flag:run_op/task_options/task|_ is set to ``cal_bandgap``:
 
-        This task computes a finite HOMO-LUMO gap or a one-dimensional periodic band gap from the full structure and DeePTB checkpoint. It runs on CPU, supports dense, checked SuperLU inertia, and verified shift-invert solvers, and writes results under ``OUTPUT/results``. See the `band-gap calculator guide <../cal_bandgap.md>`_ for the complete option schema and numerical limitations.
+        This task computes a finite HOMO-LUMO gap or a one-dimensional periodic band gap from the full structure and DeePTB checkpoint. It runs on CPU, supports dense, checked SuperLU inertia, and verified shift-invert solvers, and writes results under ``OUTPUT/results``. See the :doc:`band-gap calculator guide <../cal_bandgap>` for the complete option schema and numerical limitations.
 
