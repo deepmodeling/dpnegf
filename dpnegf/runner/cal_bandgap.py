@@ -1089,6 +1089,7 @@ class BandGapCalculator:
                 evaluate(float(coordinate))
             edges = self._band_edges(self._evaluations, occupied)
             delta = None
+            stable = False
             if previous is not None:
                 delta = max(abs(edges["vbm_eV"] - previous["vbm_eV"]),
                             abs(edges["cbm_eV"] - previous["cbm_eV"]))
@@ -1097,16 +1098,34 @@ class BandGapCalculator:
                 # of the sampled band edges; convergence is only accepted once
                 # the grid reaches min_nk.
                 converged = bool(stable and n_k >= min_nk)
+            next_n = 2 * (n_k - 1) + 1
+            stop = converged or next_n > max_nk
             convergence.append({
                 "nk": n_k, "vbm_eV": edges["vbm_eV"], "cbm_eV": edges["cbm_eV"],
                 "max_edge_change_eV": None if delta is None else float(delta),
                 "numerical_allowance_eV": edges["numerical_allowance_eV"],
                 "converged": bool(converged),
             })
-            if converged:
-                break
-            next_n = 2 * (n_k - 1) + 1
-            if next_n > max_nk:
+            if previous is None:
+                log.info(
+                    "cal_bandgap k-grid nk=%d: gap=%.6f eV (VBM=%.6f, CBM=%.6f eV); first grid level.",
+                    n_k, edges["signed_gap_eV"], edges["vbm_eV"], edges["cbm_eV"],
+                )
+            else:
+                gap_change = abs(edges["signed_gap_eV"] - previous["signed_gap_eV"])
+                if converged:
+                    outcome = f"converged (tolerance {self.k_options['gap_tol']:g} eV)"
+                elif stop:
+                    outcome = f"not converged within max_nk={max_nk}"
+                elif n_k < min_nk and stable:
+                    outcome = f"stable but below min_nk={min_nk}, refining"
+                else:
+                    outcome = "refining"
+                log.info(
+                    "cal_bandgap k-grid nk=%d: gap=%.6f eV; band-edge change %.6f eV, gap change %.6f eV -> %s.",
+                    n_k, edges["signed_gap_eV"], delta, gap_change, outcome,
+                )
+            if stop:
                 break
             previous, n_k = edges, next_n
 
@@ -1119,9 +1138,15 @@ class BandGapCalculator:
                     abs(new_edges["vbm_eV"] - old_edges["vbm_eV"]),
                     abs(new_edges["cbm_eV"] - old_edges["cbm_eV"]),
                 ))
-                if convergence[-1]["local_refinement_change_eV"] + 2 * new_edges["numerical_allowance_eV"] > self.k_options["gap_tol"]:
+                revoked = convergence[-1]["local_refinement_change_eV"] + 2 * new_edges["numerical_allowance_eV"] > self.k_options["gap_tol"]
+                if revoked:
                     converged = False
                     convergence[-1]["converged"] = False
+                log.info(
+                    "cal_bandgap local refinement: band-edge change %.6f eV%s.",
+                    convergence[-1]["local_refinement_change_eV"],
+                    "; convergence revoked" if revoked else "",
+                )
 
         return converged, convergence
 
@@ -1216,6 +1241,22 @@ class BandGapCalculator:
         gap_ax.axhline(0.0, color="black", linewidth=0.6, alpha=0.6)
         gap_ax.set_ylabel("Energy relative to mid-gap (eV)")
         gap_ax.set_xlabel("Fractional k along periodic axis" if result["structure_mode"] == "periodic" else "Finite structure")
+        axis = result["periodic_axis"]
+        vbm_x = result["vbm_k_fractional"][axis] if axis is not None else 0.0
+        cbm_x = result["cbm_k_fractional"][axis] if axis is not None else 0.0
+        for edge_x, edge_e in ((vbm_x, result["vbm_eV"]), (cbm_x, result["cbm_eV"])):
+            gap_ax.plot(
+                [edge_x], [edge_e - reference], marker="o", markersize=9,
+                markerfacecolor="none", markeredgecolor="#b03a2e",
+                markeredgewidth=1.5, linestyle="none",
+            )
+        gap_ax.set_title(f"band gap = {result['signed_gap_eV']:.4f} eV ({result['gap_status']})")
+        gap_ax.annotate(
+            f"VBM = {result['vbm_eV']:.4f} eV @ k={result['vbm_k_fractional']}\n"
+            f"CBM = {result['cbm_eV']:.4f} eV @ k={result['cbm_k_fractional']}",
+            xy=(0.02, 0.04), xycoords="axes fraction", fontsize=8,
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
+        )
         gap_ax.legend()
         gap_fig.tight_layout()
         gap_fig.savefig(self.results_path / "gap.png")
@@ -1229,6 +1270,11 @@ class BandGapCalculator:
             log.info("threadpoolctl is not installed; BLAS thread limiting is skipped.")
 
         self._atoms, mode, axis = self._read_structure()
+        log.info(
+            "cal_bandgap: %s, %d atoms, mode=%s%s.",
+            self._atoms.get_chemical_formula(), len(self._atoms), mode,
+            f", periodic axis={axis}" if mode == "periodic" else "",
+        )
         source_fingerprint = self._source_fingerprint()
         cache_path = self._cache_path()
         cache_key = self._cache_key(self._atoms, mode, axis, source_fingerprint)
@@ -1236,8 +1282,10 @@ class BandGapCalculator:
         cached = self._load_cached_blocks(cache_path, cache_key)
         cache_hit = cached is not None
         if cache_hit:
+            log.info("cal_bandgap: H/S cache hit (%s); skipping model build and inference.", cache_path)
             h_blocks, s_blocks, atom_norbs, model_metadata = cached
         else:
+            log.info("cal_bandgap: running DeePTB inference once for the full structure.")
             h_blocks, s_blocks, atom_norbs, model_metadata = self._predict_blocks(self._atoms)
             if self.cache_options["save"]:
                 self._write_cached_blocks(
@@ -1247,6 +1295,10 @@ class BandGapCalculator:
         self._evaluations = {}
         occupied, ranks, solve = self._make_solver(
             h_blocks, s_blocks, atom_norbs, model_metadata,
+        )
+        log.info(
+            "cal_bandgap: %d orbitals, %.4g electrons, %d occupied bands; solving bands %d..%d; spectrum solver: %s.",
+            sum(atom_norbs), self._electron_count, occupied, ranks[0], ranks[-1], self._resolved_method,
         )
         solver_names = set()
         spectrum_cache_counts = {"hits": 0, "misses": 0}
@@ -1309,10 +1361,16 @@ class BandGapCalculator:
                 )
                 if convergence:
                     convergence[-1]["plot_added_change_eV"] = float(plot_change)
-                if plot_change + 2 * edges_with_plot["numerical_allowance_eV"] > self.k_options["gap_tol"]:
+                revoked = plot_change + 2 * edges_with_plot["numerical_allowance_eV"] > self.k_options["gap_tol"]
+                if revoked:
                     converged = False
                     if convergence:
                         convergence[-1]["converged"] = False
+                log.info(
+                    "cal_bandgap: added %d plot k points; band-edge change %.6f eV%s.",
+                    int(self.output_options["plot_nk"]), plot_change,
+                    "; convergence revoked" if revoked else "",
+                )
                 base_edges = edges_with_plot
 
         signed_gap = base_edges["signed_gap_eV"]
@@ -1415,6 +1473,19 @@ class BandGapCalculator:
                 f"{float(self.k_options['gap_tol']):g} eV; it is not reliably resolved "
                 "as a positive gap at this scale."
             )
+        log.info("cal_bandgap finished: %s, converged=%s.", gap_status, result["converged"])
+        if signed_gap < 0:
+            log.info("  band overlap = %.6f eV (no positive gap)", -signed_gap)
+        else:
+            log.info("  band gap = %.6f eV", signed_gap)
+        log.info(
+            "  VBM = %.6f eV at k=%s, CBM = %.6f eV at k=%s",
+            base_edges["vbm_eV"], base_edges["vbm_k_fractional"],
+            base_edges["cbm_eV"], base_edges["cbm_k_fractional"],
+        )
+        direct_gap = base_edges["minimum_direct_gap_eV"]
+        if direct_gap > signed_gap + 1e-9:
+            log.info("  minimum direct gap = %.6f eV", direct_gap)
         self._save_outputs(result)
         return result
 
