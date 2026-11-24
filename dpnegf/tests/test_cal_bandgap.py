@@ -366,7 +366,10 @@ def test_realspace_blocks_match_native_hr2hk_for_complex_kpoints():
     from dptb.nn.hr2hk import HR2HK
     from dptb.utils.argcheck import get_cutoffs_from_model_options
 
-    model = build_model(checkpoint=str(HBN_CHECKPOINT), common_options={"device": "cpu"})
+    # Run the native DeePTB calls under the same default-dtype guard used by
+    # the calculator: the process default dtype may be polluted by other tests.
+    with cal_bandgap_module._torch_default_dtype(torch.float32):
+        model = build_model(checkpoint=str(HBN_CHECKPOINT), common_options={"device": "cpu"})
     atoms = read(str(HBN_STRUCTURE))
     cell = np.asarray(atoms.cell).copy()
     cell[2] = [0.0, 0.0, 4.0]
@@ -374,14 +377,15 @@ def test_realspace_blocks_match_native_hr2hk_for_complex_kpoints():
     atoms.set_pbc([False, False, True])
     cutoffs = dict(zip(("r_max", "er_max", "oer_max"),
                        get_cutoffs_from_model_options(model.model_options)))
-    data = AtomicData.to_AtomicDataDict(AtomicData.from_ase(atoms, **cutoffs).to("cpu"))
-    data = model.idp(data)
-    kpoints = np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 0.2], [0.0, 0.0, 0.5]])
-    data[AtomicDataDict.KPOINT_KEY] = torch.nested.as_nested_tensor(
-        [torch.as_tensor(kpoints, dtype=model.dtype, device="cpu")]
-    )
-    with torch.no_grad():
-        predicted = model(data)
+    with cal_bandgap_module._torch_default_dtype(model.dtype):
+        data = AtomicData.to_AtomicDataDict(AtomicData.from_ase(atoms, **cutoffs).to("cpu"))
+        data = model.idp(data)
+        kpoints = np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 0.2], [0.0, 0.0, 0.5]])
+        data[AtomicDataDict.KPOINT_KEY] = torch.nested.as_nested_tensor(
+            [torch.as_tensor(kpoints, dtype=model.dtype, device="cpu")]
+        )
+        with torch.no_grad():
+            predicted = model(data)
 
     h_blocks = feature_to_block(predicted, model.idp)
     s_blocks = feature_to_block(predicted, model.idp, overlap=True)
@@ -515,6 +519,30 @@ def test_compute_works_without_threadpoolctl(monkeypatch):
         },
     ).compute()
     assert result["gap_status"] == "positive_gap"
+
+
+def test_compute_robust_to_polluted_torch_default_dtype():
+    """A leaked global default dtype must not break inference, and the
+    caller's value must be restored afterwards."""
+    pytest.importorskip("dptb")
+    import torch
+
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)  # leaks in from other code
+    try:
+        result = BandGapCalculator(
+            structure=str(HBN_STRUCTURE),
+            checkpoint=str(HBN_CHECKPOINT),
+            pbc=[False, False, False],
+            task_options={
+                **_finite_options("dense"),
+                "cache_options": {"use_saved": False, "save": False},
+            },
+        ).compute()
+        assert result["gap_status"] == "positive_gap"
+        assert torch.get_default_dtype() is torch.float64
+    finally:
+        torch.set_default_dtype(previous)
 
 
 def test_min_nk_forces_refinement_past_premature_stability():

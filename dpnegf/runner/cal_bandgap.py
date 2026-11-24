@@ -30,6 +30,24 @@ _CACHE_VERSION = 2
 _ALGORITHM_VERSION = "realspace-blocks-v3"
 
 
+@contextlib.contextmanager
+def _torch_default_dtype(dtype):
+    """Temporarily set the torch default dtype, restoring it on exit.
+
+    The process-global default dtype belongs to the caller (or to leaky
+    third-party code); model inference must be insensitive to it, and the
+    caller's value must be restored afterwards.
+    """
+    import torch
+
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
+
+
 def _finite_number(value, name, *, positive=False):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a finite number.")
@@ -766,7 +784,10 @@ class BandGapCalculator:
             common_options = {"device": "cpu"}
             if self.dtype is not None:
                 common_options["dtype"] = self.dtype
-            self._model = build_model(checkpoint=str(self.checkpoint), common_options=common_options)
+            # DeePTB builds some plain attributes (e.g. r_map) with the ambient
+            # default dtype; force float32 so the whole model is consistent.
+            with _torch_default_dtype(torch.float32):
+                self._model = build_model(checkpoint=str(self.checkpoint), common_options=common_options)
             # build_model sets the model dtype but can leave submodule weights
             # and buffers in the checkpoint's original precision; cast the
             # whole model so inference runs entirely in the effective dtype.
@@ -823,31 +844,38 @@ class BandGapCalculator:
 
         model = self._load_model()
         options = self._effective_atomic_data_options(model)
-        data = AtomicData.from_ase(atoms, **options)
-        data = AtomicData.to_AtomicDataDict(data.to(device="cpu"))
-        # Sync every floating graph field (edge vectors, cell shifts, ...) to
-        # the model dtype; mixed float32/float64 fields break the model's
-        # internal einsum/phase operations.
-        for key, value in data.items():
-            if torch.is_tensor(value) and value.dtype.is_floating_point:
-                data[key] = value.to(dtype=model.dtype)
-        data = model.idp(data)
-        data[AtomicDataDict.KPOINT_KEY] = torch.nested.as_nested_tensor(
-            [torch.zeros((1, 3), dtype=model.dtype, device="cpu")]
-        )
-        with torch.no_grad():
-            predicted = model(data)
+        # Force a sane default dtype: graph tensors and anything DeePTB builds
+        # with torch.get_default_dtype() must match the float32 model.
+        with _torch_default_dtype(model.dtype):
+            data = AtomicData.from_ase(atoms, **options)
+            data = AtomicData.to_AtomicDataDict(data.to(device="cpu"))
+            # Sync every floating graph field (edge vectors, cell shifts, ...) to
+            # the model dtype; mixed float32/float64 fields break the model's
+            # internal einsum/phase operations.
+            for key, value in data.items():
+                if torch.is_tensor(value) and value.dtype.is_floating_point:
+                    data[key] = value.to(dtype=model.dtype)
+            data = model.idp(data)
+            # idp may add further floating fields; sync those as well.
+            for key, value in data.items():
+                if torch.is_tensor(value) and value.dtype.is_floating_point:
+                    data[key] = value.to(dtype=model.dtype)
+            data[AtomicDataDict.KPOINT_KEY] = torch.nested.as_nested_tensor(
+                [torch.zeros((1, 3), dtype=model.dtype, device="cpu")]
+            )
+            with torch.no_grad():
+                predicted = model(data)
 
-        soc_key = AtomicDataDict.NODE_SOC_SWITCH_KEY
-        soc = predicted.get(soc_key, False)
-        if hasattr(soc, "numel") and soc.numel():
-            soc = bool(soc.bool().all().item())
-        if soc:
-            raise ValueError("SOC/spinor Hamiltonians are outside the initial cal_bandgap scope.")
+            soc_key = AtomicDataDict.NODE_SOC_SWITCH_KEY
+            soc = predicted.get(soc_key, False)
+            if hasattr(soc, "numel") and soc.numel():
+                soc = bool(soc.bool().all().item())
+            if soc:
+                raise ValueError("SOC/spinor Hamiltonians are outside the initial cal_bandgap scope.")
 
-        h_blocks = self._to_numpy_blocks(feature_to_block(predicted, model.idp))
-        overlap_present = AtomicDataDict.NODE_OVERLAP_KEY in predicted
-        s_blocks = self._to_numpy_blocks(feature_to_block(predicted, model.idp, overlap=True)) if overlap_present else None
+            h_blocks = self._to_numpy_blocks(feature_to_block(predicted, model.idp))
+            overlap_present = AtomicDataDict.NODE_OVERLAP_KEY in predicted
+            s_blocks = self._to_numpy_blocks(feature_to_block(predicted, model.idp, overlap=True)) if overlap_present else None
         atom_norbs = []
         for symbol in atoms.get_chemical_symbols():
             try:
@@ -884,38 +912,39 @@ class BandGapCalculator:
         if not basis or not atomic_options:
             raise ValueError("The H/S cache lacks the DeePTB basis or graph cutoffs needed by HR2HK.")
 
-        idp = OrbitalMapper(basis=basis, method="e3tb", device="cpu")
-        graph = AtomicData.from_ase(self._atoms, **atomic_options)
-        if graph[AtomicDataDict.EDGE_INDEX_KEY].shape[1] == 0:
-            return False
-        data = AtomicData.to_AtomicDataDict(graph.to(device="cpu"))
-        data = idp(data)
-        block_to_feature(
-            data,
-            idp,
-            blocks=h_blocks,
-            overlap_blocks=s_blocks if s_blocks is not None else False,
-        )
         dtype = getattr(torch, model_metadata.get("dtype", "float32"))
-        # Convert every floating field (features, positions, edge vectors,
-        # cell shifts); HR2HK mixes them with the k point in one dtype.
-        for key, value in data.items():
-            if torch.is_tensor(value) and value.dtype.is_floating_point:
-                data[key] = value.to(dtype=dtype, device="cpu")
-
-        self._hr2hk_data = data
-        self._hr2hk_h = HR2HK(idp=idp, dtype=dtype, device="cpu")
-        self._hr2hk_s = None
-        if s_blocks is not None:
-            self._hr2hk_s = HR2HK(
-                idp=idp,
-                edge_field=AtomicDataDict.EDGE_OVERLAP_KEY,
-                node_field=AtomicDataDict.NODE_OVERLAP_KEY,
-                out_field=AtomicDataDict.OVERLAP_KEY,
-                overlap=True,
-                dtype=dtype,
-                device="cpu",
+        with _torch_default_dtype(dtype):
+            idp = OrbitalMapper(basis=basis, method="e3tb", device="cpu")
+            graph = AtomicData.from_ase(self._atoms, **atomic_options)
+            if graph[AtomicDataDict.EDGE_INDEX_KEY].shape[1] == 0:
+                return False
+            data = AtomicData.to_AtomicDataDict(graph.to(device="cpu"))
+            data = idp(data)
+            block_to_feature(
+                data,
+                idp,
+                blocks=h_blocks,
+                overlap_blocks=s_blocks if s_blocks is not None else False,
             )
+            # Convert every floating field (features, positions, edge vectors,
+            # cell shifts); HR2HK mixes them with the k point in one dtype.
+            for key, value in data.items():
+                if torch.is_tensor(value) and value.dtype.is_floating_point:
+                    data[key] = value.to(dtype=dtype, device="cpu")
+
+            self._hr2hk_data = data
+            self._hr2hk_h = HR2HK(idp=idp, dtype=dtype, device="cpu")
+            self._hr2hk_s = None
+            if s_blocks is not None:
+                self._hr2hk_s = HR2HK(
+                    idp=idp,
+                    edge_field=AtomicDataDict.EDGE_OVERLAP_KEY,
+                    node_field=AtomicDataDict.NODE_OVERLAP_KEY,
+                    out_field=AtomicDataDict.OVERLAP_KEY,
+                    overlap=True,
+                    dtype=dtype,
+                    device="cpu",
+                )
         return True
 
     def _hr2hk_fourier(self, kpoint, *, overlap=False):
@@ -926,11 +955,12 @@ class BandGapCalculator:
         if transform is None:
             raise ValueError("The checkpoint does not provide overlap blocks.")
         dtype = transform.dtype
-        data = dict(self._hr2hk_data)
-        point = torch.as_tensor(np.asarray(kpoint).reshape(1, 3), dtype=dtype, device="cpu")
-        data[AtomicDataDict.KPOINT_KEY] = torch.nested.as_nested_tensor([point])
-        output_key = AtomicDataDict.OVERLAP_KEY if overlap else AtomicDataDict.HAMILTONIAN_KEY
-        matrix = transform(data)[output_key][0].detach().cpu().numpy()
+        with _torch_default_dtype(dtype):
+            data = dict(self._hr2hk_data)
+            point = torch.as_tensor(np.asarray(kpoint).reshape(1, 3), dtype=dtype, device="cpu")
+            data[AtomicDataDict.KPOINT_KEY] = torch.nested.as_nested_tensor([point])
+            output_key = AtomicDataDict.OVERLAP_KEY if overlap else AtomicDataDict.HAMILTONIAN_KEY
+            matrix = transform(data)[output_key][0].detach().cpu().numpy()
         if not np.all(np.isfinite(matrix)):
             raise ValueError(f"DeePTB HR2HK produced non-finite {'S' if overlap else 'H'}(k).")
         return sparse.csr_matrix(np.asarray(matrix, dtype=np.complex128))
