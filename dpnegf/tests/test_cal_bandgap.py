@@ -43,22 +43,43 @@ def test_bandgap_schema_defaults_and_rejects_invalid_periodicity():
     })
     options = normalized["task_options"]
     assert options["solver_options"]["method"] == "auto"
+    assert options["structure_options"]["pbc"] is None
     assert options["k_options"]["initial_nk"] == 9
     assert options["k_options"]["min_nk"] == 17
     assert options["k_options"]["max_nk"] == 65
     assert options["k_options"]["gap_tol"] == pytest.approx(0.01)
     assert options["cache_options"]["use_saved"] is True
 
-    with pytest.raises(ValueError, match="one-dimensional"):
+    with pytest.raises(ValueError, match="future release"):
         normalize_run({
             "structure": "structure.xyz", "pbc": [True, True, False],
             "task_options": {"task": "cal_bandgap"},
+        })
+    with pytest.raises(ValueError, match="future release"):
+        normalize_run({
+            "structure": "structure.xyz",
+            "task_options": {"task": "cal_bandgap",
+                             "structure_options": {"pbc": [True, True, False]}},
         })
     with pytest.raises(ValueError, match="conflicts"):
         normalize_run({
             "structure": "structure.xyz", "pbc": [False, False, True],
             "task_options": {"task": "cal_bandgap",
                              "structure_options": {"mode": "finite"}},
+        })
+    with pytest.raises(ValueError, match="conflicts"):
+        normalize_run({
+            "structure": "structure.xyz",
+            "task_options": {"task": "cal_bandgap",
+                             "structure_options": {"mode": "finite",
+                                                   "pbc": [False, False, True]}},
+        })
+    with pytest.raises(ValueError, match="same axis"):
+        normalize_run({
+            "structure": "structure.xyz", "pbc": [False, True, False],
+            "task_options": {"task": "cal_bandgap",
+                             "structure_options": {"mode": "periodic",
+                                                   "pbc": [False, False, True]}},
         })
     with pytest.raises(ValueError, match="min_nk must be at least initial_nk"):
         normalize_run({
@@ -72,6 +93,44 @@ def test_bandgap_schema_defaults_and_rejects_invalid_periodicity():
             "task_options": {"task": "cal_bandgap",
                              "k_options": {"initial_nk": 3, "min_nk": 17, "max_nk": 9}},
         })
+
+
+def test_structure_options_pbc_selects_the_periodic_axis():
+    pytest.importorskip("ase")
+    from ase import Atoms
+
+    atoms = Atoms("C2", positions=[[0.0, 0.0, 0.1], [0.0, 0.0, 1.2]],
+                  cell=[10.0, 10.0, 3.0], pbc=False)
+    calculator = BandGapCalculator(
+        structure=atoms,
+        checkpoint=str(HBN_CHECKPOINT),
+        task_options={"structure_options": {"mode": "periodic",
+                                            "pbc": [False, False, True]}},
+    )
+    out_atoms, mode, axis = calculator._read_structure()
+    assert mode == "periodic"
+    assert axis == 2
+    assert list(out_atoms.pbc) == [False, False, True]
+
+    # The structure's own PBC drives mode="auto"; a conflicting task pbc fails.
+    atoms_auto = atoms.copy()
+    atoms_auto.set_pbc([False, True, False])
+    calculator = BandGapCalculator(
+        structure=atoms_auto,
+        checkpoint=str(HBN_CHECKPOINT),
+        task_options={"structure_options": {"pbc": [False, False, True]}},
+    )
+    with pytest.raises(ValueError, match="conflicts"):
+        calculator._read_structure()
+
+    # Periodic mode without any pbc source is rejected.
+    calculator = BandGapCalculator(
+        structure=atoms,
+        checkpoint=str(HBN_CHECKPOINT),
+        task_options={"structure_options": {"mode": "periodic"}},
+    )
+    with pytest.raises(ValueError, match="needs structure_options.pbc"):
+        calculator._read_structure()
 
 
 def test_checked_superlu_inertia_real_complex_and_unsafe_pivot():
@@ -429,7 +488,7 @@ def test_shift_invert_warm_start_seeded_from_nearest_k(monkeypatch):
         checkpoint=str(HBN_CHECKPOINT),
         pbc=[False, False, True],
         task_options={
-            "structure_options": {"mode": "periodic", "axis": 2, "periodic_length": 4.0},
+            "structure_options": {"mode": "periodic", "pbc": [False, False, True], "periodic_length": 4.0},
             "occupation_options": {"nel_atom": {"B": 3, "N": 5}},
             "solver_options": {"method": "shift-invert", "edge_tol": 1e-5},
             "k_options": {"initial_nk": 3, "min_nk": 3, "max_nk": 3},

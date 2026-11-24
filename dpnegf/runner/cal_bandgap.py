@@ -506,7 +506,7 @@ class BandGapCalculator:
 
     def _set_defaults(self):
         self.structure_options.setdefault("mode", "auto")
-        self.structure_options.setdefault("axis", 2)
+        self.structure_options.setdefault("pbc", None)
         self.structure_options.setdefault("periodic_length", None)
         self.occupation_options.setdefault("nel_atom", None)
         self.occupation_options.setdefault("charge", 0.0)
@@ -547,23 +547,44 @@ class BandGapCalculator:
             atoms.set_pbc(pbc)
 
         mode = self.structure_options["mode"]
-        axis = self.structure_options["axis"]
-        if mode not in ("auto", "finite", "periodic") or axis not in (0, 1, 2):
-            raise ValueError("Invalid structure mode or periodic axis.")
+        task_pbc = self.structure_options["pbc"]
+        if mode not in ("auto", "finite", "periodic"):
+            raise ValueError("Invalid structure mode.")
+        task_axes = None
+        if task_pbc is not None:
+            if (
+                not isinstance(task_pbc, list)
+                or len(task_pbc) != 3
+                or any(not isinstance(value, (bool, np.bool_)) for value in task_pbc)
+            ):
+                raise ValueError("structure_options.pbc must be null or a list of three booleans.")
+            task_axes = [i for i, value in enumerate(task_pbc) if value]
+            if len(task_axes) > 1:
+                raise ValueError(
+                    "cal_bandgap currently supports only one-dimensional periodic boundary conditions; "
+                    "multi-axis structure_options.pbc will be implemented in a future release."
+                )
         active_axes = np.flatnonzero(np.asarray(atoms.pbc, dtype=bool)).tolist()
+        if len(active_axes) > 1:
+            raise ValueError(
+                "cal_bandgap currently supports only one-dimensional periodic boundary conditions; "
+                "multi-axis structure PBC will be implemented in a future release."
+            )
+        if task_axes is not None and active_axes and task_axes != active_axes:
+            raise ValueError("structure_options.pbc conflicts with the structure's periodic boundary conditions.")
         if mode == "auto":
-            if len(active_axes) > 1:
-                raise ValueError("Only finite or one-dimensional periodic structures are supported.")
-            mode = "periodic" if active_axes else "finite"
-            if active_axes:
-                axis = active_axes[0]
+            mode = "periodic" if (active_axes or task_axes) else "finite"
         if mode == "finite":
-            if active_axes or self.structure_options["periodic_length"] is not None:
+            if active_axes or task_axes or self.structure_options["periodic_length"] is not None:
                 raise ValueError("Finite mode conflicts with a periodic boundary or periodic_length.")
             atoms.set_pbc([False, False, False])
+            axis = None
         else:
-            if active_axes and active_axes != [axis]:
-                raise ValueError("Periodic mode requires exactly one periodic axis matching structure_options.axis.")
+            if task_axes is None and not active_axes:
+                raise ValueError(
+                    "Periodic mode needs structure_options.pbc or periodic boundary conditions in the structure."
+                )
+            axis = (task_axes or active_axes)[0]
             periodic_length = self.structure_options["periodic_length"]
             cell = np.asarray(atoms.cell, dtype=float).copy()
             vector = cell[axis]

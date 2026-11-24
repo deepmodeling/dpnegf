@@ -739,7 +739,7 @@ def validate_cal_bandgap_options(data):
         )
     task = data["task_options"]
     defaults = {
-        "structure_options": {"mode": "auto", "axis": 2, "periodic_length": None},
+        "structure_options": {"mode": "auto", "pbc": None, "periodic_length": None},
         "occupation_options": {"nel_atom": None, "charge": 0.0},
         "solver_options": {
             "method": "auto", "backend": "superlu", "dense_limit": 1000,
@@ -764,8 +764,21 @@ def validate_cal_bandgap_options(data):
 
     if structure["mode"] not in ("auto", "finite", "periodic"):
         raise ValueError("cal_bandgap.structure_options.mode must be auto, finite, or periodic.")
-    if structure["axis"] not in (0, 1, 2):
-        raise ValueError("cal_bandgap.structure_options.axis must be 0, 1, or 2.")
+    task_pbc = structure["pbc"]
+    if task_pbc is not None:
+        if (
+            not isinstance(task_pbc, list)
+            or len(task_pbc) != 3
+            or any(not isinstance(value, bool) for value in task_pbc)
+        ):
+            raise ValueError("cal_bandgap.structure_options.pbc must be null or a list of three booleans.")
+        if sum(task_pbc) > 1:
+            raise ValueError(
+                "cal_bandgap currently supports only one-dimensional periodic boundary conditions; "
+                "multi-axis structure_options.pbc will be implemented in a future release."
+            )
+        if structure["mode"] == "finite" and any(task_pbc):
+            raise ValueError("mode='finite' conflicts with structure_options.pbc selecting a periodic axis.")
     length = structure["periodic_length"]
     if length is not None and (not math.isfinite(length) or length <= 0):
         raise ValueError("cal_bandgap.structure_options.periodic_length must be finite and positive.")
@@ -779,12 +792,20 @@ def validate_cal_bandgap_options(data):
         else:
             raise ValueError("Top-level pbc must be a bool or a list of three booleans.")
         periodic_axes = [i for i, value in enumerate(effective_pbc) if value]
+        if len(periodic_axes) > 1:
+            raise ValueError(
+                "cal_bandgap currently supports only one-dimensional periodic boundary conditions; "
+                "multi-axis pbc will be implemented in a future release."
+            )
         if structure["mode"] == "finite" and periodic_axes:
             raise ValueError("mode='finite' conflicts with periodic top-level pbc.")
-        if structure["mode"] == "periodic" and periodic_axes and periodic_axes != [structure["axis"]]:
-            raise ValueError("mode='periodic' requires top-level pbc to select only structure_options.axis.")
-        if structure["mode"] == "auto" and len(periodic_axes) > 1:
-            raise ValueError("cal_bandgap supports finite or one-dimensional periodic structures only.")
+        if (
+            structure["mode"] == "periodic"
+            and periodic_axes
+            and task_pbc is not None
+            and periodic_axes != [i for i, value in enumerate(task_pbc) if value]
+        ):
+            raise ValueError("mode='periodic' requires top-level pbc and structure_options.pbc to select the same axis.")
     if structure["mode"] == "finite" and length is not None:
         raise ValueError("periodic_length cannot be set with mode='finite'.")
 
@@ -945,8 +966,8 @@ def cal_bandgap():
         Argument("structure_options", dict, optional=True, default={}, sub_fields=[
             Argument("mode", str, optional=True, default="auto",
                      doc="Structure mode: auto, finite, or one-dimensional periodic."),
-            Argument("axis", int, optional=True, default=2,
-                     doc="Periodic cell-vector index (0, 1, or 2)."),
+            Argument("pbc", [list, None], optional=True, default=None,
+                     doc="Periodic boundary flags [x, y, z] selecting the periodic axis (at most one True; multi-axis PBC is not supported yet)."),
             Argument("periodic_length", [float, int, None], optional=True, default=None,
                      doc="Optional replacement length in Angstrom for the periodic cell vector; coordinates are unchanged."),
         ]),
