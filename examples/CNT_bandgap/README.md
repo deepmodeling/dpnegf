@@ -13,6 +13,7 @@ real-space H/S blocks through the two-level cache.
 | file | role |
 | :--- | :--- |
 | `cnt7_0_len6.xyz` | (7,0) CNT, 6 translational periods (168 atoms), seamless z cell 25.56 Å, `pbc="F F T"` |
+| `nnenv.cnt.pth` | DeePTB e3 checkpoint for carbon (~21 MB) used for the H/S inference |
 | `input.json` | CLI configuration for `dpnegf run` (shift-invert, default nested k grids 9 → 17 → 33 → 65) |
 | `run_api.py` | the same calculation through the `BandGapCalculator` Python API |
 | `output_cli/` | CLI outputs (created by the run) |
@@ -77,15 +78,15 @@ for explanation only; field values match `input.json`.
 
 ## Requirements
 
-The DeePTB e3 checkpoint for carbon is expected at
-`examples/long_cnt/nnenv.iter201150.pth` (about 21 MB). Pass a different path
-with `-i` / the `checkpoint=` argument if your copy lives elsewhere.
+The DeePTB e3 checkpoint for carbon is shipped with this example as
+`nnenv.cnt.pth` (about 21 MB). Pass a different path with `-i` / the
+`checkpoint=` argument if you want to use another checkpoint.
 
 ## Run with the CLI
 
 ```bash
 dpnegf run input.json \
-  -i ../long_cnt/nnenv.iter201150.pth \
+  -i nnenv.cnt.pth \
   -stu cnt7_0_len6.xyz \
   -o output_cli
 ```

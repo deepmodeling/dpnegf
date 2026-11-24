@@ -10,7 +10,7 @@ from pathlib import Path
 from dpnegf.runner.cal_bandgap import BandGapCalculator
 
 HERE = Path(__file__).resolve().parent
-CHECKPOINT = HERE / "../long_cnt/nnenv.iter201150.pth"
+CHECKPOINT = HERE / "nnenv.cnt.pth"
 STRUCTURE = HERE / "cnt7_0_len6.xyz"
 # Point the two-level cache at the CLI run's results directory; falls back to
 # a cold model inference when the files do not exist yet.
