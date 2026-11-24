@@ -375,18 +375,19 @@
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">dict</span></code>, optional</div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options</span></code></div>
 </div>
-<p>Which transport task to run and its detailed options. See <cite>task_options</cite> below.</p>
+<p>Which electronic-structure or transport task to run and its detailed options. See <cite>task_options</cite> below.</p>
 <p>Depending on the value of <em>task</em>, different sub args are accepted.</p>
 <dl id="run-op-task-options-task">
 <dt>task:</dt><dd><div class="line-block">
 <div class="line">type: <code class="docutils literal notranslate"><span class="pre">str</span></code> (flag key)</div>
 <div class="line">argument path: <code class="docutils literal notranslate"><span class="pre">run_op/task_options/task</span></code></div>
-<div class="line">possible choices: <a class="reference internal" href="#run-op-task-options-negf"><code class="docutils literal notranslate"><span class="pre">negf</span></code></a>, <a class="reference internal" href="#run-op-task-options-tbtrans-negf"><code class="docutils literal notranslate"><span class="pre">tbtrans_negf</span></code></a></div>
+<div class="line">possible choices: <a class="reference internal" href="#run-op-task-options-negf"><code class="docutils literal notranslate"><span class="pre">negf</span></code></a>, <a class="reference internal" href="#run-op-task-options-tbtrans-negf"><code class="docutils literal notranslate"><span class="pre">tbtrans_negf</span></code></a>, <a class="reference internal" href="#run-op-task-options-cal-bandgap"><code class="docutils literal notranslate"><span class="pre">cal_bandgap</span></code></a></div>
 </div>
 <dl class="simple">
 <dt>The string define the task to conduct:</dt><dd><ul class="simple">
 <li><p><cite>negf</cite>: for non-equilibrium green function calculation.</p></li>
 <li><p><cite>tbtrans_negf</cite>: for non-equilibrium green function calculation with tbtrans.</p></li>
+<li><p><cite>cal_bandgap</cite>: for finite HOMO-LUMO or one-dimensional periodic band-gap calculation.</p></li>
 </ul>
 </dd>
 </dl>
@@ -4007,6 +4008,8 @@
 <p>Cutoff radius for onsite environment; only used by nnsk models in strain or NRL mode. Default: None.</p>
 </dd>
 </dl>
+<p id="run-op-task-options-cal-bandgap">When <a class="reference internal" href="#run-op-task-options-task"><em>task</em></a> is set to <code class="docutils literal notranslate"><span class="pre">cal_bandgap</span></code>:</p>
+<p>This task computes a finite HOMO-LUMO gap or a one-dimensional periodic band gap from the full structure and DeePTB checkpoint. It runs on CPU, supports dense, checked SuperLU inertia, and verified shift-invert solvers, and writes results under <code class="docutils literal notranslate"><span class="pre">OUTPUT/results</span></code>. See the <span class="xref std std-doc">band-gap calculator guide</span> for the complete option schema and numerical limitations.</p>
 </dd>
 </dl>
 </dd>
