@@ -181,6 +181,32 @@ def test_float64_checkpoint_dtype_supported():
     assert result64["signed_gap_eV"] == pytest.approx(result32["signed_gap_eV"], abs=1e-5)
 
 
+def test_load_model_casts_all_weights_to_effective_dtype(monkeypatch):
+    """build_model may leave submodule weights in the checkpoint precision."""
+    pytest.importorskip("dptb")
+    import torch
+
+    class MixedPrecision(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w64 = torch.nn.Parameter(torch.zeros(2, dtype=torch.float64))
+            self.w32 = torch.nn.Parameter(torch.zeros(2, dtype=torch.float32))
+            self.register_buffer("b32", torch.zeros(2, dtype=torch.float32))
+
+    fake = MixedPrecision()
+    fake.dtype = torch.float64
+    monkeypatch.setattr("dptb.nn.build.build_model", lambda **kwargs: fake)
+    calculator = BandGapCalculator(
+        structure="unused.xyz",
+        checkpoint=str(HBN_CHECKPOINT),
+        dtype="float64",
+        task_options={"task": "cal_bandgap"},
+    )
+    model = calculator._load_model()
+    assert all(parameter.dtype == torch.float64 for parameter in model.parameters())
+    assert all(buffer.dtype == torch.float64 for buffer in model.buffers())
+
+
 def test_shift_invert_falls_back_to_inertia_on_exact_degeneracy():
     """One Arnoldi run cannot resolve both copies of an exactly degenerate level."""
     values = np.linspace(-1.0, 1.0, 33)

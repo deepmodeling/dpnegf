@@ -739,12 +739,19 @@ class BandGapCalculator:
 
     def _load_model(self):
         if self._model is None:
+            import torch
             from dptb.nn.build import build_model
 
             common_options = {"device": "cpu"}
             if self.dtype is not None:
                 common_options["dtype"] = self.dtype
             self._model = build_model(checkpoint=str(self.checkpoint), common_options=common_options)
+            # build_model sets the model dtype but can leave submodule weights
+            # and buffers in the checkpoint's original precision; cast the
+            # whole model so inference runs entirely in the effective dtype.
+            model_dtype = getattr(self._model, "dtype", None)
+            if isinstance(model_dtype, torch.dtype):
+                self._model.to(dtype=model_dtype)
         model_device = getattr(self._model, "device", None)
         if model_device is None:
             try:
