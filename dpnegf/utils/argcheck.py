@@ -663,8 +663,8 @@ def doped():
     ]
 
 def run_options():
-    doc_task = "Which transport task to run and its detailed options. See `task_options` below."
-    doc_structure = "Path to the structure file (xyz/vasp/etc.). Overrides the CLI `--structure` flag when set."
+    doc_task = "Which electronic-structure or transport task to run and its detailed options. See `task_options` below."
+    doc_structure = "Path to the structure file (xyz/vasp/etc.). The CLI `--structure` flag takes precedence when provided."
     doc_gui = "Whether to launch the GUI. Default: False."
     doc_device = ("The torch device for model construction, Hamiltonian initialization and "
                   "lead electronic structure. Choose 'cpu' or 'cuda[:int]'. "
@@ -723,7 +723,142 @@ def normalize_run(data):
             task["direct_btd_max_mib"] is not None
             and task["direct_btd_max_mib"] <= 0):
             raise ValueError("direct_btd_max_mib must be positive.")
+    elif data.get("task_options", {}).get("task") == "cal_bandgap":
+        validate_cal_bandgap_options(data)
     return data
+
+
+def validate_cal_bandgap_options(data):
+    """Validate cross-field constraints for the standalone band-gap task."""
+    import math
+
+    dtype = data.get("dtype")
+    if dtype is not None and dtype != "float32":
+        raise ValueError(
+            "cal_bandgap supports float32 inference only; DeePTB checkpoints are trained in float32."
+        )
+    task = data["task_options"]
+    defaults = {
+        "structure_options": {"mode": "auto", "pbc": None, "periodic_length": None},
+        "occupation_options": {"nel_atom": None, "charge": 0.0},
+        "solver_options": {
+            "method": "auto", "backend": "superlu", "dense_limit": 1000,
+            "edge_tol": 1e-5, "energy_bounds": [-10.0, 10.0], "energy_shift": None,
+        },
+        "k_options": {"initial_nk": 9, "min_nk": 17, "max_nk": 65, "gap_tol": 0.01, "local_refine": False},
+        "output_options": {
+            "bands_per_side": 4, "all_bands": False, "plot": True,
+            "plot_nk": 0, "plot_window": None,
+        },
+        "cache_options": {"use_saved": True, "save": True, "path": None},
+    }
+    for group_name, fields in defaults.items():
+        group = task.setdefault(group_name, {})
+        for key, value in fields.items():
+            group.setdefault(key, value)
+    structure = task["structure_options"]
+    occupation = task["occupation_options"]
+    solver = task["solver_options"]
+    k_options = task["k_options"]
+    output = task["output_options"]
+
+    if structure["mode"] not in ("auto", "finite", "periodic"):
+        raise ValueError("cal_bandgap.structure_options.mode must be auto, finite, or periodic.")
+    task_pbc = structure["pbc"]
+    if task_pbc is not None:
+        if (
+            not isinstance(task_pbc, list)
+            or len(task_pbc) != 3
+            or any(not isinstance(value, bool) for value in task_pbc)
+        ):
+            raise ValueError("cal_bandgap.structure_options.pbc must be null or a list of three booleans.")
+        if sum(task_pbc) > 1:
+            raise ValueError(
+                "cal_bandgap currently supports only one-dimensional periodic boundary conditions; "
+                "multi-axis structure_options.pbc will be implemented in a future release."
+            )
+        if structure["mode"] == "finite" and any(task_pbc):
+            raise ValueError("mode='finite' conflicts with structure_options.pbc selecting a periodic axis.")
+    length = structure["periodic_length"]
+    if length is not None and (not math.isfinite(length) or length <= 0):
+        raise ValueError("cal_bandgap.structure_options.periodic_length must be finite and positive.")
+
+    pbc = data.get("pbc")
+    if pbc is not None:
+        if isinstance(pbc, bool):
+            effective_pbc = [pbc] * 3
+        elif isinstance(pbc, list) and len(pbc) == 3 and all(isinstance(x, bool) for x in pbc):
+            effective_pbc = pbc
+        else:
+            raise ValueError("Top-level pbc must be a bool or a list of three booleans.")
+        periodic_axes = [i for i, value in enumerate(effective_pbc) if value]
+        if len(periodic_axes) > 1:
+            raise ValueError(
+                "cal_bandgap currently supports only one-dimensional periodic boundary conditions; "
+                "multi-axis pbc will be implemented in a future release."
+            )
+        if structure["mode"] == "finite" and periodic_axes:
+            raise ValueError("mode='finite' conflicts with periodic top-level pbc.")
+        if (
+            structure["mode"] == "periodic"
+            and periodic_axes
+            and task_pbc is not None
+            and periodic_axes != [i for i, value in enumerate(task_pbc) if value]
+        ):
+            raise ValueError("mode='periodic' requires top-level pbc and structure_options.pbc to select the same axis.")
+    if structure["mode"] == "finite" and length is not None:
+        raise ValueError("periodic_length cannot be set with mode='finite'.")
+
+    charge = occupation["charge"]
+    if not math.isfinite(charge):
+        raise ValueError("cal_bandgap.occupation_options.charge must be finite.")
+    nel_atom = occupation["nel_atom"]
+    if nel_atom is not None:
+        if not nel_atom:
+            raise ValueError("cal_bandgap.occupation_options.nel_atom cannot be empty.")
+        if any(not isinstance(value, (int, float)) or isinstance(value, bool)
+               or not math.isfinite(value) or value < 0 for value in nel_atom.values()):
+            raise ValueError("nel_atom values must be finite, nonnegative electron counts.")
+
+    if solver["method"] not in ("auto", "dense", "inertia", "shift-invert"):
+        raise ValueError("solver_options.method must be auto, dense, inertia, or shift-invert.")
+    if solver["backend"] != "superlu":
+        raise ValueError("Only solver_options.backend='superlu' is currently supported.")
+    if solver["dense_limit"] < 1:
+        raise ValueError("solver_options.dense_limit must be positive.")
+    edge_tol = solver["edge_tol"]
+    if not math.isfinite(edge_tol) or edge_tol <= 0:
+        raise ValueError("solver_options.edge_tol must be finite and positive.")
+    bounds = solver["energy_bounds"]
+    if len(bounds) != 2 or any(not isinstance(x, (int, float)) or not math.isfinite(x) for x in bounds) or bounds[0] >= bounds[1]:
+        raise ValueError("solver_options.energy_bounds must be two finite, increasing energies.")
+    shift = solver["energy_shift"]
+    if shift is not None and not math.isfinite(shift):
+        raise ValueError("solver_options.energy_shift must be finite when provided.")
+
+    if k_options["initial_nk"] < 3:
+        raise ValueError("k_options.initial_nk must be at least 3.")
+    if k_options["min_nk"] < k_options["initial_nk"]:
+        raise ValueError("k_options.min_nk must be at least initial_nk.")
+    if k_options["max_nk"] < k_options["min_nk"]:
+        raise ValueError("k_options.max_nk must be at least min_nk.")
+    gap_tol = k_options["gap_tol"]
+    if not math.isfinite(gap_tol) or gap_tol <= 2 * edge_tol:
+        raise ValueError("k_options.gap_tol must be finite and greater than twice solver_options.edge_tol.")
+
+    if output["bands_per_side"] < 1:
+        raise ValueError("output_options.bands_per_side must be positive.")
+    if output["all_bands"] and solver["method"] not in ("auto", "dense"):
+        raise ValueError("output_options.all_bands requires method='dense' or 'auto'.")
+    if output["plot_nk"] not in (0,) and output["plot_nk"] < 2:
+        raise ValueError("output_options.plot_nk must be 0 or at least 2.")
+    plot_window = output["plot_window"]
+    if plot_window is not None and (
+        len(plot_window) != 2
+        or any(not isinstance(x, (int, float)) or not math.isfinite(x) for x in plot_window)
+        or plot_window[0] >= plot_window[1]
+    ):
+        raise ValueError("output_options.plot_window must be null or two finite, increasing energies.")
 
 
 # (flat legacy key)  -> tuple describing where it now lives inside task_options.
@@ -815,12 +950,80 @@ def task_options():
     doc_task = '''The string define the task to conduct:
                     - `negf`: for non-equilibrium green function calculation.
                     - `tbtrans_negf`: for non-equilibrium green function calculation with tbtrans.
+                    - `cal_bandgap`: for finite HOMO-LUMO or one-dimensional periodic band-gap calculation.
                 '''
 
     return Variant("task", [
             Argument("negf", dict, negf()),
             Argument("tbtrans_negf", dict, tbtrans_negf()),
+            Argument("cal_bandgap", dict, cal_bandgap()),
         ],optional=False, doc=doc_task)
+
+
+def cal_bandgap():
+    """Options for the standalone electronic band-gap task."""
+    return [
+        Argument("structure_options", dict, optional=True, default={}, sub_fields=[
+            Argument("mode", str, optional=True, default="auto",
+                     doc="Structure mode: auto, finite, or one-dimensional periodic."),
+            Argument("pbc", [list, None], optional=True, default=None,
+                     doc="Periodic boundary flags [x, y, z] selecting the periodic axis (at most one True; multi-axis PBC is not supported yet)."),
+            Argument("periodic_length", [float, int, None], optional=True, default=None,
+                     doc="Optional replacement length in Angstrom for the periodic cell vector; coordinates are unchanged."),
+        ]),
+        Argument("occupation_options", dict, optional=True, default={}, sub_fields=[
+            Argument("nel_atom", [dict, None], optional=True, default=None,
+                     doc="Valence electron count per element. Defaults to the DPNEGF valence table."),
+            Argument("charge", [float, int], optional=True, default=0.0,
+                     doc="Positive charge removes electrons from the neutral structure."),
+        ]),
+        Argument("solver_options", dict, optional=True, default={}, sub_fields=[
+            Argument("method", str, optional=True, default="auto",
+                     doc="Spectrum solver: auto, dense, inertia, or shift-invert."),
+            Argument("backend", str, optional=True, default="superlu",
+                     doc="Sparse factorization backend. SuperLU is the built-in backend."),
+            Argument("dense_limit", int, optional=True, default=1000,
+                     doc="Largest orbital dimension automatically sent to the dense solver."),
+            Argument("edge_tol", [float, int], optional=True, default=1e-5,
+                     doc="Energy bisection interval width in eV for inertia solving."),
+            Argument("energy_bounds", list, optional=True, default=[-10.0, 10.0],
+                     doc="Initial energy interval in eV for inertia solving; it expands when needed."),
+            Argument("energy_shift", [float, int, None], optional=True, default=None,
+                     doc="Optional shift-invert energy hint in eV."),
+        ]),
+        Argument("k_options", dict, optional=True, default={}, sub_fields=[
+            Argument("initial_nk", int, optional=True, default=9,
+                     doc="Initial nested one-dimensional half-BZ grid size (at least 3)."),
+            Argument("min_nk", int, optional=True, default=17,
+                     doc="Convergence is only accepted on grids of at least this size, avoiding premature convergence on coarse grids."),
+            Argument("max_nk", int, optional=True, default=65,
+                     doc="Maximum nested grid size."),
+            Argument("gap_tol", [float, int], optional=True, default=0.01,
+                     doc="Requested adjacent-grid band-edge stability in eV."),
+            Argument("local_refine", bool, optional=True, default=False,
+                     doc="Refine sampled local VBM and CBM extrema using additional real k-point evaluations."),
+        ]),
+        Argument("output_options", dict, optional=True, default={}, sub_fields=[
+            Argument("bands_per_side", int, optional=True, default=4,
+                     doc="Number of ordered bands to retain on each side of the occupation edge."),
+            Argument("all_bands", bool, optional=True, default=False,
+                     doc="Retain the complete spectrum. Only available with the dense solver."),
+            Argument("plot", bool, optional=True, default=True,
+                     doc="Write band-edge and band-structure plots when an output directory is available."),
+            Argument("plot_nk", int, optional=True, default=0,
+                     doc="Additional evenly spaced k points to evaluate for plotting (0 disables them)."),
+            Argument("plot_window", [list, None], optional=True, default=None,
+                     doc="Optional [minimum, maximum] energy window in eV relative to the plotted reference."),
+        ]),
+        Argument("cache_options", dict, optional=True, default={}, sub_fields=[
+            Argument("use_saved", bool, optional=True, default=True,
+                     doc="Load a matching real-space H/S block cache when available."),
+            Argument("save", bool, optional=True, default=True,
+                     doc="Save inferred real-space H/S blocks for reuse."),
+            Argument("path", [str, None], optional=True, default=None,
+                     doc="Optional cache file path. By default the cache is stored under results_path."),
+        ]),
+    ]
 
 
 def AtomicData_options_sub():

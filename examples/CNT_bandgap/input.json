@@ -1,0 +1,42 @@
+{
+  "device": "cpu",
+  "dtype": "float32",
+  "task_options": {
+    "task": "cal_bandgap",
+    "structure_options": {
+      "mode": "periodic",
+      "pbc": [false, false, true],
+      "periodic_length": null
+    },
+    "occupation_options": {
+      "nel_atom": {"C": 4.0},
+      "charge": 0.0
+    },
+    "solver_options": {
+      "method": "shift-invert",
+      "backend": "superlu",
+      "dense_limit": 1000,
+      "edge_tol": 1e-05,
+      "energy_bounds": [-10.0, 10.0],
+      "energy_shift": null
+    },
+    "k_options": {
+      "initial_nk": 9,
+      "min_nk": 17,
+      "max_nk": 65,
+      "gap_tol": 0.01,
+      "local_refine": false
+    },
+    "output_options": {
+      "bands_per_side": 4,
+      "all_bands": false,
+      "plot": true,
+      "plot_nk": 0,
+      "plot_window": null
+    },
+    "cache_options": {
+      "use_saved": true,
+      "save": true
+    }
+  }
+}

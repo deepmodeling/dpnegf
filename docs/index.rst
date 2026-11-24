@@ -32,6 +32,7 @@ For more details, see our papers:
    :caption: Quick Start
 
    easy_install
+   cal_bandgap
    hands_on/index
 
 .. .. toctree::
