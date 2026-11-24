@@ -5,7 +5,7 @@
     "task": "cal_bandgap",
     "structure_options": {
       "mode": "periodic",
-      "axis": 2,
+      "pbc": [false, false, true],
       "periodic_length": null
     },
     "occupation_options": {

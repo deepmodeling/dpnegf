@@ -21,7 +21,7 @@ calculator = BandGapCalculator(
     checkpoint=str(CHECKPOINT),
     dtype="float32",
     task_options={
-        "structure_options": {"mode": "periodic", "axis": 2},
+        "structure_options": {"mode": "periodic", "pbc": [False, False, True]},
         "occupation_options": {"nel_atom": {"C": 4.0}},
         "solver_options": {"method": "shift-invert", "energy_shift": None},
         "cache_options": {"path": str(CACHE)},

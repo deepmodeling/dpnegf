@@ -38,7 +38,8 @@ for explanation only; field values match `input.json`.
 ```jsonc
 "structure_options": {
   "mode": "periodic",        // structure mode: auto / finite / periodic; here: 1D-periodic supercell
-  "axis": 2,                 // periodic axis: 0=x, 1=y, 2=z
+  "pbc": [false, false, true],  // periodic boundary flags [x, y, z]; at most one may be true
+                                // (1D only; multi-axis PBC is rejected pending a future release)
   "periodic_length": null    // optional: replace the axial lattice-vector length (Å) without scaling
                              // coordinates; null keeps the cell from the structure file
 },
