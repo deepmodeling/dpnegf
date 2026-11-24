@@ -178,25 +178,23 @@ def test_shift_invert_repositions_complete_but_misaligned_window(monkeypatch):
         assert spectrum[rank][0] == pytest.approx(expected[rank - 1], abs=1e-8)
 
 
-def test_float64_checkpoint_dtype_supported():
-    pytest.importorskip("dptb")
-    common = {
-        "structure": str(HBN_STRUCTURE),
-        "checkpoint": str(HBN_CHECKPOINT),
-        "pbc": [False, False, False],
-        "task_options": {
-            **_finite_options("dense"),
-            "cache_options": {"use_saved": False, "save": False},
-        },
-    }
-    result64 = BandGapCalculator(dtype="float64", **common).compute()
-    assert result64["gap_status"] == "positive_gap"
-    assert result64["model_dtype"] == "float64"
-    result32 = BandGapCalculator(dtype="float32", **common).compute()
-    assert result64["signed_gap_eV"] == pytest.approx(result32["signed_gap_eV"], abs=1e-5)
+def test_float64_dtype_is_rejected():
+    with pytest.raises(ValueError, match="float32 inference only"):
+        BandGapCalculator(
+            structure="unused.xyz",
+            checkpoint=str(HBN_CHECKPOINT),
+            dtype="float64",
+            task_options={"task": "cal_bandgap"},
+        )
+    with pytest.raises(ValueError, match="float32 inference only"):
+        normalize_run({
+            "structure": "structure.xyz",
+            "dtype": "float64",
+            "task_options": {"task": "cal_bandgap"},
+        })
 
 
-def test_load_model_casts_all_weights_to_effective_dtype(monkeypatch):
+def test_load_model_casts_all_weights_to_float32(monkeypatch):
     """build_model may leave submodule weights in the checkpoint precision."""
     pytest.importorskip("dptb")
     import torch
@@ -206,20 +204,35 @@ def test_load_model_casts_all_weights_to_effective_dtype(monkeypatch):
             super().__init__()
             self.w64 = torch.nn.Parameter(torch.zeros(2, dtype=torch.float64))
             self.w32 = torch.nn.Parameter(torch.zeros(2, dtype=torch.float32))
-            self.register_buffer("b32", torch.zeros(2, dtype=torch.float32))
+            self.register_buffer("b64", torch.zeros(2, dtype=torch.float64))
 
     fake = MixedPrecision()
+    fake.dtype = torch.float32
+    monkeypatch.setattr("dptb.nn.build.build_model", lambda **kwargs: fake)
+    calculator = BandGapCalculator(
+        structure="unused.xyz",
+        checkpoint=str(HBN_CHECKPOINT),
+        task_options={"task": "cal_bandgap"},
+    )
+    model = calculator._load_model()
+    assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
+    assert all(buffer.dtype == torch.float32 for buffer in model.buffers())
+
+
+def test_load_model_rejects_float64_checkpoint(monkeypatch):
+    pytest.importorskip("dptb")
+    import torch
+
+    fake = torch.nn.Linear(2, 2)
     fake.dtype = torch.float64
     monkeypatch.setattr("dptb.nn.build.build_model", lambda **kwargs: fake)
     calculator = BandGapCalculator(
         structure="unused.xyz",
         checkpoint=str(HBN_CHECKPOINT),
-        dtype="float64",
         task_options={"task": "cal_bandgap"},
     )
-    model = calculator._load_model()
-    assert all(parameter.dtype == torch.float64 for parameter in model.parameters())
-    assert all(buffer.dtype == torch.float64 for buffer in model.buffers())
+    with pytest.raises(ValueError, match="float32 checkpoints only"):
+        calculator._load_model()
 
 
 def test_shift_invert_falls_back_to_inertia_on_exact_degeneracy():

@@ -732,6 +732,11 @@ def validate_cal_bandgap_options(data):
     """Validate cross-field constraints for the standalone band-gap task."""
     import math
 
+    dtype = data.get("dtype")
+    if dtype is not None and dtype != "float32":
+        raise ValueError(
+            "cal_bandgap supports float32 inference only; DeePTB checkpoints are trained in float32."
+        )
     task = data["task_options"]
     defaults = {
         "structure_options": {"mode": "auto", "axis": 2, "periodic_length": None},

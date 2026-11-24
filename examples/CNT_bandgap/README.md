@@ -25,7 +25,9 @@ real-space H/S blocks through the two-level cache.
 example). Two- or three-dimensional periodic boundary conditions are rejected
 with an explicit error; arbitrary 2D/3D k-space search is out of scope for
 this first version. Magnetic/SOC models, odd-electron counts and GPU solving
-are  not supported yet.
+are  not supported yet. Inference runs on CPU in **float32 only**: DeePTB
+checkpoints are trained in float32, so requesting float64 (or loading a
+float64 checkpoint) raises an explicit error.
 
 ## input.json core options
 

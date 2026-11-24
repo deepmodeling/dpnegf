@@ -469,8 +469,8 @@ class BandGapCalculator:
     ):
         if device is not None and str(device) != "cpu":
             raise ValueError("cal_bandgap currently supports CPU model inference and eigensolving only.")
-        if dtype not in (None, "float32", "float64"):
-            raise ValueError("dtype must be None, 'float32', or 'float64'.")
+        if dtype not in (None, "float32"):
+            raise ValueError("cal_bandgap supports float32 inference only; DeePTB checkpoints are trained in float32.")
         self.structure = structure
         if checkpoint is None:
             raise ValueError("A model checkpoint is required to validate the H/S cache.")
@@ -762,8 +762,13 @@ class BandGapCalculator:
             raise ValueError(
                 f"The checkpoint model is on {model_device}; cal_bandgap requires CPU model inference."
             )
-        if self.dtype is not None and str(getattr(self._model, "dtype", "")).split(".")[-1] != self.dtype:
+        effective_dtype = str(getattr(self._model, "dtype", "")).split(".")[-1]
+        if self.dtype is not None and effective_dtype != self.dtype:
             raise ValueError("The checkpoint model dtype does not match the requested dtype.")
+        if effective_dtype != "float32":
+            raise ValueError(
+                f"The checkpoint model dtype is {effective_dtype}; cal_bandgap supports float32 checkpoints only."
+            )
         self._model.eval()
         return self._model
 
