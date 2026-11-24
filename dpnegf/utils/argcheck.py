@@ -740,7 +740,7 @@ def validate_cal_bandgap_options(data):
             "method": "auto", "backend": "superlu", "dense_limit": 1000,
             "edge_tol": 1e-5, "energy_bounds": [-10.0, 10.0], "energy_shift": None,
         },
-        "k_options": {"initial_nk": 3, "max_nk": 9, "gap_tol": 0.01, "local_refine": False},
+        "k_options": {"initial_nk": 9, "min_nk": 17, "max_nk": 65, "gap_tol": 0.01, "local_refine": False},
         "output_options": {
             "bands_per_side": 4, "all_bands": False, "plot": True,
             "plot_nk": 0, "plot_window": None,
@@ -812,8 +812,10 @@ def validate_cal_bandgap_options(data):
 
     if k_options["initial_nk"] < 3:
         raise ValueError("k_options.initial_nk must be at least 3.")
-    if k_options["max_nk"] < k_options["initial_nk"]:
-        raise ValueError("k_options.max_nk must be at least initial_nk.")
+    if k_options["min_nk"] < k_options["initial_nk"]:
+        raise ValueError("k_options.min_nk must be at least initial_nk.")
+    if k_options["max_nk"] < k_options["min_nk"]:
+        raise ValueError("k_options.max_nk must be at least min_nk.")
     gap_tol = k_options["gap_tol"]
     if not math.isfinite(gap_tol) or gap_tol <= 2 * edge_tol:
         raise ValueError("k_options.gap_tol must be finite and greater than twice solver_options.edge_tol.")
@@ -964,9 +966,11 @@ def cal_bandgap():
                      doc="Optional shift-invert energy hint in eV."),
         ]),
         Argument("k_options", dict, optional=True, default={}, sub_fields=[
-            Argument("initial_nk", int, optional=True, default=3,
+            Argument("initial_nk", int, optional=True, default=9,
                      doc="Initial nested one-dimensional half-BZ grid size (at least 3)."),
-            Argument("max_nk", int, optional=True, default=9,
+            Argument("min_nk", int, optional=True, default=17,
+                     doc="Convergence is only accepted on grids of at least this size, avoiding premature convergence on coarse grids."),
+            Argument("max_nk", int, optional=True, default=65,
                      doc="Maximum nested grid size."),
             Argument("gap_tol", [float, int], optional=True, default=0.01,
                      doc="Requested adjacent-grid band-edge stability in eV."),

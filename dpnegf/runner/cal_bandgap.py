@@ -515,7 +515,7 @@ class BandGapCalculator:
             "edge_tol": 1e-5, "energy_bounds": [-10.0, 10.0], "energy_shift": None,
         }.items():
             self.solver_options.setdefault(key, value)
-        for key, value in {"initial_nk": 3, "max_nk": 9, "gap_tol": 0.01, "local_refine": False}.items():
+        for key, value in {"initial_nk": 9, "min_nk": 17, "max_nk": 65, "gap_tol": 0.01, "local_refine": False}.items():
             self.k_options.setdefault(key, value)
         for key, value in {"bands_per_side": 4, "all_bands": False, "plot": True,
                            "plot_nk": 0, "plot_window": None}.items():
@@ -1079,6 +1079,7 @@ class BandGapCalculator:
 
     def _run_periodic(self, evaluate, occupied, axis):
         n_k = int(self.k_options["initial_nk"])
+        min_nk = int(self.k_options["min_nk"])
         max_nk = int(self.k_options["max_nk"])
         previous = None
         convergence = []
@@ -1091,7 +1092,11 @@ class BandGapCalculator:
             if previous is not None:
                 delta = max(abs(edges["vbm_eV"] - previous["vbm_eV"]),
                             abs(edges["cbm_eV"] - previous["cbm_eV"]))
-                converged = delta + 2.0 * edges["numerical_allowance_eV"] <= self.k_options["gap_tol"]
+                stable = delta + 2.0 * edges["numerical_allowance_eV"] <= self.k_options["gap_tol"]
+                # Coarse grids can be accidentally stable at a local extremum
+                # of the sampled band edges; convergence is only accepted once
+                # the grid reaches min_nk.
+                converged = bool(stable and n_k >= min_nk)
             convergence.append({
                 "nk": n_k, "vbm_eV": edges["vbm_eV"], "cbm_eV": edges["cbm_eV"],
                 "max_edge_change_eV": None if delta is None else float(delta),

@@ -43,6 +43,9 @@ def test_bandgap_schema_defaults_and_rejects_invalid_periodicity():
     })
     options = normalized["task_options"]
     assert options["solver_options"]["method"] == "auto"
+    assert options["k_options"]["initial_nk"] == 9
+    assert options["k_options"]["min_nk"] == 17
+    assert options["k_options"]["max_nk"] == 65
     assert options["k_options"]["gap_tol"] == pytest.approx(0.01)
     assert options["cache_options"]["use_saved"] is True
 
@@ -56,6 +59,18 @@ def test_bandgap_schema_defaults_and_rejects_invalid_periodicity():
             "structure": "structure.xyz", "pbc": [False, False, True],
             "task_options": {"task": "cal_bandgap",
                              "structure_options": {"mode": "finite"}},
+        })
+    with pytest.raises(ValueError, match="min_nk must be at least initial_nk"):
+        normalize_run({
+            "structure": "structure.xyz",
+            "task_options": {"task": "cal_bandgap",
+                             "k_options": {"initial_nk": 9, "min_nk": 5, "max_nk": 65}},
+        })
+    with pytest.raises(ValueError, match="max_nk must be at least min_nk"):
+        normalize_run({
+            "structure": "structure.xyz",
+            "task_options": {"task": "cal_bandgap",
+                             "k_options": {"initial_nk": 3, "min_nk": 17, "max_nk": 9}},
         })
 
 
@@ -404,7 +419,7 @@ def test_shift_invert_warm_start_seeded_from_nearest_k(monkeypatch):
             "structure_options": {"mode": "periodic", "axis": 2, "periodic_length": 4.0},
             "occupation_options": {"nel_atom": {"B": 3, "N": 5}},
             "solver_options": {"method": "shift-invert", "edge_tol": 1e-5},
-            "k_options": {"initial_nk": 3, "max_nk": 3},
+            "k_options": {"initial_nk": 3, "min_nk": 3, "max_nk": 3},
             "output_options": {"plot": False},
             "cache_options": {"use_saved": False, "save": False},
         },
@@ -430,8 +445,50 @@ def test_compute_works_without_threadpoolctl(monkeypatch):
     assert result["gap_status"] == "positive_gap"
 
 
+def test_min_nk_forces_refinement_past_premature_stability():
+    """Coarse-grid accidental stability must not stop refinement below min_nk."""
+    constant_edges = {
+        "vbm_eV": -0.5, "vbm_k_fractional": [0.0],
+        "cbm_eV": 0.5, "cbm_k_fractional": [0.0],
+        "signed_gap_eV": 1.0, "band_gap_eV": 1.0,
+        "minimum_direct_gap_eV": 1.0, "numerical_allowance_eV": 0.0,
+    }
+
+    def run_with(k_options):
+        calculator = BandGapCalculator.__new__(BandGapCalculator)
+        calculator.k_options = dict(k_options)
+        calculator._evaluations = {}
+        calculator._band_edges = lambda evaluations, occupied: dict(constant_edges)
+        visited = []
+
+        def fake_evaluate(coordinate):
+            visited.append(coordinate)
+            key = float(round(coordinate, 12))
+            calculator._evaluations.setdefault(key, {})
+            return calculator._evaluations[key]
+
+        converged, convergence = calculator._run_periodic(fake_evaluate, occupied=2, axis=2)
+        return converged, convergence, sorted(set(visited))
+
+    converged, convergence, visited = run_with(
+        {"initial_nk": 3, "min_nk": 9, "max_nk": 9, "gap_tol": 0.01, "local_refine": False}
+    )
+    assert [item["nk"] for item in convergence] == [3, 5, 9]
+    assert convergence[0]["converged"] is False
+    assert convergence[1]["converged"] is False  # stable at 5 but below min_nk
+    assert convergence[2]["converged"] is True
+    assert converged is True
+    assert visited == pytest.approx(list(np.linspace(0.0, 0.5, 9)), abs=1e-12)
+
+    converged, convergence, visited = run_with(
+        {"initial_nk": 3, "min_nk": 5, "max_nk": 9, "gap_tol": 0.01, "local_refine": False}
+    )
+    assert [item["nk"] for item in convergence] == [3, 5]
+    assert convergence[1]["converged"] is True
+    assert converged is True
+
+
 def test_local_refine_targets_only_candidate_bands(monkeypatch):
-    """Each candidate interval refines only the band whose extremum lies there."""
     refine_calls = []
     real_minimize = cal_bandgap_module.minimize_scalar
 
